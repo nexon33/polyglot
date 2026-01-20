@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use polyglot::{
     compiler::compile,
-    parser::{parse_poly, ParsedFile},
+    parser::{ParsedFile, parse_poly},
     types::CompileOptions,
     validate,
     wit_gen::generate_wit,
@@ -65,6 +65,16 @@ enum Commands {
         /// Title for the HTML page
         #[arg(short, long, default_value = "Polyglot App")]
         title: String,
+    },
+    /// Install npm dependencies and bundle with esbuild
+    Npm {
+        /// Subcommand: install, bundle, or init
+        #[arg(default_value = "install")]
+        action: String,
+
+        /// Package names to install (for 'install' action)
+        #[arg(trailing_var_arg = true)]
+        packages: Vec<String>,
     },
 }
 
@@ -146,6 +156,90 @@ fn main() -> anyhow::Result<()> {
                 "\n🌐 Open in browser: file://{}",
                 fs::canonicalize(&out_path)?.display()
             );
+        }
+        Commands::Npm { action, packages } => {
+            match action.as_str() {
+                "init" => {
+                    println!("📦 Initializing npm project...");
+                    let status = Command::new("npm")
+                        .args(["init", "-y"])
+                        .status()
+                        .expect("Failed to run npm init");
+
+                    if status.success() {
+                        println!("✅ Created package.json");
+
+                        // Also install esbuild
+                        println!("📦 Installing esbuild...");
+                        let esbuild_status = Command::new("npm")
+                            .args(["install", "--save-dev", "esbuild"])
+                            .status()
+                            .expect("Failed to install esbuild");
+
+                        if esbuild_status.success() {
+                            println!("✅ esbuild installed");
+                        }
+                    }
+                }
+                "install" | "i" => {
+                    if packages.is_empty() {
+                        println!("📦 Installing all dependencies...");
+                        let status = Command::new("npm")
+                            .args(["install"])
+                            .status()
+                            .expect("Failed to run npm install");
+
+                        if status.success() {
+                            println!("✅ Dependencies installed");
+                        }
+                    } else {
+                        println!("📦 Installing: {}", packages.join(", "));
+                        let mut args = vec!["install", "--save"];
+                        for pkg in &packages {
+                            args.push(pkg);
+                        }
+
+                        let status = Command::new("npm")
+                            .args(&args)
+                            .status()
+                            .expect("Failed to run npm install");
+
+                        if status.success() {
+                            println!("✅ Installed: {}", packages.join(", "));
+                        }
+                    }
+                }
+                "bundle" => {
+                    println!("📦 Bundling JS dependencies with esbuild...");
+
+                    // Create entry point that re-exports all dependencies
+                    let entry = "// Auto-generated entry point\nexport * from './node_modules';\n";
+                    fs::write("_poly_entry.js", entry)?;
+
+                    let status = Command::new("npx")
+                        .args([
+                            "esbuild",
+                            "_poly_entry.js",
+                            "--bundle",
+                            "--outfile=_poly_bundled.js",
+                            "--format=esm",
+                            "--minify",
+                        ])
+                        .status()
+                        .expect("Failed to run esbuild");
+
+                    // Cleanup temp entry
+                    let _ = fs::remove_file("_poly_entry.js");
+
+                    if status.success() {
+                        println!("✅ Bundled to _poly_bundled.js");
+                        println!("   Include this in your #[js] block or import it");
+                    }
+                }
+                _ => {
+                    eprintln!("❌ Unknown action: {}. Use: init, install, bundle", action);
+                }
+            }
         }
     }
 
