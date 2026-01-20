@@ -1,10 +1,13 @@
 use clap::{Parser, Subcommand};
 use polyglot::{
-    compiler::compile, parser::parse_poly, types::CompileOptions, wit_gen::generate_wit,
+    compiler::compile,
+    parser::{parse_poly, ParsedFile},
+    types::CompileOptions,
+    wit_gen::generate_wit,
 };
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser, Debug)]
@@ -95,7 +98,11 @@ fn main() -> anyhow::Result<()> {
 fn build_poly(file: &PathBuf, release: bool) -> anyhow::Result<PathBuf> {
     println!("🔨 Compiling {}", file.display());
     let source = fs::read_to_string(file)?;
-    let parsed = parse_poly(&source).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let mut parsed = parse_poly(&source).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // Resolve imports - load and merge imported files
+    let base_dir = file.parent().unwrap_or(std::path::Path::new("."));
+    resolve_imports(&mut parsed, base_dir)?;
 
     let opts = CompileOptions {
         release,
@@ -189,4 +196,66 @@ version = "0.1.0"
     println!("   polyglot run main.poly");
 
     Ok(())
+}
+
+/// Resolve imports by loading and merging imported .poly files
+fn resolve_imports(parsed: &mut ParsedFile, base_dir: &Path) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+
+    fn resolve_inner(
+        parsed: &mut ParsedFile,
+        base_dir: &Path,
+        visited: &mut HashSet<PathBuf>,
+    ) -> anyhow::Result<()> {
+        // Take imports to avoid borrowing issues
+        let imports = std::mem::take(&mut parsed.imports);
+
+        if imports.is_empty() {
+            return Ok(());
+        }
+
+        println!("📦 Resolving {} import(s)...", imports.len());
+
+        for import in imports {
+            let import_path = base_dir
+                .join(&import.path)
+                .canonicalize()
+                .unwrap_or_else(|_| base_dir.join(&import.path));
+
+            // Skip already visited files (cycle detection)
+            if visited.contains(&import_path) {
+                continue;
+            }
+
+            if !import_path.exists() {
+                return Err(anyhow::anyhow!("Import not found: {}", import.path));
+            }
+
+            println!("   ← {}", import.path);
+            visited.insert(import_path.clone());
+
+            let import_source = fs::read_to_string(&import_path)?;
+            let mut import_parsed = parse_poly(&import_source)
+                .map_err(|e| anyhow::anyhow!("Error parsing {}: {}", import.path, e))?;
+
+            // Recursively resolve nested imports FIRST
+            let child_base = import_path.parent().unwrap_or(base_dir);
+            resolve_inner(&mut import_parsed, child_base, visited)?;
+
+            // Then merge interfaces from imported file
+            for item in import_parsed.interfaces {
+                parsed.interfaces.push(item);
+            }
+
+            // Merge code blocks from imported file
+            for block in import_parsed.blocks {
+                parsed.blocks.push(block);
+            }
+        }
+
+        Ok(())
+    }
+
+    let mut visited = HashSet::new();
+    resolve_inner(parsed, base_dir, &mut visited)
 }

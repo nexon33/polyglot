@@ -10,11 +10,19 @@ pub enum TypeRef {
     Named(String),
 }
 
+/// Import statement: use <items> from "<path>"
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub items: Vec<String>, // Empty means import all (use * from)
+    pub path: String,       // Relative path to .poly file
+}
+
 #[derive(Debug, Default)]
 pub struct ParsedFile {
     pub blocks: Vec<CodeBlock>,
     pub signatures: Vec<FunctionSig>,
     pub interfaces: Vec<InterfaceItem>,
+    pub imports: Vec<Import>, // Imported files
 }
 
 #[derive(Debug, Clone)]
@@ -42,11 +50,41 @@ impl std::error::Error for ParseError {}
 pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     let mut parsed = ParsedFile::default();
 
+    // Parse import statements: use <item> from "<path>"
+    // Syntax: use myfunction from "./other.poly"
+    //         use * from "./types.poly"
+    //         use { foo, bar } from "./utils.poly"
+    let import_re =
+        Regex::new(r#"(?m)^use\s+(?:(\*)|(\w+)|(?:\{([^}]+)\}))\s+from\s+"([^"]+)""#).unwrap();
+
+    for cap in import_re.captures_iter(source) {
+        let path = cap.get(4).unwrap().as_str().to_string();
+        let items = if cap.get(1).is_some() {
+            // use * from "..."
+            vec![] // Empty means all
+        } else if let Some(single) = cap.get(2) {
+            // use item from "..."
+            vec![single.as_str().to_string()]
+        } else if let Some(multi) = cap.get(3) {
+            // use { foo, bar } from "..."
+            multi
+                .as_str()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect()
+        } else {
+            vec![]
+        };
+
+        parsed.imports.push(Import { items, path });
+    }
+
     // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[main], etc.
     // Only matches known polyglot tags, not Rust attributes like #[no_mangle]
-    let re = Regex::new(r"(?m)^#\[(interface|rust|rs|python|py|main)(?::[a-zA-Z0-9_:]+)?\]\s*$").unwrap();
+    let re = Regex::new(r"(?m)^#\[(interface|rust|rs|python|py|main)(?::[a-zA-Z0-9_:]+)?\]\s*$")
+        .unwrap();
 
-    let mut matches: Vec<_> = re.find_iter(source).collect();
+    let matches: Vec<_> = re.find_iter(source).collect();
 
     for (i, m) in matches.iter().enumerate() {
         let start_idx = m.end();
