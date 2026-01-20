@@ -254,24 +254,76 @@ fn parse_type_alias(input: &str) -> IResult<&str, (String, Type)> {
 }
 
 /// Parse type declaration with optional explicit mappings
-/// Supports: `type Tensor` or `type Tensor { rust: "...", python: "..." }`
+/// Supports: 
+/// - `type Tensor` (opaque, no mappings)
+/// - `type Tensor { rust: "...", python: "..." }` (block syntax)
+/// - `type Tensor = rust:path | python:path;` (pipe syntax - preferred)
 fn parse_type_decl(input: &str) -> IResult<&str, TypeDeclDef> {
     let (input, _) = tag("type")(input)?;
     let (input, _) = multispace0(input)?;
     let (input, name) = parse_ident(input)?;
     let (input, _) = multispace0(input)?;
     
-    // Make sure this is NOT followed by '=' (that would be a type alias)
+    // New pipe syntax: type Tensor = rust:path | python:path;
     if input.starts_with('=') {
-        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+        let (input, _) = char('=')(input)?;
+        let (input, _) = multispace0(input)?;
+        
+        let mut rust_impl = None;
+        let mut python_impl = None;
+        let mut remaining = input;
+        
+        loop {
+            let (input, _) = multispace0(remaining)?;
+            
+            // Check for end (semicolon, newline, or another declaration)
+            if input.is_empty() || input.starts_with('\n') || input.starts_with("fn ") 
+               || input.starts_with("type ") || input.starts_with('#') {
+                remaining = input;
+                break;
+            }
+            
+            // Skip semicolon if present
+            if input.starts_with(';') {
+                remaining = &input[1..];
+                break;
+            }
+            
+            // Parse lang:path
+            let (input, lang) = parse_ident(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = char(':')(input)?;
+            let (input, _) = multispace0(input)?;
+            
+            // Parse the path (everything until | or ; or newline)
+            let path_end = input.find(|c| c == '|' || c == ';' || c == '\n').unwrap_or(input.len());
+            let path = input[..path_end].trim();
+            let input = &input[path_end..];
+            
+            match lang {
+                "rust" | "rs" => rust_impl = Some(path.to_string()),
+                "python" | "py" => python_impl = Some(path.to_string()),
+                _ => {} // Ignore unknown languages for now
+            }
+            
+            // Skip | if present
+            let (input, _) = multispace0(input)?;
+            let input = if input.starts_with('|') { &input[1..] } else { input };
+            remaining = input;
+        }
+        
+        return Ok((remaining, TypeDeclDef {
+            name: name.to_string(),
+            rust_impl,
+            python_impl,
+        }));
     }
     
-    // Check for optional body with explicit mappings
+    // Old block syntax: type Tensor { rust: "...", python: "..." }
     if input.starts_with('{') {
         let (input, _) = char('{')(input)?;
         let (input, _) = multispace0(input)?;
         
-        // Parse key-value pairs: rust: "...", python: "..."
         let mut rust_impl = None;
         let mut python_impl = None;
         let mut remaining = input;
@@ -307,19 +359,19 @@ fn parse_type_decl(input: &str) -> IResult<&str, TypeDeclDef> {
             remaining = input;
         }
         
-        Ok((remaining, TypeDeclDef {
+        return Ok((remaining, TypeDeclDef {
             name: name.to_string(),
             rust_impl,
             python_impl,
-        }))
-    } else {
-        // Simple opaque type without mappings
-        Ok((input, TypeDeclDef {
-            name: name.to_string(),
-            rust_impl: None,
-            python_impl: None,
-        }))
+        }));
     }
+    
+    // Simple opaque type without mappings
+    Ok((input, TypeDeclDef {
+        name: name.to_string(),
+        rust_impl: None,
+        python_impl: None,
+    }))
 }
 
 fn parse_type(input: &str) -> IResult<&str, Type> {
