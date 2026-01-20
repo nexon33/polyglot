@@ -1,4 +1,5 @@
 pub mod ast_parser;
+pub mod capability;
 pub mod compiler;
 pub mod interface;
 pub mod languages;
