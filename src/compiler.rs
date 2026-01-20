@@ -3,7 +3,7 @@
 use crate::languages::find_language;
 use crate::parser::ParsedFile;
 use crate::types::CompileOptions;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::fs;
 use std::process::Command;
 
@@ -55,6 +55,11 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
                 gpu_blocks.push(block.code.clone());
             }
             "js" | "jsx" => {
+                js_blocks.push(block.code.clone());
+            }
+            "ts" | "tsx" | "typescript" => {
+                // TypeScript blocks - will be transpiled alongside JS
+                // For browser, Babel handles TS transpilation
                 js_blocks.push(block.code.clone());
             }
             "html" => {
@@ -308,7 +313,7 @@ pub fn generate_inline_bundle(
     html_template: Option<&str>,
     title: &str,
 ) -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     let wasm_base64 = STANDARD.encode(wasm_bytes);
 

@@ -263,32 +263,45 @@ const App = () => {
         
         try {
             // Build fetch headers with optional auth
-            const headers = {};
+            const headers = { 'Accept': 'application/json' };
             if (authToken) {
                 headers['Authorization'] = `Bearer ${authToken}`;
                 log('Using HuggingFace auth token');
             }
             
-            // Try HuggingFace datasets-server API
-            const url = 'https://datasets-server.huggingface.co/rows?dataset=roneneldan%2FTinyStories&config=default&split=train&offset=0&length=500';
+            // Try multiple HuggingFace API endpoints
+            const endpoints = [
+                // first-rows endpoint (simpler API)
+                'https://datasets-server.huggingface.co/first-rows?dataset=roneneldan/TinyStories&config=default&split=train',
+                // rows endpoint with proper encoding
+                'https://datasets-server.huggingface.co/rows?dataset=roneneldan/TinyStories&config=default&split=train&offset=0&length=100',
+                // Alternative: parquet endpoint for direct download
+                'https://huggingface.co/api/datasets/roneneldan/TinyStories/parquet/default/train/0.parquet',
+            ];
             
             let texts = [];
             
-            try {
-                const resp = await fetch(url, { headers });
-                if (resp.ok) {
-                    const data = await resp.json();
-                    if (data.rows) {
-                        texts = data.rows.map(r => r.row?.text || '').filter(t => t.length > 0);
-                        log(`Loaded ${texts.length} stories from HuggingFace`);
+            for (const url of endpoints) {
+                if (texts.length > 0) break;
+                try {
+                    log(`Trying: ${url.split('?')[0].split('/').pop()}...`);
+                    const resp = await fetch(url, { headers });
+                    if (resp.ok) {
+                        const contentType = resp.headers.get('content-type') || '';
+                        if (contentType.includes('json')) {
+                            const data = await resp.json();
+                            // Handle first-rows format
+                            if (data.rows) {
+                                texts = data.rows.map(r => r.row?.text || r.text || '').filter(t => t.length > 0);
+                                log(`Loaded ${texts.length} stories from HuggingFace`);
+                            }
+                        }
+                    } else {
+                        log(`${url.split('/').pop().split('?')[0]}: ${resp.status}`);
                     }
-                } else if (resp.status === 401) {
-                    log('Auth required - enter HuggingFace token above');
-                } else {
-                    log(`API returned ${resp.status}`);
+                } catch (e) {
+                    // Continue to next endpoint
                 }
-            } catch (e) {
-                log(`Fetch failed: ${e.message}`);
             }
             
             // If no data loaded, use better synthetic fallback

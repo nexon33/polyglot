@@ -17,6 +17,9 @@
             "include": "#js-block"
         },
         {
+            "include": "#ts-block"
+        },
+        {
             "include": "#rscss-block"
         },
         {
@@ -197,6 +200,42 @@
                 },
                 {
                     "include": "#js-keywords"
+                },
+                {
+                    "include": "#js-functions"
+                },
+                {
+                    "include": "#js-comments"
+                },
+                {
+                    "include": "#js-numbers"
+                },
+                {
+                    "include": "#js-jsx"
+                }
+            ]
+        },
+        "ts-block": {
+            "begin": "^\\s*(#\\[(ts|tsx|typescript)\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|ts|tsx|typescript|rscss|gpu|html|main)\\])",
+            "contentName": "meta.embedded.ts",
+            "patterns": [
+                {
+                    "include": "#ts-types"
+                },
+                {
+                    "include": "#js-template-string"
+                },
+                {
+                    "include": "#js-strings"
+                },
+                {
+                    "include": "#ts-keywords"
                 },
                 {
                     "include": "#js-functions"
@@ -531,6 +570,30 @@
         "wgsl-numbers": {
             "match": "\\b(0x[0-9A-Fa-f]+|\\d+\\.?\\d*([eE][+-]?\\d+)?[fh]?)\\b",
             "name": "constant.numeric.wgsl"
+        },
+        "ts-types": {
+            "patterns": [
+                {
+                    "match": ":\\s*([A-Z][A-Za-z0-9_]*(?:<[^>]+>)?)",
+                    "captures": {
+                        "1": {
+                            "name": "entity.name.type.ts"
+                        }
+                    }
+                },
+                {
+                    "match": "\\b(interface|type|enum|namespace|declare|abstract|implements|readonly)\\b",
+                    "name": "storage.type.ts"
+                },
+                {
+                    "match": "<[^>]+>",
+                    "name": "meta.type.parameters.ts"
+                }
+            ]
+        },
+        "ts-keywords": {
+            "match": "\\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|this|class|extends|import|export|from|default|async|await|try|catch|finally|throw|typeof|instanceof|in|of|null|undefined|true|false|interface|type|enum|namespace|declare|abstract|implements|readonly|as|is|keyof|infer|never|unknown|any|void|public|private|protected)\\b",
+            "name": "keyword.control.ts"
         }
     }
 }
