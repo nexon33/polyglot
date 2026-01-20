@@ -1,0 +1,35 @@
+use * from "./geometry.poly"
+use * from "./math.poly"
+
+#[interface]
+fn create_point(x: f64, y: f64) -> Point
+fn distance(a: Point, b: Point) -> f64
+fn create_matrix(rows: u32, cols: u32) -> Matrix
+fn multiply(a: Matrix, b: Matrix) -> Matrix
+fn transform(m: Matrix) -> Matrix
+fn run_simulation() -> f64
+
+#[rust]
+fn run_simulation() -> f64 {
+    println!("Rust: Starting simulation...");
+    
+    // Use geometry functions (from geometry.poly - Rust)
+    let p1 = create_point(0.0, 0.0);
+    let p2 = create_point(3.0, 4.0);
+    let dist = distance(p1, p2);
+    println!("Distance between points: {}", dist);
+    
+    // Use matrix functions (from math.poly - Rust + Python)
+    let m = create_matrix(4, 4);
+    let m2 = transform(m);  // Calls Python!
+    let m3 = multiply(m2, create_matrix(4, 4));
+    
+    dist
+}
+
+#[main]
+fn main() {
+    println!("=== Multi-File Polyglot Demo ===\n");
+    let result = run_simulation();
+    println!("\nSimulation result: {}", result);
+}

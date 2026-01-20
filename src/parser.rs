@@ -110,7 +110,7 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
         // Parse interface blocks specially
         if lang_tag == "interface" {
             if let Ok(interfaces) = crate::interface::parser::parse_interface(tag_content) {
-                parsed.interfaces = interfaces;
+                parsed.interfaces.extend(interfaces); // Extend instead of overwrite
             }
             continue; // Don't add interface as a code block
         }

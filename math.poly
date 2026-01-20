@@ -1,0 +1,36 @@
+#[interface]
+type Matrix
+
+fn create_matrix(rows: u32, cols: u32) -> Matrix
+fn multiply(a: Matrix, b: Matrix) -> Matrix  
+fn transform(m: Matrix) -> Matrix
+
+#[rust]
+// Rust handles the low-level Matrix type and allocation
+#[derive(Debug, Clone)]
+pub struct Matrix {
+    pub data: Vec<f64>,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+fn create_matrix(rows: u32, cols: u32) -> Matrix {
+    println!("Rust: Creating {}x{} matrix", rows, cols);
+    Matrix {
+        data: vec![0.0; (rows * cols) as usize],
+        rows,
+        cols,
+    }
+}
+
+fn multiply(a: Matrix, b: Matrix) -> Matrix {
+    println!("Rust: Matrix multiply {}x{} * {}x{}", a.rows, a.cols, b.rows, b.cols);
+    // Simple identity return for demo
+    a
+}
+
+#[python]
+# Python handles the higher-level transformations
+def transform(m: Matrix) -> Matrix:
+    print(f"Python: Transforming matrix")
+    return m
