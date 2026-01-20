@@ -26,10 +26,10 @@ struct ChildServer {
 
 impl Delegator {
     /// Normalize language tags for consistent lookup
-    /// "rs" | "rust" -> "rust", "py" | "python" -> "python"
+    /// "rs" | "rust" | "main" -> "rust", "py" | "python" -> "python"
     fn normalize_lang(lang: &str) -> &'static str {
         match lang {
-            "rs" | "rust" => "rust",
+            "rs" | "rust" | "main" | "interface" => "rust",
             "py" | "python" => "python",
             _ => "unknown",
         }
