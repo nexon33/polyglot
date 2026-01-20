@@ -91,31 +91,38 @@ pub fn generate_rust(items: &[InterfaceItem]) -> String {
     let mut out = String::new();
     out.push_str("// Auto-generated from interface block\n\n");
 
-    // Collect functions for extern block
+    // Collect functions for export wrapper generation
     let functions: Vec<_> = items.iter().filter_map(|item| {
         if let InterfaceItem::Function(f) = item { Some(f) } else { None }
     }).collect();
 
-    // Generate extern block for cross-language imports
-    // NOTE: This is commented out because detecting which functions need imports
-    // vs. which have local implementations requires code analysis.
-    // For full WASM Component Model support, use wasm-compose to link modules.
-    /*
+    // Generate export wrappers for interface functions
+    // These make the user-defined functions visible to WASM host
     if !functions.is_empty() {
-        out.push_str("extern \"C\" {\n");
+        out.push_str("// Auto-generated export wrappers\n");
         for f in &functions {
             let params: Vec<String> = f.params.iter()
                 .map(|(name, ty)| format!("{}: {}", name, type_to_rust(ty)))
+                .collect();
+            let param_names: Vec<&str> = f.params.iter()
+                .map(|(name, _)| name.as_str())
                 .collect();
             let ret = match &f.return_type {
                 Some(ty) => format!(" -> {}", type_to_rust(ty)),
                 None => String::new(),
             };
-            out.push_str(&format!("    fn {}({}){};\n", f.name, params.join(", "), ret));
+            
+            // Generate #[no_mangle] wrapper that calls the user's implementation
+            out.push_str(&format!(
+                "#[no_mangle]\npub extern \"C\" fn __export_{}({}){} {{\n    {}({})\n}}\n\n",
+                f.name,
+                params.join(", "),
+                ret,
+                f.name,
+                param_names.join(", ")
+            ));
         }
-        out.push_str("}\n\n");
     }
-    */
 
     for item in items {
         match item {
@@ -129,7 +136,7 @@ pub fn generate_rust(items: &[InterfaceItem]) -> String {
                 out.push_str(&format!("pub type {} = {};\n\n", name, type_to_rust(ty)));
             }
             InterfaceItem::Function(_) => {
-                // Already handled in extern block
+                // Already handled in export wrapper generation
             }
         }
     }
@@ -191,20 +198,25 @@ fn type_to_rust(ty: &Type) -> String {
 
 pub fn generate_wit(items: &[InterfaceItem]) -> String {
     let mut out = String::new();
-    out.push_str("// Auto-generated WIT\n\n");
-
+    
+    // WIT package header
+    out.push_str("package polyglot:interface@0.1.0;\n\n");
+    
+    // Interface definition with all functions
+    out.push_str("interface exports {\n");
+    
     for item in items {
         match item {
             InterfaceItem::Struct(s) => {
-                out.push_str(&format!("record {} {{\n", to_kebab(&s.name)));
+                out.push_str(&format!("    record {} {{\n", to_kebab(&s.name)));
                 for field in &s.fields {
                     out.push_str(&format!(
-                        "    {}: {},\n",
+                        "        {}: {},\n",
                         to_kebab(&field.name),
                         type_to_wit(&field.ty)
                     ));
                 }
-                out.push_str("}\n\n");
+                out.push_str("    }\n\n");
             }
             InterfaceItem::Function(f) => {
                 let params: Vec<String> = f.params.iter()
@@ -214,12 +226,18 @@ pub fn generate_wit(items: &[InterfaceItem]) -> String {
                     Some(ty) => format!(" -> {}", type_to_wit(ty)),
                     None => String::new(),
                 };
-                out.push_str(&format!("{}: func({}){}\n", to_kebab(&f.name), params.join(", "), ret));
+                out.push_str(&format!("    {}: func({}){};\n", to_kebab(&f.name), params.join(", "), ret));
             }
-            // ... enums, type aliases
             _ => {}
         }
     }
+    
+    out.push_str("}\n\n");
+    
+    // World definition
+    out.push_str("world polyglot {\n");
+    out.push_str("    export exports;\n");
+    out.push_str("}\n");
 
     out
 }

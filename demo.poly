@@ -9,19 +9,15 @@ fn print_tensor(t: Tensor)
 use gridmesh::tensor::Tensor as GTensor;
 pub type Tensor = GTensor<f32>;
 
-// Exported interface functions - callable from other WASM modules
-
-#[no_mangle]
-pub extern "C" fn create_tensor(rows: u32, cols: u32) -> *mut Tensor {
+// Clean function definitions - exports are auto-generated from interface
+fn create_tensor(rows: u32, cols: u32) -> Tensor {
     println!("Rust: Allocating {}x{} tensor", rows, cols);
     let shape = vec![rows as usize, cols as usize];
-    Box::into_raw(Box::new(Tensor::zeros(&shape)))
+    Tensor::zeros(&shape)
 }
 
-#[no_mangle]
-pub extern "C" fn print_tensor(t: *const Tensor) {
-    let tensor = unsafe { &*t };
-    println!("Rust: Inspecting Tensor: {:?}", tensor);
+fn print_tensor(t: Tensor) {
+    println!("Rust: Inspecting Tensor: {:?}", t);
 }
 
 #[python]
@@ -30,19 +26,14 @@ import numpy as np
 
 # Python handles the data science / logic layer
 def process_tensor(t: Tensor) -> Tensor:
-    print(f"Pythonz: Processing tensor of shape {t.shape}")
-    # In a real implementation, this would map to logic
-    # ret = np.array(t) * 2.0
+    print(f"Python: Processing tensor of shape {t.shape}")
     return t
 
 #[main]
 fn main() {
     println!("Polyglot Runtime Init");
     
-    // Call exported interface functions
-    let tensor_ptr = create_tensor(128, 128);
-    print_tensor(tensor_ptr);
-    
-    // Clean up (in production, would use proper RAII)
-    unsafe { let _ = Box::from_raw(tensor_ptr); }
+    // Call interface functions - exports are auto-generated
+    let t = create_tensor(128, 128);
+    print_tensor(t);
 }
