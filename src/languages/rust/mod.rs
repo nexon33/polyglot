@@ -53,6 +53,12 @@ gridmesh = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/gridmesh" }
 #[no_mangle]
 pub extern "C" fn __pyrs_keepalive() {{}}
 
+// WASI entry point - calls user's main
+#[no_mangle]
+pub extern "C" fn _start() {{
+    main();
+}}
+
 {}
 "#,
             source
