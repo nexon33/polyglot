@@ -16,15 +16,25 @@ pub struct VirtualFile {
 pub struct VirtualFileManager {
     // Map of Real URI -> List of Virtual Files
     pub files: DashMap<Url, Vec<VirtualFile>>,
+    // Map of Real URI -> Source content (for hover support)
+    sources: DashMap<Url, String>,
 }
 
 impl VirtualFileManager {
     pub fn new() -> Self {
         Self::default()
     }
+    
+    /// Get the source content for a file
+    pub fn get_source(&self, uri: &Url) -> Option<String> {
+        self.sources.get(uri).map(|v| v.clone())
+    }
 
     pub fn update_file(&self, uri: Url, content: &str, version: i32) -> Vec<VirtualFile> {
         let mut virtual_files = Vec::new();
+        
+        // Store the source for hover support
+        self.sources.insert(uri.clone(), content.to_string());
 
         // Use the shared parser from the main crate
         if let Ok(parsed) = parse_poly(content) {

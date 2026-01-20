@@ -2,6 +2,9 @@
     "scopeName": "source.polyglot",
     "patterns": [
         {
+            "include": "#types-block"
+        },
+        {
             "include": "#interface-block"
         },
         {
@@ -11,10 +14,59 @@
             "include": "#python-block"
         },
         {
+            "include": "#js-block"
+        },
+        {
+            "include": "#rscss-block"
+        },
+        {
+            "include": "#gpu-block"
+        },
+        {
+            "include": "#html-block"
+        },
+        {
             "include": "#main-block"
         }
     ],
     "repository": {
+        "types-block": {
+            "begin": "^\\s*(#\\[(types)\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|rscss|gpu|html|main)\\])",
+            "patterns": [
+                {
+                    "match": "\\b(type)\\s+(\\w+)\\s*=",
+                    "captures": {
+                        "1": {
+                            "name": "storage.type.polyglot"
+                        },
+                        "2": {
+                            "name": "entity.name.type.polyglot"
+                        }
+                    }
+                },
+                {
+                    "match": "(rust|python):",
+                    "name": "keyword.other.polyglot"
+                },
+                {
+                    "match": "\\|",
+                    "name": "keyword.operator.polyglot"
+                },
+                {
+                    "match": "\\b[A-Z]\\w*(::\\w+)*(<[^>]+>)?",
+                    "name": "entity.name.type.polyglot"
+                },
+                {
+                    "include": "#comments"
+                }
+            ]
+        },
         "interface-block": {
             "begin": "^\\s*(#\\[interface\\])\\s*$",
             "beginCaptures": {
@@ -22,7 +74,7 @@
                     "name": "keyword.control.directive.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(interface|rust|rs|python|py|main)\\])",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|rscss|gpu|html|main)\\])",
             "patterns": [
                 {
                     "match": "\\b(fn)\\s+(\\w+)",
@@ -59,9 +111,12 @@
                     "name": "keyword.control.directive.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(interface|rust|rs|python|py|main)\\])",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|rscss|gpu|html|main)\\])",
             "contentName": "meta.embedded.rust",
             "patterns": [
+                {
+                    "include": "#polyglot-visibility-rust"
+                },
                 {
                     "include": "source.rust"
                 }
@@ -74,11 +129,35 @@
                     "name": "keyword.control.directive.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(interface|rust|rs|python|py|main)\\])",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|rscss|gpu|html|main)\\])",
             "contentName": "meta.embedded.python",
             "patterns": [
                 {
-                    "include": "source.python"
+                    "include": "#polyglot-visibility-python"
+                },
+                {
+                    "include": "#python-keywords"
+                },
+                {
+                    "include": "#python-function-def"
+                },
+                {
+                    "include": "#python-strings"
+                },
+                {
+                    "include": "#python-comments"
+                },
+                {
+                    "include": "#python-builtin"
+                },
+                {
+                    "include": "#python-types"
+                },
+                {
+                    "include": "#python-operators"
+                },
+                {
+                    "include": "#python-numbers"
                 }
             ]
         },
@@ -89,13 +168,236 @@
                     "name": "keyword.control.directive.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(interface|rust|rs|python|py|main)\\])|\\z",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|rscss|gpu|html|main)\\])|\\z",
             "contentName": "meta.embedded.rust",
             "patterns": [
+                {
+                    "include": "#polyglot-visibility-rust"
+                },
                 {
                     "include": "source.rust"
                 }
             ]
+        },
+        "js-block": {
+            "begin": "^\\s*(#\\[js\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|rscss|gpu|html|main)\\])",
+            "contentName": "meta.embedded.js",
+            "patterns": [
+                {
+                    "include": "#js-template-string"
+                },
+                {
+                    "include": "#js-strings"
+                },
+                {
+                    "include": "#js-keywords"
+                },
+                {
+                    "include": "#js-functions"
+                },
+                {
+                    "include": "#js-comments"
+                },
+                {
+                    "include": "#js-numbers"
+                },
+                {
+                    "include": "#js-jsx"
+                }
+            ]
+        },
+        "rscss-block": {
+            "begin": "^\\s*(#\\[rscss\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|rscss|gpu|html|main)\\])",
+            "contentName": "meta.embedded.css",
+            "patterns": [
+                {
+                    "include": "#css-rust-interpolation"
+                },
+                {
+                    "include": "source.css"
+                }
+            ]
+        },
+        "gpu-block": {
+            "begin": "^\\s*(#\\[gpu\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|rscss|gpu|html|main)\\])",
+            "contentName": "meta.embedded.wgsl",
+            "patterns": [
+                {
+                    "include": "#wgsl-keywords"
+                },
+                {
+                    "include": "#wgsl-types"
+                },
+                {
+                    "include": "#wgsl-functions"
+                },
+                {
+                    "include": "#wgsl-comments"
+                },
+                {
+                    "include": "#wgsl-numbers"
+                }
+            ]
+        },
+        "html-block": {
+            "begin": "^\\s*(#\\[html\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|rscss|gpu|html|main)\\])",
+            "contentName": "meta.embedded.html",
+            "patterns": [
+                {
+                    "include": "text.html.basic"
+                }
+            ]
+        },
+        "polyglot-visibility-rust": {
+            "patterns": [
+                {
+                    "match": "\\b(export|public|internal)\\s+(fn)\\s+(\\w+)",
+                    "captures": {
+                        "1": {
+                            "name": "storage.modifier.visibility.polyglot"
+                        },
+                        "2": {
+                            "name": "keyword.other.fn.rust"
+                        },
+                        "3": {
+                            "name": "entity.name.function.rust"
+                        }
+                    }
+                }
+            ]
+        },
+        "polyglot-visibility-python": {
+            "patterns": [
+                {
+                    "match": "\\b(export|public|internal)\\s+(def)\\s+(\\w+)",
+                    "captures": {
+                        "1": {
+                            "name": "storage.modifier.visibility.polyglot"
+                        },
+                        "2": {
+                            "name": "keyword.control.flow.python"
+                        },
+                        "3": {
+                            "name": "entity.name.function.python"
+                        }
+                    }
+                }
+            ]
+        },
+        "python-function-def": {
+            "match": "\\b(def)\\s+(\\w+)\\s*\\(",
+            "captures": {
+                "1": {
+                    "name": "keyword.control.flow.python"
+                },
+                "2": {
+                    "name": "entity.name.function.python"
+                }
+            }
+        },
+        "python-keywords": {
+            "match": "\\b(and|as|assert|async|await|break|class|continue|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\\b",
+            "name": "keyword.control.flow.python"
+        },
+        "python-builtin": {
+            "match": "\\b(print|len|range|str|int|float|bool|list|dict|set|tuple|type|isinstance|hasattr|getattr|setattr|open|input|map|filter|zip|enumerate|sorted|reversed|sum|min|max|abs|round|format|repr|True|False|None|self)\\b",
+            "name": "support.function.builtin.python"
+        },
+        "python-types": {
+            "match": "\\b([A-Z][A-Za-z0-9_]*)\\b",
+            "name": "entity.name.type.python"
+        },
+        "python-strings": {
+            "patterns": [
+                {
+                    "begin": "(f)\"",
+                    "beginCaptures": {
+                        "1": {
+                            "name": "storage.type.string.python"
+                        }
+                    },
+                    "end": "\"",
+                    "name": "string.quoted.double.python",
+                    "patterns": [
+                        {
+                            "match": "\\{[^}]+\\}",
+                            "name": "constant.other.placeholder.python"
+                        }
+                    ]
+                },
+                {
+                    "begin": "(f)'",
+                    "beginCaptures": {
+                        "1": {
+                            "name": "storage.type.string.python"
+                        }
+                    },
+                    "end": "'",
+                    "name": "string.quoted.single.python",
+                    "patterns": [
+                        {
+                            "match": "\\{[^}]+\\}",
+                            "name": "constant.other.placeholder.python"
+                        }
+                    ]
+                },
+                {
+                    "begin": "\"\"\"",
+                    "end": "\"\"\"",
+                    "name": "string.quoted.triple.python"
+                },
+                {
+                    "begin": "'''",
+                    "end": "'''",
+                    "name": "string.quoted.triple.python"
+                },
+                {
+                    "begin": "\"",
+                    "end": "\"",
+                    "name": "string.quoted.double.python"
+                },
+                {
+                    "begin": "'",
+                    "end": "'",
+                    "name": "string.quoted.single.python"
+                }
+            ]
+        },
+        "python-comments": {
+            "match": "#.*$",
+            "name": "comment.line.number-sign.python"
+        },
+        "python-operators": {
+            "match": "(->|==|!=|<=|>=|<|>|\\+|-|\\*|/|%|\\*\\*|//|=|\\+=|-=|\\*=|/=)",
+            "name": "keyword.operator.python"
+        },
+        "python-numbers": {
+            "match": "\\b(0x[0-9A-Fa-f]+|0b[01]+|0o[0-7]+|\\d+\\.?\\d*([eE][+-]?\\d+)?)\\b",
+            "name": "constant.numeric.python"
         },
         "comments": {
             "patterns": [
@@ -104,6 +406,131 @@
                     "name": "comment.line.double-slash.polyglot"
                 }
             ]
+        },
+        "js-template-string": {
+            "begin": "`",
+            "end": "`",
+            "name": "string.template.js",
+            "patterns": [
+                {
+                    "begin": "\\$\\{",
+                    "end": "\\}",
+                    "name": "meta.template.expression.js",
+                    "patterns": [
+                        {
+                            "include": "#js-keywords"
+                        }
+                    ]
+                }
+            ]
+        },
+        "js-strings": {
+            "patterns": [
+                {
+                    "begin": "\"",
+                    "end": "\"",
+                    "name": "string.quoted.double.js",
+                    "patterns": [
+                        {
+                            "match": "\\\\.",
+                            "name": "constant.character.escape.js"
+                        }
+                    ]
+                },
+                {
+                    "begin": "'",
+                    "end": "'",
+                    "name": "string.quoted.single.js",
+                    "patterns": [
+                        {
+                            "match": "\\\\.",
+                            "name": "constant.character.escape.js"
+                        }
+                    ]
+                }
+            ]
+        },
+        "js-keywords": {
+            "match": "\\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|this|class|extends|import|export|from|default|async|await|try|catch|finally|throw|typeof|instanceof|in|of|null|undefined|true|false)\\b",
+            "name": "keyword.control.js"
+        },
+        "js-functions": {
+            "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*\\(",
+            "captures": {
+                "1": {
+                    "name": "entity.name.function.js"
+                }
+            }
+        },
+        "js-comments": {
+            "patterns": [
+                {
+                    "match": "//.*$",
+                    "name": "comment.line.double-slash.js"
+                },
+                {
+                    "begin": "/\\*",
+                    "end": "\\*/",
+                    "name": "comment.block.js"
+                }
+            ]
+        },
+        "js-numbers": {
+            "match": "\\b(0x[0-9A-Fa-f]+|0b[01]+|0o[0-7]+|\\d+\\.?\\d*([eE][+-]?\\d+)?)\\b",
+            "name": "constant.numeric.js"
+        },
+        "js-jsx": {
+            "patterns": [
+                {
+                    "match": "</?[A-Z][A-Za-z0-9]*",
+                    "name": "entity.name.tag.jsx"
+                },
+                {
+                    "match": "</?[a-z][a-z0-9-]*",
+                    "name": "entity.name.tag.html"
+                },
+                {
+                    "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*=",
+                    "captures": {
+                        "1": {
+                            "name": "entity.other.attribute-name.jsx"
+                        }
+                    }
+                }
+            ]
+        },
+        "css-rust-interpolation": {
+            "match": "@\\{[A-Z_][A-Z0-9_]*\\}",
+            "name": "variable.other.polyglot"
+        },
+        "wgsl-keywords": {
+            "match": "\\b(fn|var|let|const|struct|return|if|else|for|while|loop|break|continue|switch|case|default|discard|enable|alias|override|diagnostic)\\b",
+            "name": "keyword.control.wgsl"
+        },
+        "wgsl-types": {
+            "match": "\\b(f32|f16|i32|u32|bool|vec2|vec3|vec4|mat2x2|mat3x3|mat4x4|array|sampler|texture_2d|texture_3d|texture_cube|ptr|atomic)\\b",
+            "name": "storage.type.wgsl"
+        },
+        "wgsl-functions": {
+            "match": "@(vertex|fragment|compute|builtin|location|binding|group|workgroup_size)",
+            "name": "entity.name.function.decorator.wgsl"
+        },
+        "wgsl-comments": {
+            "patterns": [
+                {
+                    "match": "//.*$",
+                    "name": "comment.line.double-slash.wgsl"
+                },
+                {
+                    "begin": "/\\*",
+                    "end": "\\*/",
+                    "name": "comment.block.wgsl"
+                }
+            ]
+        },
+        "wgsl-numbers": {
+            "match": "\\b(0x[0-9A-Fa-f]+|\\d+\\.?\\d*([eE][+-]?\\d+)?[fh]?)\\b",
+            "name": "constant.numeric.wgsl"
         }
     }
 }

@@ -1,0 +1,1 @@
+type Tensor = rust:gridmesh::tensor::Tensor<f32> | python:gridmesh.Tensor

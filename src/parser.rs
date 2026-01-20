@@ -81,7 +81,8 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
 
     // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[types], #[main], etc.
     // Only matches known polyglot tags, not Rust attributes like #[no_mangle]
-    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|main)(?::[a-zA-Z0-9_:]+)?\]\s*$")
+    // Supported: rust/rs, python/py, interface, types, main, gpu, js, html, rscss, css
+    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|main|gpu|wgsl|js|jsx|html|rscss|css)(?::[a-zA-Z0-9_:]+)?\]\s*$")
         .unwrap();
 
     let matches: Vec<_> = re.find_iter(source).collect();
@@ -114,7 +115,7 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             }
             // Fall through to also add interface as a code block for LSP VirtualFile tracking
         }
-        
+
         // Parse #[types] blocks for type declarations (cleaner syntax than #[interface])
         if lang_tag == "types" {
             if let Ok(interfaces) = crate::interface::parser::parse_interface(tag_content) {
@@ -138,59 +139,214 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             start_line,
         });
     }
-    
-    // Auto-discover pub functions from Rust/Python blocks
-    scan_pub_functions(&mut parsed);
+
+    // Auto-discover export/public functions from Rust/Python blocks
+    scan_exported_functions(&mut parsed);
 
     Ok(parsed)
 }
 
-/// Scan code blocks for `pub fn` (Rust) and `pub def` (Python) and add to interfaces
-fn scan_pub_functions(parsed: &mut ParsedFile) {
-    use crate::interface::parser::{InterfaceItem, FunctionDecl, Type, Visibility};
+/// Scan code blocks for `export fn`, `public fn` (Rust) and `export def`, `public def` (Python)
+fn scan_exported_functions(parsed: &mut ParsedFile) {
+    use crate::interface::parser::{FunctionDecl, InterfaceItem, PrimitiveType, Type, Visibility};
     use regex::Regex;
-    
-    // Regex for Rust: pub fn name(params) -> ReturnType
-    let rust_fn_re = Regex::new(r"pub\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap();
-    
-    // Regex for Python: pub def name(params) -> ReturnType:
-    // Note: "pub def" is our polyglot syntax, not standard Python
-    let python_fn_re = Regex::new(r"pub\s+def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap();
-    
+
+    // Rust patterns:
+    // - export fn name(params) -> Type  => Export visibility
+    // - public fn name(params) -> Type  => Public visibility (FFI)
+    // - pub fn name(params) -> Type      => Public (alias, Rust-friendly)
+    let rust_export_re =
+        Regex::new(r"export\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^\{]+))?").unwrap();
+    let rust_public_re =
+        Regex::new(r"(?:public|pub)\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^\{]+))?").unwrap();
+
+    // Python patterns:
+    // - export def name(params) -> Type:  => Export visibility
+    // - public def name(params) -> Type:  => Public visibility (FFI)
+    let python_export_re =
+        Regex::new(r"export\s+def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap();
+    let python_public_re =
+        Regex::new(r"(?:public|pub)\s+def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap();
+
     for block in &parsed.blocks {
-        let re = match block.lang_tag.as_str() {
-            "rust" | "rs" => &rust_fn_re,
-            "python" | "py" => &python_fn_re,
+        let (patterns, is_rust): (Vec<(&Regex, Visibility)>, bool) = match block.lang_tag.as_str() {
+            "rust" | "rs" => (
+                vec![
+                    (&rust_export_re, Visibility::Export),
+                    (&rust_public_re, Visibility::Public),
+                ],
+                true,
+            ),
+            "python" | "py" => (
+                vec![
+                    (&python_export_re, Visibility::Export),
+                    (&python_public_re, Visibility::Public),
+                ],
+                false,
+            ),
             _ => continue,
         };
-        
-        for cap in re.captures_iter(&block.code) {
-            let name = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
-            let _params_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-            let return_type = cap.get(3).map(|m| Type::Named(m.as_str().to_string()));
-            
-            // `pub` means Export visibility (callable from other .poly files)
-            let func_decl = FunctionDecl {
-                name,
-                params: vec![], // TODO: parse params properly
-                return_type,
-                visibility: Visibility::Export,
-            };
-            
-            // Check if this function is already in interfaces (avoid duplicates)
-            let already_exists = parsed.interfaces.iter().any(|item| {
-                if let InterfaceItem::Function(f) = item {
-                    f.name == func_decl.name
-                } else {
-                    false
+
+        for (re, visibility) in patterns {
+            for cap in re.captures_iter(&block.code) {
+                let name = cap
+                    .get(1)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+                let params_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                let return_type_str = cap.get(3).map(|m| m.as_str().trim());
+
+                // Parse parameters
+                let params = parse_params_to_type(params_str, is_rust);
+
+                // Parse return type
+                let return_type = return_type_str.and_then(|s| {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(parse_type_str(s, is_rust))
+                    }
+                });
+
+                let func_decl = FunctionDecl {
+                    name,
+                    params,
+                    return_type,
+                    visibility,
+                };
+
+                // Check if this function is already in interfaces (avoid duplicates)
+                let already_exists = parsed.interfaces.iter().any(|item| {
+                    if let InterfaceItem::Function(f) = item {
+                        f.name == func_decl.name
+                    } else {
+                        false
+                    }
+                });
+
+                if !already_exists {
+                    parsed.interfaces.push(InterfaceItem::Function(func_decl));
                 }
-            });
-            
-            if !already_exists {
-                parsed.interfaces.push(InterfaceItem::Function(func_decl));
             }
         }
     }
+}
+
+/// Parse a parameter string like "rows: u32, cols: u32" into Vec<(String, Type)>
+fn parse_params_to_type(
+    params_str: &str,
+    is_rust: bool,
+) -> Vec<(String, crate::interface::parser::Type)> {
+    use crate::interface::parser::Type;
+
+    let mut params = Vec::new();
+    let trimmed = params_str.trim();
+
+    if trimmed.is_empty() {
+        return params;
+    }
+
+    // Skip self parameters
+    let trimmed = if is_rust {
+        trimmed
+            .trim_start_matches("&mut self,")
+            .trim_start_matches("&self,")
+            .trim_start_matches("mut self,")
+            .trim_start_matches("self,")
+            .trim()
+    } else {
+        // Python: skip 'self' as first param
+        if trimmed.starts_with("self,") {
+            trimmed.trim_start_matches("self,").trim()
+        } else if trimmed == "self" {
+            return params;
+        } else {
+            trimmed
+        }
+    };
+
+    if trimmed.is_empty() {
+        return params;
+    }
+
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        // Parse "name: Type" or "name: Type = default"
+        if let Some(colon_idx) = part.find(':') {
+            let name = part[..colon_idx]
+                .trim()
+                .trim_start_matches("mut ")
+                .to_string();
+            let type_part = part[colon_idx + 1..].trim();
+
+            // Remove default value if present (for Python)
+            let type_str = if let Some(eq_idx) = type_part.find('=') {
+                type_part[..eq_idx].trim()
+            } else {
+                type_part
+            };
+
+            let ty = parse_type_str(type_str, is_rust);
+            params.push((name, ty));
+        }
+    }
+
+    params
+}
+
+/// Parse a type string into Type enum
+fn parse_type_str(s: &str, is_rust: bool) -> crate::interface::parser::Type {
+    use crate::interface::parser::{PrimitiveType, Type};
+
+    let s = s.trim();
+
+    // Handle primitives
+    if is_rust {
+        match s {
+            "bool" => return Type::Primitive(PrimitiveType::Bool),
+            "u8" => return Type::Primitive(PrimitiveType::U8),
+            "u16" => return Type::Primitive(PrimitiveType::U16),
+            "u32" => return Type::Primitive(PrimitiveType::U32),
+            "u64" => return Type::Primitive(PrimitiveType::U64),
+            "i8" => return Type::Primitive(PrimitiveType::I8),
+            "i16" => return Type::Primitive(PrimitiveType::I16),
+            "i32" => return Type::Primitive(PrimitiveType::I32),
+            "i64" => return Type::Primitive(PrimitiveType::I64),
+            "f32" => return Type::Primitive(PrimitiveType::F32),
+            "f64" => return Type::Primitive(PrimitiveType::F64),
+            "String" | "&str" | "&String" => return Type::Primitive(PrimitiveType::String),
+            _ => {}
+        }
+    } else {
+        // Python types
+        match s {
+            "bool" => return Type::Primitive(PrimitiveType::Bool),
+            "int" => return Type::Primitive(PrimitiveType::I64),
+            "float" => return Type::Primitive(PrimitiveType::F64),
+            "str" => return Type::Primitive(PrimitiveType::String),
+            "bytes" => return Type::Primitive(PrimitiveType::Bytes),
+            _ => {}
+        }
+    }
+
+    // Handle generics like Vec<T> or list[T]
+    if is_rust && s.starts_with("Vec<") && s.ends_with('>') {
+        let inner = &s[4..s.len() - 1];
+        return Type::Generic("Vec".to_string(), vec![parse_type_str(inner, is_rust)]);
+    }
+
+    if !is_rust && s.starts_with("list[") && s.ends_with(']') {
+        let inner = &s[5..s.len() - 1];
+        return Type::Generic("list".to_string(), vec![parse_type_str(inner, is_rust)]);
+    }
+
+    // Default: Named type
+    Type::Named(s.to_string())
 }
 
 pub fn parse_python_params(s: &str) -> Result<Vec<Param>, ParseError> {

@@ -27,6 +27,8 @@ pub struct TypeGraph {
     interfaces: HashMap<String, TypeNode>,
     // Implementations: Function Name -> (Lang, Signature)
     implementations: HashMap<String, (String, TypeNode)>,
+    // Type declarations: Type Name -> (Rust impl, Python impl)
+    type_declarations: HashMap<String, (Option<String>, Option<String>)>,
     // All function call sites (legacy, kept for compatibility)
     pub call_sites: Vec<CallSite>,
     // Unified symbol table for AST-based linking
@@ -38,6 +40,7 @@ impl TypeGraph {
         Self {
             interfaces: HashMap::new(),
             implementations: HashMap::new(),
+            type_declarations: HashMap::new(),
             call_sites: Vec::new(),
             symbol_table: SymbolTable::new(),
         }
@@ -46,6 +49,7 @@ impl TypeGraph {
     pub fn clear(&mut self) {
         self.interfaces.clear();
         self.implementations.clear();
+        self.type_declarations.clear();
         self.call_sites.clear();
         self.symbol_table.clear();
     }
@@ -70,7 +74,23 @@ impl TypeGraph {
         for vfile in vfiles {
             eprintln!("TypeGraph: Processing block lang_tag='{}' start_line={}", vfile.lang_tag, vfile.start_line);
             
-            if vfile.lang_tag == "interface" {
+            if vfile.lang_tag == "types" {
+                // Parse type declarations: type Name = rust:path | python:path
+                let type_regex = regex::Regex::new(
+                    r"type\s+(\w+)\s*=\s*(?:rust:([^\s|]+))?\s*\|?\s*(?:python:([^\s]+))?"
+                ).unwrap();
+                
+                for line in vfile.content.lines() {
+                    if let Some(cap) = type_regex.captures(line) {
+                        let name = cap[1].to_string();
+                        let rust_impl = cap.get(2).map(|m| m.as_str().to_string());
+                        let python_impl = cap.get(3).map(|m| m.as_str().to_string());
+                        
+                        eprintln!("TypeGraph: Parsed type '{}' rust={:?} python={:?}", name, rust_impl, python_impl);
+                        self.add_type_declaration(&name, rust_impl, python_impl);
+                    }
+                }
+            } else if vfile.lang_tag == "interface" {
                 // Parse interface declarations - functions defined in the polyglot contract
                 for (line_idx, line) in vfile.content.lines().enumerate() {
                     if let Some(cap) = interface_regex.captures(line) {
@@ -370,6 +390,89 @@ impl TypeGraph {
     pub fn add_implementation(&mut self, name: &str, lang: &str, node: TypeNode) {
         self.implementations
             .insert(name.to_string(), (lang.to_string(), node));
+    }
+    
+    /// Get function hover info: signature, implementation language, interface declaration
+    pub fn get_function_hover(&self, name: &str) -> Option<String> {
+        let mut hover_parts = Vec::new();
+        
+        // Interface declaration
+        if let Some(iface) = self.interfaces.get(name) {
+            let params = iface.params.join(", ");
+            let ret = iface.return_type.as_deref().unwrap_or("()");
+            hover_parts.push(format!(
+                "**{}** *(Polyglot function)*\n\n---\n\n```\nfn {}({}) -> {}\n```\n\n*Declared in interface block*",
+                name, name, params, ret
+            ));
+        }
+        
+        // Implementation info
+        if let Some((lang, impl_node)) = self.implementations.get(name) {
+            let lang_display = match lang.as_str() {
+                "rs" | "rust" => "Rust 🦀",
+                "py" | "python" => "Python 🐍",
+                "main" => "Main (Rust)",
+                _ => lang,
+            };
+            
+            let params = impl_node.params.join(", ");
+            let ret = impl_node.return_type.as_deref().unwrap_or("()");
+            
+            if hover_parts.is_empty() {
+                // No interface, just implementation
+                hover_parts.push(format!(
+                    "**{}** *(Polyglot function)*\n\n---\n\n```\nfn {}({}) -> {}\n```\n\n**Implemented in:** {}",
+                    name, name, params, ret, lang_display
+                ));
+            } else {
+                hover_parts.push(format!("\n\n**Implemented in:** {}", lang_display));
+            }
+        }
+        
+        if hover_parts.is_empty() {
+            None
+        } else {
+            Some(hover_parts.join(""))
+        }
+    }
+    
+    /// Get interface signature for a function
+    pub fn get_interface(&self, name: &str) -> Option<&TypeNode> {
+        self.interfaces.get(name)
+    }
+    
+    /// Get all interfaces (for type hover)
+    pub fn get_interfaces(&self) -> &HashMap<String, TypeNode> {
+        &self.interfaces
+    }
+    
+    /// Add a type declaration
+    pub fn add_type_declaration(&mut self, name: &str, rust_impl: Option<String>, python_impl: Option<String>) {
+        self.type_declarations.insert(name.to_string(), (rust_impl, python_impl));
+    }
+    
+    /// Get type hover info
+    pub fn get_type_hover(&self, name: &str) -> Option<String> {
+        if let Some((rust_impl, python_impl)) = self.type_declarations.get(name) {
+            let mut hover = format!("**{}** *(Polyglot type)*\n\n---\n\n", name);
+            
+            if let Some(rust) = rust_impl {
+                hover.push_str(&format!("**Rust:** `{}`\n\n", rust));
+            }
+            if let Some(python) = python_impl {
+                hover.push_str(&format!("**Python:** `{}`\n\n", python));
+            }
+            
+            hover.push_str("*Cross-language type mapping defined in `#[types]` block*");
+            
+            return Some(hover);
+        }
+        None
+    }
+    
+    /// Get all type declarations
+    pub fn get_type_declarations(&self) -> &HashMap<String, (Option<String>, Option<String>)> {
+        &self.type_declarations
     }
 
     pub fn check_consistency(&self) -> Vec<Diagnostic> {

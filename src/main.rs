@@ -53,6 +53,19 @@ enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
+    /// Build and bundle into a single self-contained HTML file
+    Bundle {
+        /// Input poly file
+        file: PathBuf,
+
+        /// Output HTML file (default: <name>.html)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Title for the HTML page
+        #[arg(short, long, default_value = "Polyglot App")]
+        title: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -90,6 +103,49 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Init { name } => {
             init_project(name)?;
+        }
+        Commands::Bundle {
+            file,
+            output,
+            title,
+        } => {
+            // Build first
+            let wasm_path = build_poly(&file, true)?;
+
+            // Read WASM bytes
+            let wasm_bytes = fs::read(&wasm_path)?;
+
+            // Get temp dir from the file's parent
+            let temp_dir = file
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("target/polyglot_tmp");
+
+            // Generate bundle
+            let bundle = polyglot::compiler::bundle_to_single_file(&temp_dir, &wasm_bytes, &title)?;
+
+            // Determine output path
+            let out_path = output.unwrap_or_else(|| {
+                let stem = file.file_stem().unwrap_or_default().to_string_lossy();
+                PathBuf::from(format!("{}.html", stem))
+            });
+
+            fs::write(&out_path, &bundle)?;
+
+            let size_kb = bundle.len() / 1024;
+            println!(
+                "📦 Single-file bundle: {} ({} KB)",
+                out_path.display(),
+                size_kb
+            );
+            println!("   ✓ WASM: base64 inline");
+            println!("   ✓ CSS:  <style> inline");
+            println!("   ✓ JS:   <script> inline");
+            println!("   ✓ GPU:  WGSL shaders embedded");
+            println!(
+                "\n🌐 Open in browser: file://{}",
+                fs::canonicalize(&out_path)?.display()
+            );
         }
     }
 

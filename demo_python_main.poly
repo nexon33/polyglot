@@ -1,0 +1,30 @@
+
+#[types]
+type Tensor = rust:gridmesh::tensor::Tensor<f32> | python:gridmesh.Tensor
+
+#[rust]
+// Helper functions in Rust
+
+export fn create_tensor(rows: u32, cols: u32) -> Tensor {
+    println!("Rust: Creating {}x{} tensor", rows, cols);
+    let shape = vec![rows as usize, cols as usize];
+    Tensor::zeros(&shape)
+}
+
+export fn print_tensor(t: Tensor) {
+    println!("Rust: Tensor is {:?}", t);
+}
+
+#[python]
+# Python main entry point - compiler auto-detects this!
+
+export def process_tensor(t: Tensor) -> Tensor:
+    print(f"Python: Processing {t.shape}")
+    return t
+
+def main():
+    print("Hello from Python main!")
+    t = create_tensor(64, 64)
+    t2 = process_tensor(t)
+    print_tensor(t2)
+    print("Done!")

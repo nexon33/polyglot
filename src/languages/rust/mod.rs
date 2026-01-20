@@ -26,11 +26,12 @@ impl Language for Rust {
     fn compile(&self, source: &str, opts: &CompileOptions) -> Result<Vec<u8>> {
         // Create a temporary Cargo project to handle dependencies correctly
         let _package_name = "poly_cell";
-        
+
         // Check if Python bridge is being used (contains RustPython imports)
         let needs_rustpython = source.contains("rustpython_vm");
-        
-        let mut cargo_toml = String::from(r#"
+
+        let mut cargo_toml = String::from(
+            r#"
 [workspace]
 
 [package]
@@ -46,13 +47,40 @@ path = "lib.rs"
 anyhow = "1.0" 
 wit-bindgen = "0.41"
 gridmesh = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/gridmesh" }
-"#);
-        
+"#,
+        );
+
         if needs_rustpython {
             cargo_toml.push_str("rustpython-vm = { git = \"https://github.com/RustPython/RustPython\", default-features = false, features = [\"compiler\", \"codegen\"] }\n");
         }
 
         fs::write(opts.temp_dir.join("Cargo.toml"), cargo_toml)?;
+
+        // Determine entry point based on main_lang
+        let main_lang = opts.main_lang.as_deref().unwrap_or("rust");
+
+        let start_wrapper = match main_lang {
+            "python" | "py" => {
+                // Python main: _start calls the Python main via RustPython bridge
+                r#"
+// WASI entry point - calls Python main via RustPython
+#[no_mangle]
+pub extern "C" fn _start() {
+    __python_main();
+}
+"#
+            }
+            _ => {
+                // Rust main (default): _start calls Rust main directly
+                r#"
+// WASI entry point - calls user's Rust main
+#[no_mangle]
+pub extern "C" fn _start() {
+    main();
+}
+"#
+            }
+        };
 
         // Wrap the user code.
         // We do NOT use no_std so that println! and vec! work (WASI supports them).
@@ -60,16 +88,10 @@ gridmesh = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/gridmesh" }
             r#"
 #[no_mangle]
 pub extern "C" fn __pyrs_keepalive() {{}}
-
-// WASI entry point - calls user's main
-#[no_mangle]
-pub extern "C" fn _start() {{
-    main();
-}}
-
+{}
 {}
 "#,
-            source
+            start_wrapper, source
         );
 
         let lib_rs = opts.temp_dir.join("lib.rs");
@@ -111,37 +133,58 @@ pub extern "C" fn _start() {{
     }
 
     fn parse_signatures(&self, source: &str) -> Result<Vec<FunctionSig>, ParseError> {
+        let syntax = syn::parse_file(source).map_err(|e| ParseError {
+            message: e.to_string(),
+            line: 0, // Span line info requires extra features, defaulting to 0
+        })?;
+
         let mut sigs = Vec::new();
-        let func_regex = Regex::new(
-            r"(?m)^(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^{]+))?",
-        )
-        .unwrap();
 
-        for caps in func_regex.captures_iter(source) {
-            let start = caps.get(0).unwrap().start();
-            // Check for async keyword in the lines before the match
-            let is_async = source[..start]
-                .lines()
-                .last()
-                .map(|l| l.contains("async"))
-                .unwrap_or(false);
+        for item in syntax.items {
+            if let syn::Item::Fn(func) = item {
+                // Ignore non-pub functions if desired, but for now we follow regex behavior which allowed non-pub (regex was loose)
+                // Actually regex had `(?:pub\s+)?`, so it didn't require pub.
+                // We keep capturing all top-level functions.
 
-            let name = caps.get(1).unwrap().as_str().to_string();
-            let params_str = caps.get(2).unwrap().as_str();
-            let returns_str = caps.get(3).map(|m| m.as_str().trim());
+                let name = func.sig.ident.to_string();
+                println!("DEBUG: Found function: {}", name);
+                let is_async = func.sig.asyncness.is_some();
 
-            let params = parse_rust_params(params_str)?;
-            let returns = match returns_str {
-                Some(s) if !s.is_empty() => Some(parse_rust_type(s)?),
-                _ => None,
-            };
+                // Parse params
+                let mut params_str = String::new();
+                for input in func.sig.inputs {
+                    if !params_str.is_empty() {
+                        params_str.push_str(", ");
+                    }
+                    // Reconstruct param string "name: type" for generic parser
+                    // Or ideally we parse AST to Param directly.
+                    // Let's rely on quote to get the type string.
+                    if let syn::FnArg::Typed(pat_type) = input {
+                        let pat = quote::quote!(#pat_type).to_string();
+                        params_str.push_str(&pat);
+                    }
+                }
+                let params = parse_rust_params(&params_str)?;
 
-            sigs.push(FunctionSig {
-                name,
-                params,
-                returns,
-                is_async,
-            });
+                // Parse return type
+                let returns = match func.sig.output {
+                    syn::ReturnType::Default => None,
+                    syn::ReturnType::Type(_, ty) => {
+                        let type_str = quote::quote!(#ty).to_string();
+                        // Remove whitespace from quote output (e . g . "Vec < f32 >") if needed
+                        // parse_rust_type handles spacing well usually, but let's be careful.
+                        // Actually, simple spacing is fine.
+                        Some(parse_rust_type(&type_str)?)
+                    }
+                };
+
+                sigs.push(FunctionSig {
+                    name,
+                    params,
+                    returns,
+                    is_async,
+                });
+            }
         }
         Ok(sigs)
     }

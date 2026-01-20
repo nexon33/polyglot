@@ -197,13 +197,61 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let line = params.text_document_position_params.position.line as usize;
-        let character = params.text_document_position_params.position.character;
+        let character = params.text_document_position_params.position.character as usize;
 
+        // Get the line content to check for Polyglot-specific keywords
         let vfiles = self.vfm.get_files(&uri).unwrap_or_default();
         
+        // First, check for Polyglot-specific keywords that we handle directly
+        if let Some(source) = self.vfm.get_source(&uri) {
+            let lines: Vec<&str> = source.lines().collect();
+            if line < lines.len() {
+                let line_text = lines[line];
+                
+                // Check for visibility keywords
+                if let Some(hover) = self.check_polyglot_hover(line_text, character) {
+                    return Ok(Some(hover));
+                }
+                
+                // Check for block directives
+                if let Some(hover) = self.check_directive_hover(line_text, character) {
+                    return Ok(Some(hover));
+                }
+                
+                // Extract word at cursor for function/type hover
+                let word = self.extract_word_at_cursor(line_text, character);
+                
+                if !word.is_empty() {
+                    let tg = self.type_graph.lock().await;
+                    
+                    // Check for function hover
+                    if let Some(hover_text) = tg.get_function_hover(&word) {
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: hover_text,
+                            }),
+                            range: None,
+                        }));
+                    }
+                    
+                    // Check for type hover
+                    if let Some(hover_text) = tg.get_type_hover(&word) {
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: hover_text,
+                            }),
+                            range: None,
+                        }));
+                    }
+                }
+            }
+        }
+        
+        // Delegate to language server for standard language hover
         for vfile in vfiles {
             if let Some(v_line) = vfile.map_to_virtual(line) {
-                // Found the block - use normalized virtual URI
                 let virtual_uri_str = vfile.virtual_uri();
 
                 let req_params = serde_json::json!({
@@ -218,9 +266,7 @@ impl LanguageServer for Backend {
 
                 match self.delegator.request(&vfile.lang_tag, "textDocument/hover", req_params).await {
                     Ok(resp) => {
-                        // Parse response into Option<Hover>
                         if let Ok(mut hover) = serde_json::from_value::<Hover>(resp) {
-                            // Remap range if present
                             if let Some(range) = &mut hover.range {
                                 range.start.line = vfile.map_to_real(range.start.line as usize) as u32;
                                 range.end.line = vfile.map_to_real(range.end.line as usize) as u32;
@@ -467,6 +513,99 @@ impl LanguageServer for Backend {
         }
         
         Ok(Some(locations))
+    }
+}
+
+impl Backend {
+    /// Check if cursor is on a Polyglot visibility keyword (export, public, internal)
+    fn check_polyglot_hover(&self, line_text: &str, character: usize) -> Option<Hover> {
+        let keywords = [
+            ("export", "**export** *(Polyglot visibility)*\n\n---\n\nExported function callable from **other .poly files** that import this module.\n\n```\nexport fn foo() // Rust\nexport def bar() // Python\n```\n\nGenerates capability-protected FFI wrappers."),
+            ("public", "**public** *(Polyglot visibility)*\n\n---\n\nPublic function callable from **anywhere**, including raw FFI calls.\n\n```\npublic fn foo() // or pub fn\npublic def bar()\n```\n\nNo capability check - use sparingly for true public APIs."),
+            ("pub", "**pub** *(Polyglot visibility)*\n\n---\n\nAlias for `public`. Function callable from **anywhere**, including raw FFI.\n\nRust-friendly syntax for developers used to `pub fn`."),
+            ("internal", "**internal** *(Polyglot visibility)*\n\n---\n\nInternal function only callable from **this file**.\n\n```\ninternal fn helper() // Explicit internal\nfn helper()          // Implicit internal (default)\n```\n\nNot exported to FFI. Capability-protected within the ecosystem."),
+        ];
+        
+        for (keyword, description) in &keywords {
+            if let Some(start) = line_text.find(keyword) {
+                let end = start + keyword.len();
+                // Check if cursor is within this keyword and it's followed by fn/def
+                if character >= start && character <= end {
+                    // Verify it's actually a visibility keyword (followed by fn/def)
+                    let after = &line_text[end..].trim_start();
+                    if after.starts_with("fn") || after.starts_with("def") {
+                        return Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: description.to_string(),
+                            }),
+                            range: None,
+                        });
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// Check if cursor is on a block directive (#[rust], #[python], etc.)
+    fn check_directive_hover(&self, line_text: &str, character: usize) -> Option<Hover> {
+        let directives = [
+            ("#[types]", "**#[types]** *(Polyglot block)*\n\n---\n\nDefine cross-language type mappings.\n\n```\n#[types]\ntype Tensor = rust:gridmesh::Tensor<f32> | python:gridmesh.Tensor\n```\n\nTypes declared here are available in all subsequent blocks."),
+            ("#[interface]", "**#[interface]** *(Polyglot block)*\n\n---\n\nDeclare function signatures without implementation.\n\n```\n#[interface]\nfn process(data: Tensor) -> Tensor\n```\n\nFunctions here must be implemented in a language block."),
+            ("#[rust]", "**#[rust]** *(Polyglot block)*\n\n---\n\nRust implementation block. Code here compiles to WASM.\n\n```\n#[rust]\nexport fn create_tensor(rows: u32, cols: u32) -> Tensor {\n    Tensor::zeros(&[rows as usize, cols as usize])\n}\n```"),
+            ("#[rs]", "**#[rs]** *(Polyglot block)*\n\n---\n\nAlias for `#[rust]`. Rust implementation block."),
+            ("#[python]", "**#[python]** *(Polyglot block)*\n\n---\n\nPython implementation block. Runs via embedded RustPython.\n\n```\n#[python]\nexport def process_tensor(t: Tensor) -> Tensor:\n    print(f\"Processing {t.shape}\")\n    return t\n```"),
+            ("#[py]", "**#[py]** *(Polyglot block)*\n\n---\n\nAlias for `#[python]`. Python implementation block."),
+            ("#[main]", "**#[main]** *(Polyglot block)*\n\n---\n\nEntry point block (Rust syntax). Compiled as `_start` for WASM.\n\n```\n#[main]\nfn main() {\n    let t = create_tensor(128, 128);\n    print_tensor(t);\n}\n```"),
+        ];
+        
+        for (directive, description) in &directives {
+            if let Some(start) = line_text.find(directive) {
+                let end = start + directive.len();
+                if character >= start && character <= end {
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: description.to_string(),
+                        }),
+                        range: None,
+                    });
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// Extract the word at the cursor position
+    fn extract_word_at_cursor(&self, line_text: &str, character: usize) -> String {
+        let chars: Vec<char> = line_text.chars().collect();
+        
+        if character >= chars.len() {
+            return String::new();
+        }
+        
+        // Find word boundaries
+        let mut start = character;
+        let mut end = character;
+        
+        // Expand left
+        while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+            start -= 1;
+        }
+        
+        // Expand right  
+        while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+            end += 1;
+        }
+        
+        if start < end {
+            chars[start..end].iter().collect()
+        } else {
+            String::new()
+        }
     }
 }
 

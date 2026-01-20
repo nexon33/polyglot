@@ -28,22 +28,33 @@ impl std::fmt::Display for ValidationError {
     }
 }
 
-/// Extract function names from a code block (simple pattern matching)
+/// Extract function names from a code block
+/// For Rust: uses syn AST to only detect top-level functions (not impl methods)
 fn extract_implemented_functions(block: &CodeBlock) -> Vec<String> {
     let mut functions = Vec::new();
 
     match block.lang_tag.as_str() {
         "rs" | "rust" | "main" => {
-            // Match: fn name(
-            let re = regex::Regex::new(r"fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(").unwrap();
-            for cap in re.captures_iter(&block.code) {
-                if let Some(name) = cap.get(1) {
-                    functions.push(name.as_str().to_string());
+            // Preprocess: convert Polyglot keywords to valid Rust syntax for syn
+            let preprocessed = block
+                .code
+                .replace("export fn ", "pub fn ")
+                .replace("public fn ", "pub fn ")
+                .replace("internal fn ", "fn ");
+
+            // Use syn AST to only get top-level Item::Fn, not impl methods
+            if let Ok(syntax) = syn::parse_file(&preprocessed) {
+                for item in syntax.items {
+                    if let syn::Item::Fn(func) = item {
+                        functions.push(func.sig.ident.to_string());
+                    }
+                    // syn::Item::Impl contains impl methods - we explicitly IGNORE these
+                    // This is the key fix: Item::Fn only matches top-level functions
                 }
             }
         }
         "py" | "python" => {
-            // Match: def name(
+            // Match: def name( - for Python we still use regex (no Python AST)
             let re = regex::Regex::new(r"def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(").unwrap();
             for cap in re.captures_iter(&block.code) {
                 if let Some(name) = cap.get(1) {
