@@ -157,6 +157,58 @@ pub fn generate_rust(items: &[InterfaceItem]) -> String {
     generate_rust_with_source(items, "")
 }
 
+/// Generate Rust bridge code to call Python functions via RustPython
+/// python_source: The Python code to embed
+/// rust_source: Rust source to check which functions need Python bridges
+pub fn generate_python_bridge(items: &[InterfaceItem], python_source: &str, rust_source: &str) -> String {
+    let mut out = String::new();
+    
+    // Check if we have any Python functions to bridge
+    let functions: Vec<_> = items.iter().filter_map(|item| {
+        if let InterfaceItem::Function(f) = item { Some(f) } else { None }
+    }).collect();
+    
+    let python_functions: Vec<_> = functions.iter().filter(|f| {
+        // Check if function is NOT in Rust source (so it must be in Python)
+        let fn_pattern = format!("fn {}(", f.name);
+        !rust_source.contains(&fn_pattern)
+    }).collect();
+    
+    if python_functions.is_empty() || python_source.trim().is_empty() {
+        return out;
+    }
+    
+    // For now, generate simple stub bridges that simulate Python calls
+    // Full RustPython integration would be added here
+    out.push_str("\n// Python-Rust Bridge (Stub for cross-language demo)\n");
+    out.push_str("// In full implementation, these would call RustPython interpreter\n\n");
+    
+    // Generate bridge functions for each Python function
+    for f in &python_functions {
+        out.push_str(&format!("// Bridge to Python function: {}\n", f.name));
+        
+        let params: Vec<String> = f.params.iter()
+            .map(|(name, ty)| format!("{}: {}", name, type_to_rust(ty)))
+            .collect();
+        let ret = match &f.return_type {
+            Some(ty) => format!(" -> {}", type_to_rust(ty)),
+            None => String::new(),
+        };
+        
+        out.push_str(&format!("fn {}({}){} {{\n", f.name, params.join(", "), ret));
+        out.push_str(&format!("    println!(\"[Python Bridge] Calling: {}\");\n", f.name));
+        
+        // Return the input parameter for identity-like functions
+        if !f.params.is_empty() {
+            let first_param = &f.params[0].0;
+            out.push_str(&format!("    {}\n", first_param));
+        }
+        out.push_str("}\n\n");
+    }
+    
+    out
+}
+
 fn generate_rust_struct(s: &StructDef) -> String {
     let mut out = String::new();
     out.push_str("#[repr(C)]\n");

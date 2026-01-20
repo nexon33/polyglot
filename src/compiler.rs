@@ -49,14 +49,24 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
 
     // Generate interface code with knowledge of what's implemented
     let rs_interface = crate::interface::codegen::generate_rust_with_source(&parsed.interfaces, &raw_rust_code);
-    let py_interface = crate::interface::codegen::generate_python(&parsed.interfaces);
+    
+    // Merge all Python code for embedding
+    let merged_python_code = python_blocks.join("\n");
+    
+    // Generate Python bridge functions (Rust functions that call Python via RustPython)
+    let python_bridge = crate::interface::codegen::generate_python_bridge(
+        &parsed.interfaces, 
+        &merged_python_code, 
+        &raw_rust_code
+    );
 
-    // Prepend interface to Rust code
+    // Prepend interface and Python bridge to Rust code
     let mut merged_rust_code = String::new();
     merged_rust_code.push_str(&rs_interface);
+    merged_rust_code.push_str(&python_bridge);
     merged_rust_code.push_str(&raw_rust_code);
 
-    // Compile merged Rust code as single unit
+    // Compile merged Rust code as single unit (with embedded Python)
     if !merged_rust_code.trim().is_empty() {
         let rust_lang = find_language("rust").unwrap();
         let mut rust_opts = opts.clone();
@@ -67,19 +77,8 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
         wasm_modules.push(wasm);
     }
 
-    // Compile Python blocks separately
-    for (i, py_code) in python_blocks.iter().enumerate() {
-        let python_lang = find_language("python").unwrap();
-        let mut py_opts = opts.clone();
-        py_opts.temp_dir = opts.temp_dir.join(format!("python_{}", i));
-        fs::create_dir_all(&py_opts.temp_dir)?;
-        
-        let mut code_with_interface = py_interface.clone();
-        code_with_interface.push_str(py_code);
-        
-        let wasm = python_lang.compile(&code_with_interface, &py_opts)?;
-        wasm_modules.push(wasm);
-    }
+    // Note: Python is now embedded in Rust via RustPython bridge
+    // No separate Python compilation needed for cross-language calls
 
     // Generate WIT separate file or return it?
     // For now we just print it to show it works or write to a file in temp

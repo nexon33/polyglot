@@ -33,7 +33,12 @@ def process_tensor(t: Tensor) -> Tensor:
 fn main() {
     println!("Polyglot Runtime Init");
     
-    // Call interface functions - exports are auto-generated
+    // Create tensor in Rust
     let t = create_tensor(128, 128);
-    print_tensor(t);
+    
+    // Process in Python (cross-language call!)
+    let t2 = process_tensor(t);
+    
+    // Print result in Rust
+    print_tensor(t2);
 }

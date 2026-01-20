@@ -25,8 +25,12 @@ impl Language for Rust {
 
     fn compile(&self, source: &str, opts: &CompileOptions) -> Result<Vec<u8>> {
         // Create a temporary Cargo project to handle dependencies correctly
-        let package_name = "poly_cell";
-        let cargo_toml_content = r#"
+        let _package_name = "poly_cell";
+        
+        // Check if Python bridge is being used (contains RustPython imports)
+        let needs_rustpython = source.contains("rustpython_vm");
+        
+        let mut cargo_toml = String::from(r#"
 [workspace]
 
 [package]
@@ -42,9 +46,13 @@ path = "lib.rs"
 anyhow = "1.0" 
 wit-bindgen = "0.41"
 gridmesh = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/gridmesh" }
-"#;
+"#);
+        
+        if needs_rustpython {
+            cargo_toml.push_str("rustpython-vm = { git = \"https://github.com/RustPython/RustPython\", default-features = false, features = [\"compiler\", \"codegen\"] }\n");
+        }
 
-        fs::write(opts.temp_dir.join("Cargo.toml"), cargo_toml_content)?;
+        fs::write(opts.temp_dir.join("Cargo.toml"), cargo_toml)?;
 
         // Wrap the user code.
         // We do NOT use no_std so that println! and vec! work (WASI supports them).
