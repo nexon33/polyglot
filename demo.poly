@@ -7,18 +7,21 @@ fn print_tensor(t: Tensor)
 
 #[rust]
 use gridmesh::tensor::Tensor as GTensor;
-type Tensor = GTensor<f32>;
+pub type Tensor = GTensor<f32>;
 
-// Rust implements the high-performance memory allocation
-fn create_tensor(rows: u32, cols: u32) -> Tensor {
+// Exported interface functions - callable from other WASM modules
+
+#[no_mangle]
+pub extern "C" fn create_tensor(rows: u32, cols: u32) -> *mut Tensor {
     println!("Rust: Allocating {}x{} tensor", rows, cols);
-    // Create tensor using GridMesh memory system
     let shape = vec![rows as usize, cols as usize];
-    Tensor::zeros(&shape)
+    Box::into_raw(Box::new(Tensor::zeros(&shape)))
 }
 
-fn print_tensor(t: Tensor) {
-    println!("Rust: Inspecting Tensor: {:?}", t);
+#[no_mangle]
+pub extern "C" fn print_tensor(t: *const Tensor) {
+    let tensor = unsafe { &*t };
+    println!("Rust: Inspecting Tensor: {:?}", tensor);
 }
 
 #[python]
@@ -35,8 +38,11 @@ def process_tensor(t: Tensor) -> Tensor:
 #[main]
 fn main() {
     println!("Polyglot Runtime Init");
-    let t = create_tensor(128, 128);
-    // NOTE: process_tensor is in Python - cross-language calls require wasm-compose linking
-    // For now, demonstrating that each language compiles to valid WASM
-    print_tensor(t);
+    
+    // Call exported interface functions
+    let tensor_ptr = create_tensor(128, 128);
+    print_tensor(tensor_ptr);
+    
+    // Clean up (in production, would use proper RAII)
+    unsafe { let _ = Box::from_raw(tensor_ptr); }
 }

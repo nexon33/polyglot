@@ -42,8 +42,9 @@ impl std::error::Error for ParseError {}
 pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     let mut parsed = ParsedFile::default();
 
-    // Regex to find block headers: #[tag]
-    let re = Regex::new(r"(?m)^#\[([a-zA-Z0-9_:]+)\]\s*$").unwrap();
+    // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[main], etc.
+    // Only matches known polyglot tags, not Rust attributes like #[no_mangle]
+    let re = Regex::new(r"(?m)^#\[(interface|rust|rs|python|py|main)(?::[a-zA-Z0-9_:]+)?\]\s*$").unwrap();
 
     let mut matches: Vec<_> = re.find_iter(source).collect();
 
