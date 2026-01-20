@@ -88,8 +88,8 @@ pub fn parse_interface(input: &str) -> Result<Vec<InterfaceItem>, String> {
         alt((
             map(parse_function_decl, InterfaceItem::Function),
             map(parse_enum, InterfaceItem::Enum),
+            map(parse_type_decl, InterfaceItem::TypeDecl),  // Try TypeDecl FIRST (handles = lang:path)
             map(parse_type_alias, |(n, t)| InterfaceItem::TypeAlias(n, t)),
-            map(parse_type_decl, InterfaceItem::TypeDecl),
         )),
     ))
     .parse(input)

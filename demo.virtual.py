@@ -1,7 +1,5 @@
-from gridmesh import Tensor
-import numpy as np
+# No manual imports needed! Tensor is auto-imported from interface.
 
-# Python handles the data science / logic layer
 def process_tensor(t: Tensor) -> Tensor:
     print(f"Python: Processing tensor of shape {t.shape}")
     return t

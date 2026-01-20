@@ -154,8 +154,9 @@ pub fn generate_rust_with_source(items: &[InterfaceItem], source_code: &str) -> 
             }
             InterfaceItem::TypeDecl(td) => {
                 // Generate Rust type alias from the type definition
+                // Use `type X = Y` instead of `use Y as X` since we need to support generics
                 if let Some(rust_impl) = &td.rust_impl {
-                    out.push_str(&format!("use {} as {};\n", rust_impl, td.name));
+                    out.push_str(&format!("pub type {} = {};\n", td.name, rust_impl));
                 }
             }
         }
