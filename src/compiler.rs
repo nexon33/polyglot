@@ -25,21 +25,15 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
 
     let mut wasm_modules = Vec::new();
 
-    // Generate interface code
-    let rs_interface = crate::interface::codegen::generate_rust(&parsed.interfaces);
-    let py_interface = crate::interface::codegen::generate_python(&parsed.interfaces);
-
-    // Collect all Rust code (including #[main]) into a single compilation unit
-    let mut merged_rust_code = String::new();
-    merged_rust_code.push_str(&rs_interface);
-    
+    // First, collect all Rust code to know what functions are implemented
+    let mut raw_rust_code = String::new();
     let mut python_blocks = Vec::new();
 
     for block in &parsed.blocks {
         match block.lang_tag.as_str() {
             "rs" | "rust" | "main" => {
-                merged_rust_code.push_str(&block.code);
-                merged_rust_code.push('\n');
+                raw_rust_code.push_str(&block.code);
+                raw_rust_code.push('\n');
             }
             "py" | "python" => {
                 python_blocks.push(block.code.clone());
@@ -52,6 +46,15 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
             }
         }
     }
+
+    // Generate interface code with knowledge of what's implemented
+    let rs_interface = crate::interface::codegen::generate_rust_with_source(&parsed.interfaces, &raw_rust_code);
+    let py_interface = crate::interface::codegen::generate_python(&parsed.interfaces);
+
+    // Prepend interface to Rust code
+    let mut merged_rust_code = String::new();
+    merged_rust_code.push_str(&rs_interface);
+    merged_rust_code.push_str(&raw_rust_code);
 
     // Compile merged Rust code as single unit
     if !merged_rust_code.trim().is_empty() {

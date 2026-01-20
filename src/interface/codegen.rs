@@ -87,7 +87,9 @@ fn type_to_python(ty: &Type) -> String {
     }
 }
 
-pub fn generate_rust(items: &[InterfaceItem]) -> String {
+/// Generate Rust code from interface items
+/// source_code: The actual Rust source to check which functions are implemented
+pub fn generate_rust_with_source(items: &[InterfaceItem], source_code: &str) -> String {
     let mut out = String::new();
     out.push_str("// Auto-generated from interface block\n\n");
 
@@ -96,11 +98,17 @@ pub fn generate_rust(items: &[InterfaceItem]) -> String {
         if let InterfaceItem::Function(f) = item { Some(f) } else { None }
     }).collect();
 
-    // Generate export wrappers for interface functions
-    // These make the user-defined functions visible to WASM host
+    // Generate export wrappers only for functions that are actually implemented
     if !functions.is_empty() {
         out.push_str("// Auto-generated export wrappers\n");
         for f in &functions {
+            // Check if this function is defined in the source code
+            let fn_pattern = format!("fn {}(", f.name);
+            if !source_code.contains(&fn_pattern) {
+                // Function not implemented in Rust, skip wrapper
+                continue;
+            }
+            
             let params: Vec<String> = f.params.iter()
                 .map(|(name, ty)| format!("{}: {}", name, type_to_rust(ty)))
                 .collect();
@@ -142,6 +150,11 @@ pub fn generate_rust(items: &[InterfaceItem]) -> String {
     }
 
     out
+}
+
+/// Legacy function for compatibility
+pub fn generate_rust(items: &[InterfaceItem]) -> String {
+    generate_rust_with_source(items, "")
 }
 
 fn generate_rust_struct(s: &StructDef) -> String {
