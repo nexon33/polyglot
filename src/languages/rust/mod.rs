@@ -40,8 +40,7 @@ path = "lib.rs"
 
 [dependencies]
 anyhow = "1.0" 
-# We assume gridmesh is in the workspace. For this demo, we can point to it.
-# In a real system, dependencies would be injected via configuration.
+wit-bindgen = "0.41"
 gridmesh = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/gridmesh" }
 "#;
 

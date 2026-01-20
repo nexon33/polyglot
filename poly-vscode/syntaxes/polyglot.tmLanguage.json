@@ -22,7 +22,7 @@
                     "name": "keyword.control.directive.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[)",
+            "end": "(?=^\\s*#\\[(interface|rust|rs|python|py|main)\\])",
             "patterns": [
                 {
                     "match": "\\b(fn)\\s+(\\w+)",
@@ -53,13 +53,13 @@
             ]
         },
         "rust-block": {
-            "begin": "^\\s*(#\\[rust(?:.*)?\\])\\s*$",
+            "begin": "^\\s*(#\\[(rust|rs)\\])\\s*$",
             "beginCaptures": {
                 "1": {
                     "name": "keyword.control.directive.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[)",
+            "end": "(?=^\\s*#\\[(interface|rust|rs|python|py|main)\\])",
             "contentName": "meta.embedded.rust",
             "patterns": [
                 {
@@ -68,13 +68,13 @@
             ]
         },
         "python-block": {
-            "begin": "^\\s*(#\\[python(?:.*)?\\])\\s*$",
+            "begin": "^\\s*(#\\[(python|py)\\])\\s*$",
             "beginCaptures": {
                 "1": {
                     "name": "keyword.control.directive.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[)",
+            "end": "(?=^\\s*#\\[(interface|rust|rs|python|py|main)\\])",
             "contentName": "meta.embedded.python",
             "patterns": [
                 {
@@ -89,7 +89,7 @@
                     "name": "keyword.control.directive.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[)",
+            "end": "(?=^\\s*#\\[(interface|rust|rs|python|py|main)\\])|\\z",
             "contentName": "meta.embedded.rust",
             "patterns": [
                 {
