@@ -19,6 +19,12 @@ pub fn generate_python(items: &[InterfaceItem]) -> String {
             InterfaceItem::Function(_) => {
                 // Python doesn't need extern imports, functions are in scope
             }
+            InterfaceItem::TypeDecl(td) => {
+                // Generate Python type import from the type definition
+                if let Some(py_impl) = &td.python_impl {
+                    out.push_str(&format!("# Type import: {} = {}\n", td.name, py_impl));
+                }
+            }
         }
     }
 
@@ -145,6 +151,12 @@ pub fn generate_rust_with_source(items: &[InterfaceItem], source_code: &str) -> 
             }
             InterfaceItem::Function(_) => {
                 // Already handled in export wrapper generation
+            }
+            InterfaceItem::TypeDecl(td) => {
+                // Generate Rust type alias from the type definition
+                if let Some(rust_impl) = &td.rust_impl {
+                    out.push_str(&format!("use {} as {};\n", rust_impl, td.name));
+                }
             }
         }
     }
