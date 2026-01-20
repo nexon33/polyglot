@@ -1,17 +1,14 @@
 
-#[interface]
-// Interface defines the contract between languages
-
-// Type with automatic cross-language imports (NEW SYNTAX!)
+#[types]
 type Tensor = rust:gridmesh::tensor::Tensor<f32> | python:gridmesh.Tensor
 
+#[interface]
+// Explicit function declarations until pub inference is complete
 fn create_tensor(rows: u32, cols: u32) -> Tensor
 fn process_tensor(t: Tensor) -> Tensor
 fn print_tensor(t: Tensor)
 
 #[rust]
-// No manual imports needed! Tensor is auto-imported from interface.
-
 fn create_tensor(rows: u32, cols: u32) -> Tensor {
     println!("Rust: Allocating {}x{} tensor", rows, cols);
     let shape = vec![rows as usize, cols as usize];
@@ -23,8 +20,6 @@ fn print_tensor(t: Tensor) {
 }
 
 #[python]
-# No manual imports needed! Tensor is auto-imported from interface.
-
 def process_tensor(t: Tensor) -> Tensor:
     print(f"Python: Processing tensor of shape {t.shape}")
     return t
@@ -42,4 +37,3 @@ fn main() {
     // Print result in Rust
     print_tensor(t2);
 }
-

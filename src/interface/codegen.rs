@@ -97,7 +97,21 @@ fn type_to_python(ty: &Type) -> String {
 /// source_code: The actual Rust source to check which functions are implemented
 pub fn generate_rust_with_source(items: &[InterfaceItem], source_code: &str) -> String {
     let mut out = String::new();
+    
     out.push_str("// Auto-generated from interface block\n\n");
+    
+    // FIRST: Generate type declarations (needed before they're used in functions)
+    for item in items {
+        if let InterfaceItem::TypeDecl(td) = item {
+            if let Some(rust_impl) = &td.rust_impl {
+                out.push_str(&format!("pub type {} = {};\n", td.name, rust_impl));
+            }
+        }
+        if let InterfaceItem::TypeAlias(name, ty) = item {
+            out.push_str(&format!("pub type {} = {};\n\n", name, type_to_rust(ty)));
+        }
+    }
+    out.push_str("\n");
 
     // Collect functions for export wrapper generation
     let functions: Vec<_> = items.iter().filter_map(|item| {
@@ -146,22 +160,17 @@ pub fn generate_rust_with_source(items: &[InterfaceItem], source_code: &str) -> 
             InterfaceItem::Enum(_e) => {
                 out.push_str("// Enum support pending\n");
             }
-            InterfaceItem::TypeAlias(name, ty) => {
-                out.push_str(&format!("pub type {} = {};\n\n", name, type_to_rust(ty)));
+            InterfaceItem::TypeAlias(_, _) => {
+                // Already handled at start
             }
             InterfaceItem::Function(_) => {
                 // Already handled in export wrapper generation
             }
-            InterfaceItem::TypeDecl(td) => {
-                // Generate Rust type alias from the type definition
-                // Use `type X = Y` instead of `use Y as X` since we need to support generics
-                if let Some(rust_impl) = &td.rust_impl {
-                    out.push_str(&format!("pub type {} = {};\n", td.name, rust_impl));
-                }
+            InterfaceItem::TypeDecl(_) => {
+                // Already handled at start
             }
         }
     }
-
     out
 }
 

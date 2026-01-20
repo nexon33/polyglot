@@ -79,9 +79,9 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
         parsed.imports.push(Import { items, path });
     }
 
-    // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[main], etc.
+    // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[types], #[main], etc.
     // Only matches known polyglot tags, not Rust attributes like #[no_mangle]
-    let re = Regex::new(r"(?m)^#\[(interface|rust|rs|python|py|main)(?::[a-zA-Z0-9_:]+)?\]\s*$")
+    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|main)(?::[a-zA-Z0-9_:]+)?\]\s*$")
         .unwrap();
 
     let matches: Vec<_> = re.find_iter(source).collect();
@@ -114,6 +114,14 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             }
             // Fall through to also add interface as a code block for LSP VirtualFile tracking
         }
+        
+        // Parse #[types] blocks for type declarations (cleaner syntax than #[interface])
+        if lang_tag == "types" {
+            if let Ok(interfaces) = crate::interface::parser::parse_interface(tag_content) {
+                parsed.interfaces.extend(interfaces);
+            }
+            // Fall through to also add as a code block for LSP
+        }
 
         let mut options = HashMap::new();
         for opt in parts {
@@ -130,8 +138,59 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             start_line,
         });
     }
+    
+    // Auto-discover pub functions from Rust/Python blocks
+    scan_pub_functions(&mut parsed);
 
     Ok(parsed)
+}
+
+/// Scan code blocks for `pub fn` (Rust) and `pub def` (Python) and add to interfaces
+fn scan_pub_functions(parsed: &mut ParsedFile) {
+    use crate::interface::parser::{InterfaceItem, FunctionDecl, Type};
+    use regex::Regex;
+    
+    // Regex for Rust: pub fn name(params) -> ReturnType
+    let rust_fn_re = Regex::new(r"pub\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap();
+    
+    // Regex for Python: pub def name(params) -> ReturnType:
+    // Note: "pub def" is our polyglot syntax, not standard Python
+    let python_fn_re = Regex::new(r"pub\s+def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap();
+    
+    for block in &parsed.blocks {
+        let re = match block.lang_tag.as_str() {
+            "rust" | "rs" => &rust_fn_re,
+            "python" | "py" => &python_fn_re,
+            _ => continue,
+        };
+        
+        for cap in re.captures_iter(&block.code) {
+            let name = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let _params_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let return_type = cap.get(3).map(|m| Type::Named(m.as_str().to_string()));
+            
+            // For now, skip param parsing - just capture the function existence
+            // Full param parsing would require more complex logic
+            let func_decl = FunctionDecl {
+                name,
+                params: vec![], // TODO: parse params properly
+                return_type,
+            };
+            
+            // Check if this function is already in interfaces (avoid duplicates)
+            let already_exists = parsed.interfaces.iter().any(|item| {
+                if let InterfaceItem::Function(f) = item {
+                    f.name == func_decl.name
+                } else {
+                    false
+                }
+            });
+            
+            if !already_exists {
+                parsed.interfaces.push(InterfaceItem::Function(func_decl));
+            }
+        }
+    }
 }
 
 pub fn parse_python_params(s: &str) -> Result<Vec<Param>, ParseError> {

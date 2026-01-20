@@ -41,6 +41,9 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
             "interface" => {
                 // Already processed via parsed.interfaces
             }
+            "types" => {
+                // Already processed via parsed.interfaces (type declarations)
+            }
             _ => {
                 return Err(CompileError::UnknownLanguage(block.lang_tag.clone()));
             }
