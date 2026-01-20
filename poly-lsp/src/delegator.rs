@@ -25,6 +25,16 @@ struct ChildServer {
 }
 
 impl Delegator {
+    /// Normalize language tags for consistent lookup
+    /// "rs" | "rust" -> "rust", "py" | "python" -> "python"
+    fn normalize_lang(lang: &str) -> &'static str {
+        match lang {
+            "rs" | "rust" => "rust",
+            "py" | "python" => "python",
+            _ => "unknown",
+        }
+    }
+
     pub fn new(diagnostic_tx: Option<mpsc::Sender<Value>>) -> Self {
         Self {
             servers: Arc::new(Mutex::new(HashMap::new())),
@@ -102,13 +112,14 @@ impl Delegator {
             next_id: Arc::new(AtomicU64::new(1)),
         };
 
-        self.servers.lock().await.insert(lang.to_string(), server);
+        self.servers.lock().await.insert(Self::normalize_lang(lang).to_string(), server);
         Ok(())
     }
 
     pub async fn notify(&self, lang: &str, method: &str, params: Value) -> anyhow::Result<()> {
+        let normalized = Self::normalize_lang(lang);
         let mut servers = self.servers.lock().await;
-        if let Some(server) = servers.get_mut(lang) {
+        if let Some(server) = servers.get_mut(normalized) {
             let msg = json!({
                 "jsonrpc": "2.0",
                 "method": method,
@@ -144,8 +155,9 @@ impl Delegator {
     }
 
     pub async fn request(&self, lang: &str, method: &str, params: Value) -> anyhow::Result<Value> {
+        let normalized = Self::normalize_lang(lang);
         let mut servers = self.servers.lock().await;
-        if let Some(server) = servers.get_mut(lang) {
+        if let Some(server) = servers.get_mut(normalized) {
             let id = server.next_id.fetch_add(1, Ordering::SeqCst);
             let (tx, rx) = oneshot::channel();
             
