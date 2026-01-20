@@ -82,7 +82,11 @@ path = "lib.rs"
 # We need rustpython-vm to run the code. 
 # For demo speed, we might want to use a local path if available, or just the crate.
 # Using git dependency for latest WASI support or standard crate.
-rustpython-vm = { version = "0.3.0", default-features = false, features = ["compiler", "codegen"] }
+# We need rustpython-vm to run the code. 
+# For demo speed, we might want to use a local path if available, or just the crate.
+# Using git dependency for latest WASI support or standard crate.
+rustpython-vm = { git = "https://github.com/RustPython/RustPython", default-features = false, features = ["compiler", "codegen"] }
+
 "#;
 
         fs::write(opts.temp_dir.join("Cargo.toml"), cargo_toml_content)?;
@@ -101,7 +105,7 @@ rustpython-vm = { version = "0.3.0", default-features = false, features = ["comp
         wrapper.push_str("    let interpreter = Interpreter::with_init(settings, |_vm| {});\n");
         wrapper.push_str("    interpreter.enter(|vm| {\n");
         wrapper.push_str("        let scope = vm.new_scope_with_builtins();\n");
-        wrapper.push_str("        let code_obj = vm.compile(PYTHON_SOURCE, rustpython_vm::compiler::Mode::Exec, \"<embedded>\".to_string()).map_err(|err| vm.new_syntax_error(&err)).unwrap();\n");
+        wrapper.push_str("        let code_obj = vm.compile(PYTHON_SOURCE, rustpython_vm::compiler::Mode::Exec, \"<embedded>\".to_string()).map_err(|err| vm.new_syntax_error(&err, None)).unwrap();\n");
         wrapper.push_str("        let _ = vm.run_code_obj(code_obj, scope);\n");
         wrapper.push_str("    });\n");
         wrapper.push_str("}\n");

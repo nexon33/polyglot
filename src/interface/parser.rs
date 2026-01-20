@@ -13,6 +13,14 @@ pub enum InterfaceItem {
     Struct(StructDef),
     Enum(EnumDef),
     TypeAlias(String, Type),
+    Function(FunctionDecl),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionDecl {
+    pub name: String,
+    pub params: Vec<(String, Type)>,
+    pub return_type: Option<Type>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,8 +74,9 @@ pub enum PrimitiveType {
 
 pub fn parse_interface(input: &str) -> Result<Vec<InterfaceItem>, String> {
     let (remaining, items) = many0(preceded(
-        multispace0,
+        skip_ws_and_comments,
         alt((
+            map(parse_function_decl, InterfaceItem::Function),
             map(parse_enum, InterfaceItem::Enum),
             map(parse_type_alias, |(n, t)| InterfaceItem::TypeAlias(n, t)),
         )),
@@ -76,6 +85,63 @@ pub fn parse_interface(input: &str) -> Result<Vec<InterfaceItem>, String> {
     .map_err(|e| format!("Parse error: {:?}", e))?;
 
     Ok(items)
+}
+
+/// Skip whitespace and // comments
+fn skip_ws_and_comments(input: &str) -> IResult<&str, ()> {
+    let mut remaining = input;
+    loop {
+        let (rest, _) = multispace0(remaining)?;
+        remaining = rest;
+        
+        // Check for line comment
+        if remaining.starts_with("//") {
+            // Skip to end of line
+            if let Some(newline_pos) = remaining.find('\n') {
+                remaining = &remaining[newline_pos + 1..];
+            } else {
+                remaining = "";
+            }
+        } else {
+            break;
+        }
+    }
+    Ok((remaining, ()))
+}
+
+fn parse_function_decl(input: &str) -> IResult<&str, FunctionDecl> {
+    let (input, _) = tag("fn")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, name) = parse_ident(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, params) = delimited(
+        char('('),
+        separated_list0(
+            preceded(multispace0, char(',')),
+            preceded(multispace0, parse_param),
+        ),
+        preceded(multispace0, char(')')),
+    ).parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, return_type) = opt(preceded(
+        pair(tag("->"), multispace0),
+        parse_type,
+    )).parse(input)?;
+    
+    Ok((input, FunctionDecl {
+        name: name.to_string(),
+        params,
+        return_type,
+    }))
+}
+
+fn parse_param(input: &str) -> IResult<&str, (String, Type)> {
+    let (input, name) = parse_ident(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char(':')(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, ty) = parse_type(input)?;
+    Ok((input, (name.to_string(), ty)))
 }
 
 fn parse_struct(input: &str) -> IResult<&str, StructDef> {

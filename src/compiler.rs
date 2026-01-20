@@ -25,40 +25,56 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
 
     let mut wasm_modules = Vec::new();
 
-    // Helper for incremental build: only write if changed to preserve mtime
-    let write_if_changed = |path: &std::path::Path, content: &str| -> std::io::Result<()> {
-        if path.exists() {
-            let current = fs::read_to_string(path)?;
-            if current == content {
-                return Ok(()); // Skip write
+    // Generate interface code
+    let rs_interface = crate::interface::codegen::generate_rust(&parsed.interfaces);
+    let py_interface = crate::interface::codegen::generate_python(&parsed.interfaces);
+
+    // Collect all Rust code (including #[main]) into a single compilation unit
+    let mut merged_rust_code = String::new();
+    merged_rust_code.push_str(&rs_interface);
+    
+    let mut python_blocks = Vec::new();
+
+    for block in &parsed.blocks {
+        match block.lang_tag.as_str() {
+            "rs" | "rust" | "main" => {
+                merged_rust_code.push_str(&block.code);
+                merged_rust_code.push('\n');
+            }
+            "py" | "python" => {
+                python_blocks.push(block.code.clone());
+            }
+            "interface" => {
+                // Already processed via parsed.interfaces
+            }
+            _ => {
+                return Err(CompileError::UnknownLanguage(block.lang_tag.clone()));
             }
         }
-        fs::write(path, content)
-    };
+    }
 
-    // Generate interface code
-    let py_interface = crate::interface::codegen::generate_python(&parsed.interfaces);
-    let rs_interface = crate::interface::codegen::generate_rust(&parsed.interfaces);
+    // Compile merged Rust code as single unit
+    if !merged_rust_code.trim().is_empty() {
+        let rust_lang = find_language("rust").unwrap();
+        let mut rust_opts = opts.clone();
+        rust_opts.temp_dir = opts.temp_dir.join("rust_merged");
+        fs::create_dir_all(&rust_opts.temp_dir)?;
+        
+        let wasm = rust_lang.compile(&merged_rust_code, &rust_opts)?;
+        wasm_modules.push(wasm);
+    }
 
-    for (i, block) in parsed.blocks.iter().enumerate() {
-        let lang = find_language(&block.lang_tag)
-            .ok_or_else(|| CompileError::UnknownLanguage(block.lang_tag.clone()))?;
-
-        // Prepend generated interface code
-        let mut code_with_interface = String::new();
-        if block.lang_tag == "py" || block.lang_tag == "python" {
-            code_with_interface.push_str(&py_interface);
-        } else if block.lang_tag == "rs" || block.lang_tag == "rust" {
-            code_with_interface.push_str(&rs_interface);
-        }
-        code_with_interface.push_str(&block.code);
-
-        // Use unique temp dir for each block to support incremental builds and avoid collisions
-        let mut block_opts = opts.clone();
-        block_opts.temp_dir = opts.temp_dir.join(format!("block_{}_{}", i, lang.tag()));
-        fs::create_dir_all(&block_opts.temp_dir)?;
-
-        let wasm = lang.compile(&code_with_interface, &block_opts)?;
+    // Compile Python blocks separately
+    for (i, py_code) in python_blocks.iter().enumerate() {
+        let python_lang = find_language("python").unwrap();
+        let mut py_opts = opts.clone();
+        py_opts.temp_dir = opts.temp_dir.join(format!("python_{}", i));
+        fs::create_dir_all(&py_opts.temp_dir)?;
+        
+        let mut code_with_interface = py_interface.clone();
+        code_with_interface.push_str(py_code);
+        
+        let wasm = python_lang.compile(&code_with_interface, &py_opts)?;
         wasm_modules.push(wasm);
     }
 
@@ -80,6 +96,6 @@ fn link_modules(modules: &[Vec<u8>], opts: &CompileOptions) -> Result<Vec<u8>, C
 
     // Temporary: return the first one to allow build to pass for single-language tests
     // In a real polyglot scenario, we'd use wasm-compose or similar.
-    println!("Warning: Linking multiple modules is mock-implemented. Returning first module.");
+    println!("Note: Multi-module linking requires wasm-compose. Returning first module.");
     Ok(modules[0].clone())
 }

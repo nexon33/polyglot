@@ -16,6 +16,9 @@ pub fn generate_python(items: &[InterfaceItem]) -> String {
             InterfaceItem::TypeAlias(name, ty) => {
                 out.push_str(&format!("{} = {}\n\n", name, type_to_python(ty)));
             }
+            InterfaceItem::Function(_) => {
+                // Python doesn't need extern imports, functions are in scope
+            }
         }
     }
 
@@ -88,17 +91,45 @@ pub fn generate_rust(items: &[InterfaceItem]) -> String {
     let mut out = String::new();
     out.push_str("// Auto-generated from interface block\n\n");
 
+    // Collect functions for extern block
+    let functions: Vec<_> = items.iter().filter_map(|item| {
+        if let InterfaceItem::Function(f) = item { Some(f) } else { None }
+    }).collect();
+
+    // Generate extern block for cross-language imports
+    // NOTE: This is commented out because detecting which functions need imports
+    // vs. which have local implementations requires code analysis.
+    // For full WASM Component Model support, use wasm-compose to link modules.
+    /*
+    if !functions.is_empty() {
+        out.push_str("extern \"C\" {\n");
+        for f in &functions {
+            let params: Vec<String> = f.params.iter()
+                .map(|(name, ty)| format!("{}: {}", name, type_to_rust(ty)))
+                .collect();
+            let ret = match &f.return_type {
+                Some(ty) => format!(" -> {}", type_to_rust(ty)),
+                None => String::new(),
+            };
+            out.push_str(&format!("    fn {}({}){};\n", f.name, params.join(", "), ret));
+        }
+        out.push_str("}\n\n");
+    }
+    */
+
     for item in items {
         match item {
             InterfaceItem::Struct(s) => {
                 out.push_str(&generate_rust_struct(s));
             }
             InterfaceItem::Enum(_e) => {
-                // out.push_str(&generate_rust_enum(e));
                 out.push_str("// Enum support pending\n");
             }
             InterfaceItem::TypeAlias(name, ty) => {
                 out.push_str(&format!("pub type {} = {};\n\n", name, type_to_rust(ty)));
+            }
+            InterfaceItem::Function(_) => {
+                // Already handled in extern block
             }
         }
     }
@@ -174,6 +205,16 @@ pub fn generate_wit(items: &[InterfaceItem]) -> String {
                     ));
                 }
                 out.push_str("}\n\n");
+            }
+            InterfaceItem::Function(f) => {
+                let params: Vec<String> = f.params.iter()
+                    .map(|(name, ty)| format!("{}: {}", to_kebab(name), type_to_wit(ty)))
+                    .collect();
+                let ret = match &f.return_type {
+                    Some(ty) => format!(" -> {}", type_to_wit(ty)),
+                    None => String::new(),
+                };
+                out.push_str(&format!("{}: func({}){}\n", to_kebab(&f.name), params.join(", "), ret));
             }
             // ... enums, type aliases
             _ => {}

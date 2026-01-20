@@ -42,11 +42,6 @@ impl std::error::Error for ParseError {}
 pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     let mut parsed = ParsedFile::default();
 
-    // Check if we have interface blocks (naive check, real parsing via interface parser)
-    if let Ok(interfaces) = crate::interface::parser::parse_interface(source) {
-        parsed.interfaces = interfaces;
-    }
-
     // Regex to find block headers: #[tag]
     let re = Regex::new(r"(?m)^#\[([a-zA-Z0-9_:]+)\]\s*$").unwrap();
 
@@ -68,11 +63,18 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
         let tag_content = &source[start_idx..end_idx];
 
         // Extract tag name from header: "#[rust]" -> "rust"
-        // remove "#[" and "]"
         let inner = tag_header.trim_start_matches("#[").trim_end_matches(']');
 
         let mut parts = inner.split(':');
         let lang_tag = parts.next().unwrap_or("").to_string();
+
+        // Parse interface blocks specially
+        if lang_tag == "interface" {
+            if let Ok(interfaces) = crate::interface::parser::parse_interface(tag_content) {
+                parsed.interfaces = interfaces;
+            }
+            continue; // Don't add interface as a code block
+        }
 
         let mut options = HashMap::new();
         for opt in parts {
