@@ -3,6 +3,7 @@ use polyglot::{
     compiler::compile,
     parser::{parse_poly, ParsedFile},
     types::CompileOptions,
+    validate,
     wit_gen::generate_wit,
 };
 
@@ -103,6 +104,18 @@ fn build_poly(file: &PathBuf, release: bool) -> anyhow::Result<PathBuf> {
     // Resolve imports - load and merge imported files
     let base_dir = file.parent().unwrap_or(std::path::Path::new("."));
     resolve_imports(&mut parsed, base_dir)?;
+
+    // Validate interface contracts
+    if let Err(errors) = validate(&parsed) {
+        println!("\n🔍 Validation Errors:");
+        for err in &errors {
+            eprintln!("   {}", err);
+        }
+        return Err(anyhow::anyhow!(
+            "{} validation error(s) found",
+            errors.len()
+        ));
+    }
 
     let opts = CompileOptions {
         release,
