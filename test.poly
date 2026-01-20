@@ -1,0 +1,13 @@
+
+#[py]
+def greet(name: str) -> str:
+    return f"Hello, {name}!"
+
+#[rs]
+fn hash(data: &[u8]) -> [u8; 32] {
+    [0u8; 32]  // placeholder
+}
+
+#[py:fast]
+def compute(x: float, y: float) -> float:
+    return (x * x + y * y) ** 0.5

@@ -1,0 +1,73 @@
+    Checking pyrs v0.1.0 (C:\Users\adria\Downloads\pyrs polygot\pyrs)
+warning: unused import: `std::collections::HashMap`
+ --> src\parser.rs:2:5
+  |
+2 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `FunctionSig` and `PythonMode`
+ --> src\wit_gen.rs:3:21
+  |
+3 | use crate::parser::{FunctionSig, Language, ParsedFile, PythonMode, TypeRef};
+  |                     ^^^^^^^^^^^                        ^^^^^^^^^^
+
+warning: unused variable: `source`
+  --> src\compiler.rs:71:9
+   |
+71 |     let source = fs::read_to_string(py_file)?;
+   |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_source`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `opts`
+  --> src\compiler.rs:83:42
+   |
+83 | fn compile_python_cython(py_file: &Path, opts: &CompileOptions) -> Result<Vec<u8>, CompileError> {
+   |                                          ^^^^ help: if this is intentional, prefix it with an underscore: `_opts`
+
+warning: unused variable: `py_file`
+   --> src\compiler.rs:119:26
+    |
+119 | fn compile_python_nuitka(py_file: &Path, opts: &CompileOptions) -> Result<Vec<u8>, CompileError> {
+    |                          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_py_file`
+
+warning: unused variable: `opts`
+   --> src\compiler.rs:119:42
+    |
+119 | fn compile_python_nuitka(py_file: &Path, opts: &CompileOptions) -> Result<Vec<u8>, CompileError> {
+    |                                          ^^^^ help: if this is intentional, prefix it with an underscore: `_opts`
+
+warning: unused variable: `py_file`
+   --> src\compiler.rs:124:25
+    |
+124 | fn compile_python_codon(py_file: &Path, opts: &CompileOptions) -> Result<Vec<u8>, CompileError> {
+    |                         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_py_file`
+
+warning: unused variable: `opts`
+   --> src\compiler.rs:124:41
+    |
+124 | fn compile_python_codon(py_file: &Path, opts: &CompileOptions) -> Result<Vec<u8>, CompileError> {
+    |                                         ^^^^ help: if this is intentional, prefix it with an underscore: `_opts`
+
+warning: unused variable: `base_line`
+   --> src\parser.rs:192:5
+    |
+192 |     base_line: usize,
+    |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_base_line`
+
+warning: unused variable: `base_line`
+   --> src\parser.rs:222:5
+    |
+222 |     base_line: usize,
+    |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_base_line`
+
+warning: unused variable: `size`
+   --> src\wit_gen.rs:142:31
+    |
+142 |         TypeRef::Array(inner, size) => {
+    |                               ^^^^ help: if this is intentional, prefix it with an underscore: `_size`
+
+warning: `pyrs` (lib) generated 11 warnings (run `cargo fix --lib -p pyrs` to apply 11 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.64s

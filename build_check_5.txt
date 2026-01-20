@@ -1,0 +1,303 @@
+   Compiling malachite-base v0.4.22
+    Checking malachite-q v0.4.22
+    Checking malachite v0.4.22
+    Checking malachite-bigint v0.2.3
+    Checking rustpython-ast v0.3.1
+    Checking rustpython-compiler-core v0.3.1
+    Checking rustpython-format v0.3.1
+    Checking rustpython-common v0.3.1
+   Compiling malachite-nz v0.4.22
+    Checking rustpython-codegen v0.3.1
+    Checking rustpython-parser v0.3.1
+    Checking rustpython-compiler v0.3.1
+   Compiling rustpython-derive-impl v0.3.1
+   Compiling rustpython-derive v0.3.1
+    Checking rustpython-vm v0.3.1
+    Checking pyrs v0.1.0 (C:\Users\adria\Downloads\pyrs polygot\pyrs)
+error: prefix `embed` is unknown
+   --> src\compiler.rs:122:17
+    |
+122 |         .arg("--embed")
+    |                 ^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+122 |         .arg("--embed ")
+    |                      +
+
+error: prefix `o` is unknown
+   --> src\compiler.rs:123:16
+    |
+123 |         .arg("-o")
+    |                ^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+123 |         .arg("-o ")
+    |                 +
+
+error: prefix `wasi` is unknown
+   --> src\compiler.rs:136:31
+    |
+136 |         .arg("--target=wasm32-wasi")
+    |                               ^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+136 |         .arg("--target=wasm32-wasi ")
+    |                                   +
+
+error: prefix `O2` is unknown
+   --> src\compiler.rs:137:16
+    |
+137 |         .arg("-O2")
+    |                ^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+137 |         .arg("-O2 ")
+    |                  +
+
+error: prefix `o` is unknown
+   --> src\compiler.rs:138:16
+    |
+138 |         .arg("-o")
+    |                ^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+138 |         .arg("-o ")
+    |                 +
+
+error: prefix `backend` is unknown
+   --> src\compiler.rs:152:51
+    |
+152 |     Err(CompileError::NotImplemented("Nuitka WASM backend"))
+    |                                                   ^^^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+152 |     Err(CompileError::NotImplemented("Nuitka WASM backend "))
+    |                                                          +
+
+error: prefix `backend` is unknown
+   --> src\compiler.rs:157:50
+    |
+157 |     Err(CompileError::NotImplemented("Codon WASM backend"))
+    |                                                  ^^^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+157 |     Err(CompileError::NotImplemented("Codon WASM backend "))
+    |                                                         +
+
+error: prefix `rs` is unknown
+   --> src\compiler.rs:165:56
+    |
+165 |     let rs_file = opts.temp_dir.join(format!("block_{}.rs", index));
+    |                                                        ^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+165 |     let rs_file = opts.temp_dir.join(format!("block_{}.rs ", index));
+    |                                                          +
+
+error: prefix `wasi` is unknown
+   --> src\compiler.rs:188:43
+    |
+188 |         WasmTarget::Wasm32Wasi => "wasm32-wasi",
+    |                                           ^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+188 |         WasmTarget::Wasm32Wasi => "wasm32-wasi ",
+    |                                               +
+
+error: prefix `unknown` is unknown
+   --> src\compiler.rs:189:54
+    |
+189 |         WasmTarget::Wasm32Unknown => "wasm32-unknown-unknown",
+    |                                                      ^^^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+189 |         WasmTarget::Wasm32Unknown => "wasm32-unknown-unknown ",
+    |                                                             +
+
+error: prefix `target` is unknown
+   --> src\compiler.rs:193:16
+    |
+193 |     cmd.arg("--target")
+    |                ^^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+193 |     cmd.arg("--target ")
+    |                      +
+
+error: prefix `type` is unknown
+   --> src\compiler.rs:195:23
+    |
+195 |         .arg("--crate-type")
+    |                       ^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+195 |         .arg("--crate-type ")
+    |                           +
+
+error: prefix `o` is unknown
+   --> src\compiler.rs:197:16
+    |
+197 |         .arg("-o")
+    |                ^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+197 |         .arg("-o ")
+    |                 +
+
+error: prefix `O` is unknown
+   --> src\compiler.rs:202:19
+    |
+202 |         cmd.arg("-O");
+    |                   ^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+202 |         cmd.arg("-O ");
+    |                    +
+
+error: prefix `wasm` is unknown
+   --> src\compiler.rs:228:45
+    |
+228 |     let output = opts.temp_dir.join("linked.wasm");
+    |                                             ^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+228 |     let output = opts.temp_dir.join("linked.wasm ");
+    |                                                 +
+
+error: prefix `wasm` is unknown
+   --> src\compiler.rs:234:65
+    |
+234 |         let module_file = opts.temp_dir.join(format!("module_{}.wasm", i));
+    |                                                                 ^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+234 |         let module_file = opts.temp_dir.join(format!("module_{}.wasm ", i));
+    |                                                                     +
+
+error: prefix `tools` is unknown
+   --> src\compiler.rs:238:41
+    |
+238 |         let status = Command::new("wasm-tools")
+    |                                         ^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+238 |         let status = Command::new("wasm-tools ")
+    |                                              +
+
+error: prefix `o` is unknown
+   --> src\compiler.rs:243:20
+    |
+243 |             .arg("-o")
+    |                    ^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+243 |             .arg("-o ")
+    |                     +
+
+error: prefix `module` is unknown
+   --> src\compiler.rs:249:70
+    |
+249 |             eprintln!("Warning: wasm-tools not found, using unlinked module");
+    |                                                                      ^^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+249 |             eprintln!("Warning: wasm-tools not found, using unlinked module ");
+    |                                                                            +
+
+error: prefix `failed` is unknown
+   --> src\compiler.rs:277:73
+    |
+277 |             CompileError::CythonFailed => write!(f, "Cython compilation failed"),
+    |                                                                         ^^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+277 |             CompileError::CythonFailed => write!(f, "Cython compilation failed "),
+    |                                                                               +
+
+error: prefix `failed` is unknown
+   --> src\compiler.rs:278:71
+    |
+278 |             CompileError::ClangFailed => write!(f, "Clang compilation failed"),
+    |                                                                       ^^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+278 |             CompileError::ClangFailed => write!(f, "Clang compilation failed "),
+    |                                                                             +
+
+error: prefix `failed` is unknown
+   --> src\compiler.rs:279:71
+    |
+279 |             CompileError::RustcFailed => write!(f, "Rustc compilation failed"),
+    |                                                                       ^^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+279 |             CompileError::RustcFailed => write!(f, "Rustc compilation failed "),
+    |                                                                             +
+
+error: prefix `failed` is unknown
+   --> src\compiler.rs:280:65
+    |
+280 |             CompileError::LinkFailed => write!(f, "WASM linking failed"),
+    |                                                                 ^^^^^^ unknown prefix
+    |
+    = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+    |
+280 |             CompileError::LinkFailed => write!(f, "WASM linking failed "),
+    |                                                                       +
+
+error[E0765]: unterminated double quote string
+   --> src\compiler.rs:281:81
+    |
+281 |               CompileError::NotImplemented(what) => write!(f, "Not implemented: {}", what),
+    |  _________________________________________________________________________________^
+...   |
+286 | | impl std::error::Error for CompileError {}
+    | |___________________________________________^
+
+For more information about this error, try `rustc --explain E0765`.
+error: could not compile `pyrs` (lib) due to 24 previous errors

@@ -1,0 +1,73 @@
+warning: unused import: `std::collections::HashMap`
+ --> src\parser.rs:2:5
+  |
+2 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `FunctionSig` and `PythonMode`
+ --> src\wit_gen.rs:3:21
+  |
+3 | ...::{FunctionSig, Language, ParsedFile, PythonMode, T...
+  |       ^^^^^^^^^^^                        ^^^^^^^^^^
+
+warning: unused variable: `opts`
+   --> src\compiler.rs:101:42
+    |
+101 | ...(py_file: &Path, opts: &CompileOptions) -> Resul...
+    |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_opts`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `py_file`
+   --> src\compiler.rs:137:26
+    |
+137 | ...le_python_nuitka(py_file: &Path, opts: &CompileO...
+    |                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_py_file`
+
+warning: unused variable: `opts`
+   --> src\compiler.rs:137:42
+    |
+137 | ...(py_file: &Path, opts: &CompileOptions) -> Resul...
+    |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_opts`
+
+warning: unused variable: `py_file`
+   --> src\compiler.rs:142:25
+    |
+142 | ...ile_python_codon(py_file: &Path, opts: &CompileO...
+    |                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_py_file`
+
+warning: unused variable: `opts`
+   --> src\compiler.rs:142:41
+    |
+142 | ...(py_file: &Path, opts: &CompileOptions) -> Resul...
+    |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_opts`
+
+warning: unused variable: `base_line`
+   --> src\parser.rs:192:5
+    |
+192 |     base_line: usize,
+    |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_base_line`
+
+warning: unused variable: `base_line`
+   --> src\parser.rs:222:5
+    |
+222 |     base_line: usize,
+    |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_base_line`
+
+warning: unused variable: `size`
+   --> src\wit_gen.rs:142:31
+    |
+142 |         TypeRef::Array(inner, size) => {
+    |                               ^^^^ help: if this is intentional, prefix it with an underscore: `_size`
+
+warning: `pyrs` (lib) generated 10 warnings (run `cargo fix --lib -p pyrs` to apply 10 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running `target\debug\pyrs.exe check test.pyrs`
+Checking test.pyrs
+
+thread 'main' (539660) panicked at src\parser.rs:151:22:
+internal error: entered unreachable code
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: process didn't exit successfully: `target\debug\pyrs.exe check test.pyrs` (exit code: 101)

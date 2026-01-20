@@ -1,0 +1,19 @@
+[package]
+name = "polyglot"
+version = "0.1.0"
+edition = "2021"
+description = "Python + Rust polyglot compiler for verified WASM execution"
+
+[workspace]
+members = ["gridmesh"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+anyhow = "1"
+thiserror = "1"
+rustpython-vm = { version = "0.3.0", default-features = false, features = ["compiler"] }
+nom = "8.0.0"
+
+[dev-dependencies]
+tempfile = "3"
