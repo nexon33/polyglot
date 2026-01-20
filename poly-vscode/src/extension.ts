@@ -13,14 +13,29 @@ let client: LanguageClient;
 
 export function activate(context: ExtensionContext) {
     const config = workspace.getConfiguration('polyglot');
-    const serverPath = config.get<string>('serverPath') || 'poly-lsp';
 
-    // NOTE: In development, we can point to the cargo project
-    // serverPath might be "poly-lsp" which assumes it is in PATH.
+    // Check for bundled binary first, then fall back to config/PATH
+    const bundledPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'poly-lsp.exe' : 'poly-lsp');
+    const configPath = config.get<string>('serverPath');
 
-    // Launch the server
-    // If we are in debug mode, we can try to use cargo run? 
-    // For now, assume compiled binary.
+    // Priority: bundled > config > PATH
+    let serverPath: string;
+    const fs = require('fs');
+
+    if (fs.existsSync(bundledPath)) {
+        serverPath = bundledPath;
+        window.showInformationMessage(`Polyglot: Using bundled LSP`);
+    } else if (configPath && fs.existsSync(configPath)) {
+        serverPath = configPath;
+    } else {
+        serverPath = 'poly-lsp'; // Fall back to PATH
+    }
+
+    // Also set POLYGLOT_BIN env for the LSP to find the compiler
+    const polyglotBin = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'polyglot.exe' : 'polyglot');
+    if (fs.existsSync(polyglotBin)) {
+        process.env.POLYGLOT_BIN = polyglotBin;
+    }
 
     const serverOptions: ServerOptions = {
         run: { command: serverPath, transport: TransportKind.stdio },
@@ -33,7 +48,7 @@ export function activate(context: ExtensionContext) {
     const clientOptions: LanguageClientOptions = {
         documentSelector: [{ scheme: 'file', language: 'polyglot' }],
         synchronize: {
-            fileEvents: workspace.createFileSystemWatcher('**/.poly')
+            fileEvents: workspace.createFileSystemWatcher('**/*.poly')
         }
     };
 
@@ -46,8 +61,6 @@ export function activate(context: ExtensionContext) {
 
     // Start the client. This will also launch the server
     client.start();
-
-    window.showInformationMessage(`Polyglot Client Started. Connecting to: ${serverPath}`);
 }
 
 export function deactivate(): Thenable<void> | undefined {

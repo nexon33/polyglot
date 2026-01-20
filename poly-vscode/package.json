@@ -41,8 +41,8 @@
             "properties": {
                 "polyglot.serverPath": {
                     "type": "string",
-                    "default": "c:\\Users\\adria\\Downloads\\pyrs polygot\\pyrs\\target\\release\\poly-lsp.exe",
-                    "description": "Path to the poly-lsp executable."
+                    "default": "",
+                    "description": "Path to poly-lsp. Leave empty to use bundled binary."
                 },
                 "polyglot.trace.server": {
                     "scope": "window",
@@ -61,7 +61,8 @@
     "scripts": {
         "vscode:prepublish": "npm run compile",
         "compile": "tsc -p ./",
-        "watch": "tsc -watch -p ./"
+        "watch": "tsc -watch -p ./",
+        "bundle": "bundle.bat"
     },
     "devDependencies": {
         "@types/node": "^16.11.7",
