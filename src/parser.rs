@@ -147,7 +147,7 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
 
 /// Scan code blocks for `pub fn` (Rust) and `pub def` (Python) and add to interfaces
 fn scan_pub_functions(parsed: &mut ParsedFile) {
-    use crate::interface::parser::{InterfaceItem, FunctionDecl, Type};
+    use crate::interface::parser::{InterfaceItem, FunctionDecl, Type, Visibility};
     use regex::Regex;
     
     // Regex for Rust: pub fn name(params) -> ReturnType
@@ -169,12 +169,12 @@ fn scan_pub_functions(parsed: &mut ParsedFile) {
             let _params_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
             let return_type = cap.get(3).map(|m| Type::Named(m.as_str().to_string()));
             
-            // For now, skip param parsing - just capture the function existence
-            // Full param parsing would require more complex logic
+            // `pub` means Export visibility (callable from other .poly files)
             let func_decl = FunctionDecl {
                 name,
                 params: vec![], // TODO: parse params properly
                 return_type,
+                visibility: Visibility::Export,
             };
             
             // Check if this function is already in interfaces (avoid duplicates)

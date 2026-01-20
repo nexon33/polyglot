@@ -3,10 +3,14 @@
 type Tensor = rust:gridmesh::tensor::Tensor<f32> | python:gridmesh.Tensor
 
 #[interface]
-// Explicit function declarations until pub inference is complete
-fn create_tensor(rows: u32, cols: u32) -> Tensor
-fn process_tensor(t: Tensor) -> Tensor
-fn print_tensor(t: Tensor)
+// Function visibility:
+// - (default) = internal, only callable within this file
+// - export = callable from other .poly files
+// - public = callable from anywhere (FFI boundary)
+
+export fn create_tensor(rows: u32, cols: u32) -> Tensor
+export fn process_tensor(t: Tensor) -> Tensor
+export fn print_tensor(t: Tensor)
 
 #[rust]
 fn create_tensor(rows: u32, cols: u32) -> Tensor {

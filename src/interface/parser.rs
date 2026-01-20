@@ -1,10 +1,10 @@
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while1},
-    character::complete::{alpha1, alphanumeric1, char, multispace0},
+    character::complete::{alpha1, alphanumeric1, char, multispace0, multispace1},
     combinator::{map, opt, recognize},
     multi::{many0, separated_list0},
-    sequence::{delimited, pair, preceded, tuple},
+    sequence::{delimited, pair, preceded, terminated, tuple},
     IResult, Parser,
 };
 
@@ -26,11 +26,24 @@ pub struct TypeDeclDef {
     pub python_impl: Option<String>,
 }
 
+/// Visibility scope for capability-based access control
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Visibility {
+    /// Only callable from same .poly file (default, no keyword needed)
+    #[default]
+    Internal,
+    /// Callable from other .poly files that import this module
+    Export,
+    /// Callable from anywhere, including raw FFI (no capability check)
+    Public,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDecl {
     pub name: String,
     pub params: Vec<(String, Type)>,
     pub return_type: Option<Type>,
+    pub visibility: Visibility,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +134,14 @@ fn skip_ws_and_comments(input: &str) -> IResult<&str, ()> {
 }
 
 fn parse_function_decl(input: &str) -> IResult<&str, FunctionDecl> {
+    // Parse optional visibility keyword: internal, export, or public
+    let (input, visibility) = opt(alt((
+        map(terminated(tag("internal"), multispace1), |_| Visibility::Internal),
+        map(terminated(tag("export"), multispace1), |_| Visibility::Export),
+        map(terminated(tag("public"), multispace1), |_| Visibility::Public),
+    ))).parse(input)?;
+    let visibility = visibility.unwrap_or(Visibility::Internal);
+    
     let (input, _) = tag("fn")(input)?;
     let (input, _) = multispace0(input)?;
     let (input, name) = parse_ident(input)?;
@@ -143,6 +164,7 @@ fn parse_function_decl(input: &str) -> IResult<&str, FunctionDecl> {
         name: name.to_string(),
         params,
         return_type,
+        visibility,
     }))
 }
 
