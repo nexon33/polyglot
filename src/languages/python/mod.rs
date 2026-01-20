@@ -63,10 +63,29 @@ impl Language for Python {
 
     fn compile(&self, source: &str, opts: &CompileOptions) -> Result<Vec<u8>> {
         // Implement compilation logic for Python
-        // This creates a Rust wrapper and compiles it
+        // This creates a Rust wrapper and compiles it using Cargo to pull in rustpython_vm
 
-        let py_file = opts.temp_dir.join(format!("module.{}", self.extension()));
-        fs::write(&py_file, source)?;
+        let package_name = "poly_py_cell";
+        let cargo_toml_content = r#"
+[workspace]
+
+[package]
+name = "poly_py_cell"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[dependencies]
+# We need rustpython-vm to run the code. 
+# For demo speed, we might want to use a local path if available, or just the crate.
+# Using git dependency for latest WASI support or standard crate.
+rustpython-vm = { version = "0.3.0", default-features = false, features = ["compiler", "codegen"] }
+"#;
+
+        fs::write(opts.temp_dir.join("Cargo.toml"), cargo_toml_content)?;
 
         let mut wrapper = String::new();
         wrapper.push_str("// Auto-generated RustPython wrapper\n");
@@ -87,28 +106,41 @@ impl Language for Python {
         wrapper.push_str("    });\n");
         wrapper.push_str("}\n");
 
-        let rs_file = py_file.with_extension("rs");
-        fs::write(&rs_file, wrapper)?;
+        let rs_file = opts.temp_dir.join("lib.rs");
+        let should_write = if rs_file.exists() {
+            fs::read_to_string(&rs_file)
+                .map(|c| c != wrapper)
+                .unwrap_or(true)
+        } else {
+            true
+        };
 
-        // Invoke rustc
-        let wasm_file = rs_file.with_extension("wasm");
-        let mut cmd = Command::new("rustc");
-        cmd.arg("--target=wasm32-wasi")
-            .arg("--crate-type=cdylib") // Should match what's needed
-            .arg("-o")
-            .arg(&wasm_file)
-            .arg(&rs_file);
-
-        if opts.release {
-            cmd.arg("-O");
+        if should_write {
+            fs::write(&rs_file, wrapper)?;
         }
+
+        // Invoke cargo
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(&opts.temp_dir)
+            .arg("build")
+            .arg("--target=wasm32-wasip1")
+            .arg("--release");
+
+        // cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
 
         let status = cmd.status()?;
         if !status.success() {
             return Err(anyhow!("Rust wrapper compilation failed"));
         }
 
-        Ok(fs::read(&wasm_file)?)
+        let wasm_path = opts
+            .temp_dir
+            .join("target")
+            .join("wasm32-wasip1")
+            .join("release")
+            .join("poly_py_cell.wasm");
+
+        Ok(fs::read(&wasm_path)?)
     }
 
     fn parse_signatures(&self, source: &str) -> Result<Vec<FunctionSig>, ParseError> {

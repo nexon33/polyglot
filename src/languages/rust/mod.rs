@@ -24,24 +24,33 @@ impl Language for Rust {
     }
 
     fn compile(&self, source: &str, opts: &CompileOptions) -> Result<Vec<u8>> {
-        // Standard Rust compilation
-        // We wrap the code in a library crate structure if needed, or just compile as is
-        // For partial blocks, we might need a wrapper, but for now assuming valid items.
+        // Create a temporary Cargo project to handle dependencies correctly
+        let package_name = "poly_cell";
+        let cargo_toml_content = r#"
+[workspace]
 
-        // We wrap in a block to ensure no_std/no_main if user didn't provider it?
-        // Actually, the user provides "fn ...". We need to wrap it.
+[package]
+name = "poly_cell"
+version = "0.1.0"
+edition = "2021"
 
-        // This wrapping logic should be robust.
+[lib]
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[dependencies]
+anyhow = "1.0" 
+# We assume gridmesh is in the workspace. For this demo, we can point to it.
+# In a real system, dependencies would be injected via configuration.
+gridmesh = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/gridmesh" }
+"#;
+
+        fs::write(opts.temp_dir.join("Cargo.toml"), cargo_toml_content)?;
+
+        // Wrap the user code.
+        // We do NOT use no_std so that println! and vec! work (WASI supports them).
         let wrapped = format!(
             r#"
-#![no_std]
-#![no_main]
-
-// Panic handler for wasm32-unknown-unknown or wasi (wasi guides often use std though)
-// For now, let's assume WASI target which has std support usually, but we want cdylib.
-// Explicitly no_std might require a panic_handler. 
-// Let's rely on user provided code or minimal wrapper.
-
 #[no_mangle]
 pub extern "C" fn __pyrs_keepalive() {{}}
 
@@ -50,27 +59,42 @@ pub extern "C" fn __pyrs_keepalive() {{}}
             source
         );
 
-        let rs_file = opts.temp_dir.join(format!("module.{}", self.extension()));
-        fs::write(&rs_file, wrapped)?;
+        let lib_rs = opts.temp_dir.join("lib.rs");
+        let should_write = if lib_rs.exists() {
+            fs::read_to_string(&lib_rs)
+                .map(|c| c != wrapped)
+                .unwrap_or(true)
+        } else {
+            true
+        };
 
-        let output_wasm = rs_file.with_extension("wasm");
-        let mut cmd = Command::new("rustc");
-        cmd.arg(&rs_file)
-            .arg("--target=wasm32-wasi")
-            .arg("--crate-type=cdylib")
-            .arg("-o")
-            .arg(&output_wasm);
-
-        if opts.release {
-            cmd.arg("-O");
+        if should_write {
+            fs::write(&lib_rs, wrapped)?;
         }
+
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(&opts.temp_dir)
+            .arg("build")
+            .arg("--target=wasm32-wasip1")
+            .arg("--release"); // Always release for WASM size/speed in demo
+
+        // Suppress output unless error
+        // cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
 
         let status = cmd.status()?;
         if !status.success() {
             return Err(anyhow::anyhow!("Rust compilation failed"));
         }
 
-        Ok(fs::read(&output_wasm)?)
+        // Path to the output WASM
+        let wasm_path = opts
+            .temp_dir
+            .join("target")
+            .join("wasm32-wasip1")
+            .join("release")
+            .join("poly_cell.wasm");
+
+        Ok(fs::read(&wasm_path)?)
     }
 
     fn parse_signatures(&self, source: &str) -> Result<Vec<FunctionSig>, ParseError> {

@@ -61,6 +61,42 @@ impl<T: TensorElement> Tensor<T> {
         }
     }
 
+    /// Create a new tensor with zeros
+    pub fn zeros(shape: &[usize]) -> Self
+    where
+        T: Default + Clone,
+    {
+        let total_len: usize = shape.iter().product();
+
+        // Allocate data
+        let mut data = Vec::with_capacity(total_len);
+        data.resize(total_len, T::default());
+        let data_ptr = data.as_mut_ptr() as u32;
+        std::mem::forget(data); // Hand off to TensorHeader management
+
+        // Allocate shape
+        let mut shape_vec: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
+        let shape_ptr = shape_vec.as_mut_ptr() as u32;
+        std::mem::forget(shape_vec);
+
+        // Allocate header starting with ref_count 1
+        let header = Box::new(TensorHeader {
+            ref_count: std::sync::atomic::AtomicU32::new(1),
+            borrow_state: std::sync::atomic::AtomicU32::new(0),
+            data_ptr,
+            data_len: total_len as u32,
+            shape_ptr,
+            ndim: shape.len() as u32,
+            dtype: 0,
+            flags: 0,
+        });
+
+        Tensor {
+            header: Box::into_raw(header),
+            _marker: PhantomData,
+        }
+    }
+
     /// Borrow the data immutably (returns a guard)
     pub fn borrow(&self) -> Result<TensorRef<'_, T>, BorrowError> {
         unsafe {
@@ -99,6 +135,13 @@ impl<T> Drop for Tensor<T> {
                 wasm_free(self.header as u32);
             }
         }
+    }
+}
+
+impl<T: std::fmt::Debug + TensorElement> std::fmt::Debug for Tensor<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shape = self.shape();
+        write!(f, "Tensor(shape={:?}, type={})", shape, std::any::type_name::<T>())
     }
 }
 

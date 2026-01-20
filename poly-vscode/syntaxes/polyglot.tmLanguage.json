@@ -1,0 +1,109 @@
+{
+    "scopeName": "source.polyglot",
+    "patterns": [
+        {
+            "include": "#interface-block"
+        },
+        {
+            "include": "#rust-block"
+        },
+        {
+            "include": "#python-block"
+        },
+        {
+            "include": "#main-block"
+        }
+    ],
+    "repository": {
+        "interface-block": {
+            "begin": "^\\s*(#\\[interface\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[)",
+            "patterns": [
+                {
+                    "match": "\\b(fn)\\s+(\\w+)",
+                    "captures": {
+                        "1": {
+                            "name": "storage.type.function.polyglot"
+                        },
+                        "2": {
+                            "name": "entity.name.function.polyglot"
+                        }
+                    }
+                },
+                {
+                    "match": "->\\s*(\\w+)",
+                    "captures": {
+                        "1": {
+                            "name": "storage.type.polyglot"
+                        }
+                    }
+                },
+                {
+                    "match": "\\b(struct|enum|type)\\b",
+                    "name": "storage.type.polyglot"
+                },
+                {
+                    "include": "#comments"
+                }
+            ]
+        },
+        "rust-block": {
+            "begin": "^\\s*(#\\[rust(?:.*)?\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[)",
+            "contentName": "meta.embedded.rust",
+            "patterns": [
+                {
+                    "include": "source.rust"
+                }
+            ]
+        },
+        "python-block": {
+            "begin": "^\\s*(#\\[python(?:.*)?\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[)",
+            "contentName": "meta.embedded.python",
+            "patterns": [
+                {
+                    "include": "source.python"
+                }
+            ]
+        },
+        "main-block": {
+            "begin": "^\\s*(#\\[main\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[)",
+            "contentName": "meta.embedded.rust",
+            "patterns": [
+                {
+                    "include": "source.rust"
+                }
+            ]
+        },
+        "comments": {
+            "patterns": [
+                {
+                    "match": "//.*$",
+                    "name": "comment.line.double-slash.polyglot"
+                }
+            ]
+        }
+    }
+}

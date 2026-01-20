@@ -22,6 +22,7 @@ pub struct CodeBlock {
     pub lang_tag: String,
     pub code: String,
     pub options: HashMap<String, String>,
+    pub start_line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -46,30 +47,50 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
         parsed.interfaces = interfaces;
     }
 
-    // Parse language blocks regex
-    let re = Regex::new(r"(?ms)^#\[([a-zA-Z0-9_:]+)\]\s*$(.*?)(?=^#\[|\z)").unwrap();
+    // Regex to find block headers: #[tag]
+    let re = Regex::new(r"(?m)^#\[([a-zA-Z0-9_:]+)\]\s*$").unwrap();
 
-    for cap in re.captures_iter(source) {
-        let tag_full = cap[1].to_string();
-        let code = cap[2].trim().to_string();
+    let mut matches: Vec<_> = re.find_iter(source).collect();
 
-        let mut parts = tag_full.split(':');
+    for (i, m) in matches.iter().enumerate() {
+        let start_idx = m.end();
+        let end_idx = if i + 1 < matches.len() {
+            matches[i + 1].start()
+        } else {
+            source.len()
+        };
+
+        if start_idx >= end_idx {
+            continue;
+        }
+
+        let tag_header = m.as_str().trim(); // e.g. "#[rust]"
+        let tag_content = &source[start_idx..end_idx];
+
+        // Extract tag name from header: "#[rust]" -> "rust"
+        // remove "#[" and "]"
+        let inner = tag_header.trim_start_matches("#[").trim_end_matches(']');
+
+        let mut parts = inner.split(':');
         let lang_tag = parts.next().unwrap_or("").to_string();
 
-        // Options handling
         let mut options = HashMap::new();
         for opt in parts {
             options.insert(opt.to_string(), "true".to_string());
         }
 
         if lang_tag == "interface" {
-            continue; // Handled separately
+            continue;
         }
+
+        // Calculate start line
+        let start_line = source[..m.start()].lines().count();
 
         parsed.blocks.push(CodeBlock {
             lang_tag,
-            code,
+            code: tag_content.trim().to_string(),
             options,
+            start_line,
         });
     }
 

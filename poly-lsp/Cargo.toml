@@ -1,0 +1,24 @@
+[package]
+name = "poly-lsp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dashmap = "5.5" # For thread-safe state maps
+regex = "1"
+log = "0.4"
+env_logger = "0.10"
+
+# Tree Sitter for robust parsing
+tree-sitter = "0.20"
+tree-sitter-rust = "0.20"
+tree-sitter-python = "0.20"
+
+# Workspace dependencies
+polyglot = { path = "../" } # To access shared types like WitType if needed, or we might need to move types to a shared logic crate
+gridmesh = { path = "../gridmesh" }

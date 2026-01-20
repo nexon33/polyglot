@@ -34,10 +34,9 @@ pub fn default_languages() -> Vec<Box<dyn Language>> {
 
 pub fn find_language(tag: &str) -> Option<Box<dyn Language>> {
     let (base_tag, _variant) = tag.split_once(':').unwrap_or((tag, ""));
-
     match base_tag {
-        "py" => Some(Box::new(python::Python::new())),
-        "rs" => Some(Box::new(rust::Rust::new())),
+        "py" | "python" => Some(Box::new(python::Python::new())),
+        "rs" | "rust" | "main" => Some(Box::new(rust::Rust::new())),
         _ => None,
     }
 }

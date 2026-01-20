@@ -1,0 +1,128 @@
+warning: unused imports: `DerefMut` and `Deref`
+ --> gridmesh\src\tensor.rs:3:16
+  |
+3 | use std::ops::{Deref, DerefMut};
+  |                ^^^^^  ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `gridmesh` (lib) generated 1 warning (run `cargo fix --lib -p gridmesh` to apply 1 suggestion)
+warning: unused import: `anyhow`
+ --> src\compiler.rs:6:14
+  |
+6 | use anyhow::{anyhow, Result};
+  |              ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::process::Command`
+ --> src\compiler.rs:8:5
+  |
+8 | use std::process::Command;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `take_while1` and `tuple`
+ --> src\interface\parser.rs:3:28
+  |
+3 |     bytes::complete::{tag, take_while1},
+  |                            ^^^^^^^^^^^
+...
+7 |     sequence::{delimited, pair, preceded, tuple},
+  |                                           ^^^^^
+
+warning: unused import: `Param`
+ --> src\languages\python\mod.rs:3:49
+  |
+3 | ...Options, FunctionSig, Param, WitType};
+  |                          ^^^^^
+
+warning: unused import: `Param`
+ --> src\languages\rust\mod.rs:3:49
+  |
+3 | ...Options, FunctionSig, Param, WitType};
+  |                          ^^^^^
+
+warning: unused import: `FunctionSig`
+ --> src\wit_gen.rs:5:20
+  |
+5 | use crate::types::{FunctionSig, WitType};
+  |                    ^^^^^^^^^^^
+
+warning: use of deprecated function `nom::sequence::tuple`: `Parser` is directly implemented for tuples
+ --> src\interface\parser.rs:7:43
+  |
+7 |     sequence::{delimited, pair, preceded, tuple},
+  |                                           ^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `i`
+  --> src\compiler.rs:32:10
+   |
+32 |     for (i, block) in parsed.blocks.iter().enumerate...
+   |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `opts`
+  --> src\compiler.rs:58:38
+   |
+58 | ...les: &[Vec<u8>], opts: &CompileOptions) -> Result...
+   |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_opts`
+
+warning: unused variable: `remaining`
+  --> src\interface\parser.rs:68:10
+   |
+68 |     let (remaining, items) = many0(preceded(
+   |          ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_remaining`
+
+warning: function `parse_struct` is never used
+  --> src\interface\parser.rs:81:4
+   |
+81 | fn parse_struct(input: &str) -> IResult<&str, Struct...
+   |    ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `parse_field` is never used
+   --> src\interface\parser.rs:102:4
+    |
+102 | fn parse_field(input: &str) -> IResult<&str, Field> {
+    |    ^^^^^^^^^^^
+
+warning: method `to_lang_type` is never used
+  --> src\languages\python\mod.rs:16:8
+   |
+11 | impl Python {
+   | ----------- method in this implementation
+...
+16 |     fn to_lang_type(&self, wit_type: &WitType, optio...
+   |        ^^^^^^^^^^^^
+
+warning: `polyglot` (lib) generated 13 warnings (run `cargo fix --lib -p polyglot` to apply 9 suggestions)
+warning: unused import: `anyhow`
+ --> poly-lsp\src\json_rpc.rs:1:22
+  |
+1 | use anyhow::{Result, anyhow};
+  |                      ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `name` and `return_type` are never read
+  --> poly-lsp\src\type_graph.rs:8:9
+   |
+ 7 | pub struct TypeNode {
+   |            -------- fields in this struct
+ 8 |     pub name: String,
+   |         ^^^^
+ 9 |     pub params: Vec<String>, // Type strings for now
+10 |     pub return_type: Option<String>,
+   |         ^^^^^^^^^^^
+   |
+   = note: `TypeNode` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `poly-lsp` (bin "poly-lsp" test) generated 2 warnings (run `cargo fix --bin "poly-lsp" -p poly-lsp --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.46s
+     Running unittests src\main.rs (target\debug\deps\poly_lsp-5db9a0637c7f337a.exe)
+error: test failed, to rerun pass `-p poly-lsp --bin poly-lsp`

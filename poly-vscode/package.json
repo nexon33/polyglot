@@ -1,0 +1,74 @@
+{
+    "name": "poly-vscode",
+    "displayName": "Polyglot Language Support",
+    "description": "Language support for Polyglot (.poly) files with GridMesh safety.",
+    "version": "0.1.0",
+    "publisher": "pyrs",
+    "engines": {
+        "vscode": "^1.75.0"
+    },
+    "categories": [
+        "Programming Languages"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "languages": [
+            {
+                "id": "polyglot",
+                "aliases": [
+                    "Polyglot",
+                    "poly"
+                ],
+                "extensions": [
+                    ".poly"
+                ],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "polyglot",
+                "scopeName": "source.polyglot",
+                "path": "./syntaxes/polyglot.tmLanguage.json",
+                "embeddedLanguages": {
+                    "meta.embedded.rust": "rust",
+                    "meta.embedded.python": "python"
+                }
+            }
+        ],
+        "configuration": {
+            "title": "Polyglot",
+            "properties": {
+                "polyglot.serverPath": {
+                    "type": "string",
+                    "default": "c:\\Users\\adria\\Downloads\\pyrs polygot\\pyrs\\target\\release\\poly-lsp.exe",
+                    "description": "Path to the poly-lsp executable."
+                },
+                "polyglot.trace.server": {
+                    "scope": "window",
+                    "type": "string",
+                    "enum": [
+                        "off",
+                        "messages",
+                        "verbose"
+                    ],
+                    "default": "off",
+                    "description": "Traces the communication between VS Code and the polyglot language server."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./"
+    },
+    "devDependencies": {
+        "@types/node": "^16.11.7",
+        "@types/vscode": "^1.75.0",
+        "typescript": "^4.9.5"
+    },
+    "dependencies": {
+        "vscode-languageclient": "^8.1.0"
+    }
+}

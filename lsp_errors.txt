@@ -1,0 +1,197 @@
+warning: unused imports: `DerefMut` and `Deref`
+ --> gridmesh\src\tensor.rs:3:16
+  |
+3 | use std::ops::{Deref, DerefMut};
+  |                ^^^^^  ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `gridmesh` (lib) generated 1 warning (run `cargo fix --lib -p gridmesh` to apply 1 suggestion)
+warning: unused import: `anyhow`
+ --> src\compiler.rs:6:14
+  |
+6 | use anyhow::{anyhow, Result};
+  |              ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::process::Command`
+ --> src\compiler.rs:8:5
+  |
+8 | use std::process::Command;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `take_while1` and `tuple`
+ --> src\interface\parser.rs:3:28
+  |
+3 |     bytes::complete::{tag, take_while1},
+  |                            ^^^^^^^^^^^
+...
+7 |     sequence::{delimited, pair, preceded, tuple},
+  |                                           ^^^^^
+
+warning: unused import: `Param`
+ --> src\languages\python\mod.rs:3:49
+  |
+3 | ...Options, FunctionSig, Param, WitType};
+  |                          ^^^^^
+
+warning: unused import: `Param`
+ --> src\languages\rust\mod.rs:3:49
+  |
+3 | ...Options, FunctionSig, Param, WitType};
+  |                          ^^^^^
+
+warning: unused import: `FunctionSig`
+ --> src\wit_gen.rs:5:20
+  |
+5 | use crate::types::{FunctionSig, WitType};
+  |                    ^^^^^^^^^^^
+
+warning: use of deprecated function `nom::sequence::tuple`: `Parser` is directly implemented for tuples
+ --> src\interface\parser.rs:7:43
+  |
+7 |     sequence::{delimited, pair, preceded, tuple},
+  |                                           ^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `i`
+  --> src\compiler.rs:32:10
+   |
+32 |     for (i, block) in parsed.blocks.iter().enumerate...
+   |          ^ help: if this is intentional, prefix it with an underscore: `_i`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `opts`
+  --> src\compiler.rs:58:38
+   |
+58 | ...les: &[Vec<u8>], opts: &CompileOptions) -> Result...
+   |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_opts`
+
+warning: unused variable: `remaining`
+  --> src\interface\parser.rs:68:10
+   |
+68 |     let (remaining, items) = many0(preceded(
+   |          ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_remaining`
+
+warning: function `parse_struct` is never used
+  --> src\interface\parser.rs:81:4
+   |
+81 | fn parse_struct(input: &str) -> IResult<&str, Struct...
+   |    ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `parse_field` is never used
+   --> src\interface\parser.rs:102:4
+    |
+102 | fn parse_field(input: &str) -> IResult<&str, Field> {
+    |    ^^^^^^^^^^^
+
+warning: method `to_lang_type` is never used
+  --> src\languages\python\mod.rs:16:8
+   |
+11 | impl Python {
+   | ----------- method in this implementation
+...
+16 |     fn to_lang_type(&self, wit_type: &WitType, optio...
+   |        ^^^^^^^^^^^^
+
+warning: `polyglot` (lib) generated 13 warnings (run `cargo fix --lib -p polyglot` to apply 9 suggestions)
+    Checking poly-lsp v0.1.0 (C:\Users\adria\Downloads\pyrs polygot\pyrs\poly-lsp)
+warning: unused import: `polyglot::interface::parser::parse_interface`
+ --> poly-lsp\src\virtual_fs.rs:2:5
+  |
+2 | use polyglot::interface::parser::parse_interface;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `CodeBlock`
+ --> poly-lsp\src\virtual_fs.rs:3:36
+  |
+3 | use polyglot::parser::{parse_poly, CodeBlock};
+  |                                    ^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> poly-lsp\src\virtual_fs.rs:4:5
+  |
+4 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `Child`
+ --> poly-lsp\src\delegator.rs:2:22
+  |
+2 | use tokio::process::{Child, Command};
+  |                      ^^^^^
+
+warning: unused imports: `AsyncWriteExt` and `BufReader`
+ --> poly-lsp\src\delegator.rs:3:17
+  |
+3 | use tokio::io::{BufReader, AsyncWriteExt};
+  |                 ^^^^^^^^^  ^^^^^^^^^^^^^
+
+warning: unused import: `tower_lsp::lsp_types::*`
+ --> poly-lsp\src\delegator.rs:7:5
+  |
+7 | use tower_lsp::lsp_types::*;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `read_message`
+ --> poly-lsp\src\delegator.rs:9:23
+  |
+9 | use crate::json_rpc::{read_message, write_message};
+  |                       ^^^^^^^^^^^^
+
+warning: unused import: `anyhow`
+ --> poly-lsp\src\json_rpc.rs:1:22
+  |
+1 | use anyhow::{Result, anyhow};
+  |                      ^^^^^^
+
+warning: variable does not need to be mutable
+  --> poly-lsp\src\delegator.rs:37:21
+   |
+37 |                 let mut c = Command::new("rust-analyzer");
+   |                     ----^
+   |                     |
+   |                     help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0277]: `Delegator` doesn't implement `Debug`
+  --> poly-lsp\src\main.rs:17:5
+   |
+13 | #[derive(Debug)]
+   |          ----- in this derive macro expansion
+...
+17 |     delegator: Arc<Delegator>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Debug` is not implemented for `Delegator`
+  --> poly-lsp\src\delegator.rs:14:1
+   |
+14 | pub struct Delegator {
+   | ^^^^^^^^^^^^^^^^^^^^
+   = note: add `#[derive(Debug)]` to `Delegator` or manually `impl Debug for Delegator`
+   = help: the trait `Debug` is implemented for `Arc<T, A>`
+
+warning: unused variable: `idx`
+  --> poly-lsp\src\virtual_fs.rs:32:18
+   |
+32 |             for (idx, block) in parsed.blocks.iter().enumerate() {
+   |                  ^^^ help: if this is intentional, prefix it with an underscore: `_idx`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `stdout`
+  --> poly-lsp\src\delegator.rs:54:13
+   |
+54 |         let stdout = child.stdout.take().ok_or(anyhow!("Failed to open stdout"))?;
+   |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_stdout`
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `poly-lsp` (bin "poly-lsp") generated 11 warnings
+error: could not compile `poly-lsp` (bin "poly-lsp") due to 1 previous error; 11 warnings emitted

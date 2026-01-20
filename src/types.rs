@@ -48,11 +48,21 @@ pub struct Param {
     pub default: Option<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CompileOptions {
     pub release: bool,
     pub target: WasmTarget,
     pub temp_dir: PathBuf,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            release: false,
+            target: WasmTarget::default(),
+            temp_dir: PathBuf::from("target/polyglot_tmp"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]

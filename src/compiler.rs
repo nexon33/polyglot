@@ -25,6 +25,17 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
 
     let mut wasm_modules = Vec::new();
 
+    // Helper for incremental build: only write if changed to preserve mtime
+    let write_if_changed = |path: &std::path::Path, content: &str| -> std::io::Result<()> {
+        if path.exists() {
+            let current = fs::read_to_string(path)?;
+            if current == content {
+                return Ok(()); // Skip write
+            }
+        }
+        fs::write(path, content)
+    };
+
     // Generate interface code
     let py_interface = crate::interface::codegen::generate_python(&parsed.interfaces);
     let rs_interface = crate::interface::codegen::generate_rust(&parsed.interfaces);
@@ -42,7 +53,12 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
         }
         code_with_interface.push_str(&block.code);
 
-        let wasm = lang.compile(&code_with_interface, opts)?;
+        // Use unique temp dir for each block to support incremental builds and avoid collisions
+        let mut block_opts = opts.clone();
+        block_opts.temp_dir = opts.temp_dir.join(format!("block_{}_{}", i, lang.tag()));
+        fs::create_dir_all(&block_opts.temp_dir)?;
+
+        let wasm = lang.compile(&code_with_interface, &block_opts)?;
         wasm_modules.push(wasm);
     }
 
