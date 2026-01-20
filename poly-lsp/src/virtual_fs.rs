@@ -58,6 +58,25 @@ impl VirtualFileManager {
 }
 
 impl VirtualFile {
+    /// Returns the normalized file extension for this virtual file
+    /// Maps: "rs"|"rust"|"main"|"interface" -> "rs", "py"|"python" -> "py"
+    pub fn normalized_ext(&self) -> &'static str {
+        match self.lang_tag.as_str() {
+            "rs" | "rust" | "main" | "interface" => "rs",
+            "py" | "python" => "py",
+            _ => "txt",
+        }
+    }
+    
+    /// Returns the LSP languageId for this virtual file
+    pub fn language_id(&self) -> &'static str {
+        match self.lang_tag.as_str() {
+            "rs" | "rust" | "main" | "interface" => "rust",
+            "py" | "python" => "python",
+            _ => "plaintext",
+        }
+    }
+
     pub fn map_to_virtual(&self, real_line: usize) -> Option<usize> {
         // block starts at start_line (the header). code starts at start_line + 1.
         let code_start = self.start_line + 1;
@@ -73,7 +92,7 @@ impl VirtualFile {
     }
 
     pub fn virtual_uri(&self) -> String {
-        let ext = self.lang_tag.clone();
+        let ext = self.normalized_ext();
         let uri_str = self.uri.to_string();
         if uri_str.ends_with(".poly") {
             uri_str.replace(".poly", &format!(".virtual.{}", ext))
@@ -82,3 +101,4 @@ impl VirtualFile {
         }
     }
 }
+

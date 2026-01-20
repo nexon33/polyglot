@@ -1,6 +1,7 @@
 use crate::virtual_fs::VirtualFile;
+use crate::symbol_table::{SymbolTable, SymbolKind, SymbolLocation};
 use std::collections::HashMap;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Url};
 use tree_sitter::{Parser, Query, QueryCursor};
 
 #[derive(Debug, Clone)]
@@ -11,12 +12,25 @@ pub struct TypeNode {
     pub range: Range,
 }
 
+/// Represents a location where a function is called
+#[derive(Debug, Clone)]
+pub struct CallSite {
+    pub callee_name: String,   // Function being called
+    pub caller_lang: String,   // Language of the caller ("rs", "py", "main")
+    pub range: Range,          // Location of the call in the real poly file
+    pub uri: Url,              // File containing the call
+}
+
 #[derive(Debug)]
 pub struct TypeGraph {
     // Interface signatures: Function Name -> Signature
     interfaces: HashMap<String, TypeNode>,
     // Implementations: Function Name -> (Lang, Signature)
     implementations: HashMap<String, (String, TypeNode)>,
+    // All function call sites (legacy, kept for compatibility)
+    pub call_sites: Vec<CallSite>,
+    // Unified symbol table for AST-based linking
+    pub symbol_table: SymbolTable,
 }
 
 impl TypeGraph {
@@ -24,12 +38,22 @@ impl TypeGraph {
         Self {
             interfaces: HashMap::new(),
             implementations: HashMap::new(),
+            call_sites: Vec::new(),
+            symbol_table: SymbolTable::new(),
         }
     }
 
     pub fn clear(&mut self) {
         self.interfaces.clear();
         self.implementations.clear();
+        self.call_sites.clear();
+        self.symbol_table.clear();
+    }
+    
+    /// Clear only data for a specific file URI (keeps other files' data)
+    pub fn clear_for_file(&mut self, uri: &Url) {
+        self.call_sites.retain(|cs| &cs.uri != uri);
+        self.symbol_table.clear_for_file(uri);
     }
 
     pub fn add_interface(&mut self, name: &str, node: TypeNode) {
@@ -41,52 +65,69 @@ impl TypeGraph {
         let interface_regex =
             regex::Regex::new(r"fn\s+(\w+)\s*\((.*?)\)\s*(?:->\s*(\w+))?").unwrap();
 
+        eprintln!("TypeGraph: Scanning {} virtual files", vfiles.len());
+
         for vfile in vfiles {
+            eprintln!("TypeGraph: Processing block lang_tag='{}' start_line={}", vfile.lang_tag, vfile.start_line);
+            
             if vfile.lang_tag == "interface" {
-                // Parse definitions
-                for cap in interface_regex.captures_iter(&vfile.content) {
-                    let name = cap[1].to_string();
-                    let params_str = &cap[2];
-                    let ret = cap.get(3).map(|m| m.as_str().to_string());
+                // Parse interface declarations - functions defined in the polyglot contract
+                for (line_idx, line) in vfile.content.lines().enumerate() {
+                    if let Some(cap) = interface_regex.captures(line) {
+                        let name = cap[1].to_string();
+                        let params_str = &cap[2];
+                        let ret = cap.get(3).map(|m| m.as_str().to_string());
 
-                    let params: Vec<String> = params_str
-                        .split(',')
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| {
-                            // Extract type: "p: Tensor" -> "Tensor"
-                            s.split(':').nth(1).unwrap_or("").trim().to_string()
-                        })
-                        .collect();
+                        let params: Vec<String> = params_str
+                            .split(',')
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| s.split(':').nth(1).unwrap_or("").trim().to_string())
+                            .collect();
 
-                    let range = Range {
-                        start: Position {
-                            line: 0,
-                            character: 0,
-                        }, // TODO: accurate position inside block
-                        end: Position {
-                            line: 0,
-                            character: 0,
-                        },
-                    };
+                        // Calculate real line in poly file
+                        let real_line = vfile.map_to_real(line_idx) as u32;
+                        
+                        let range = Range {
+                            start: Position { line: real_line, character: 0 },
+                            end: Position { line: real_line, character: line.len() as u32 },
+                        };
 
-                    self.add_interface(
-                        &name,
-                        TypeNode {
-                            name: name.clone(),
-                            params,
-                            return_type: ret,
+                        // Add to legacy interface tracking
+                        self.add_interface(
+                            &name,
+                            TypeNode {
+                                name: name.clone(),
+                                params,
+                                return_type: ret,
+                                range,
+                            },
+                        );
+                        
+                        // Register in SymbolTable as a declaration
+                        let location = SymbolLocation {
+                            uri: vfile.uri.clone(),
                             range,
-                        },
-                    );
+                            lang: "interface".to_string(),
+                        };
+                        self.symbol_table.declare(&name, SymbolKind::Function, location);
+                    }
                 }
-            } else if vfile.lang_tag == "rs" || vfile.lang_tag == "rust" {
-                // Tree-sitter scan Rust
+            } else if vfile.lang_tag == "rs" || vfile.lang_tag == "rust" || vfile.lang_tag == "main" {
+                // Tree-sitter scan Rust (including main block)
                 self.scan_rust(vfile);
             } else if vfile.lang_tag == "py" || vfile.lang_tag == "python" {
                 // Tree-sitter scan Python
                 self.scan_python(vfile);
             }
         }
+        
+        eprintln!("TypeGraph: Found {} call sites total", self.call_sites.len());
+        for cs in &self.call_sites {
+            eprintln!("  CallSite: {} called from {} at line {}", cs.callee_name, cs.caller_lang, cs.range.start.line);
+        }
+        
+        // Debug print SymbolTable
+        self.symbol_table.debug_print();
     }
 
     fn scan_rust(&mut self, vfile: &VirtualFile) {
@@ -103,9 +144,13 @@ impl TypeGraph {
         let mut cursor = QueryCursor::new();
 
         for m in cursor.matches(&query, tree.root_node(), vfile.content.as_bytes()) {
-            let name_node = m.captures[0].node;
-            let params_node = m.captures[1].node; // parameters node
-            let func_node = m.captures[2].node;
+            // Captures are in parse tree order, not query order
+            // For "(function_item name: (identifier) @name ...)" the function_item @func comes first
+            // Let's find captures by index based on expected order: @name=0, @params=1, @func=2
+            // But tree-sitter orders by node position, so @func first, then @name, then @params
+            let func_node = m.captures[0].node;  // @func - the whole function_item
+            let name_node = m.captures[1].node;  // @name - the identifier
+            let params_node = m.captures[2].node; // @params - parameters
 
             let name = name_node
                 .utf8_text(vfile.content.as_bytes())
@@ -145,6 +190,57 @@ impl TypeGraph {
                     range,
                 },
             );
+            
+            // Add to SymbolTable for AST-based linking
+            let location = SymbolLocation {
+                uri: vfile.uri.clone(),
+                range,
+                lang: vfile.lang_tag.clone(),
+            };
+            self.symbol_table.add_implementation(&name, location);
+            eprintln!("  Added {} implementation: {} at line {}", vfile.lang_tag, name, range.start.line);
+        }
+        
+        // Scan for function calls
+        let call_query = Query::new(
+            tree_sitter_rust::language(),
+            "(call_expression function: (identifier) @callee)",
+        )
+        .unwrap();
+        let mut call_cursor = QueryCursor::new();
+        
+        for m in call_cursor.matches(&call_query, tree.root_node(), vfile.content.as_bytes()) {
+            let callee_node = m.captures[0].node;
+            let callee_name = callee_node
+                .utf8_text(vfile.content.as_bytes())
+                .unwrap()
+                .to_string();
+            
+            let range = Range {
+                start: Position {
+                    line: vfile.map_to_real(callee_node.start_position().row) as u32,
+                    character: callee_node.start_position().column as u32,
+                },
+                end: Position {
+                    line: vfile.map_to_real(callee_node.end_position().row) as u32,
+                    character: callee_node.end_position().column as u32,
+                },
+            };
+            
+            self.call_sites.push(CallSite {
+                callee_name: callee_name.clone(),
+                caller_lang: vfile.lang_tag.clone(),
+                range,
+                uri: vfile.uri.clone(),
+            });
+            
+            // Add to SymbolTable for AST-based linking
+            let location = SymbolLocation {
+                uri: vfile.uri.clone(),
+                range,
+                lang: vfile.lang_tag.clone(),
+            };
+            self.symbol_table.add_call_site(&callee_name, location);
         }
     }
 
@@ -162,9 +258,10 @@ impl TypeGraph {
         let mut cursor = QueryCursor::new();
 
         for m in cursor.matches(&query, tree.root_node(), vfile.content.as_bytes()) {
-            let name_node = m.captures[0].node;
-            let params_node = m.captures[1].node; // parameters node
-            let func_node = m.captures[2].node;
+            // Captures are in parse tree order: @func first, then @name, then @params
+            let func_node = m.captures[0].node;
+            let name_node = m.captures[1].node;
+            let params_node = m.captures[2].node;
 
             let name = name_node
                 .utf8_text(vfile.content.as_bytes())
@@ -204,8 +301,72 @@ impl TypeGraph {
                     range,
                 },
             );
+            
+            // Add to SymbolTable for AST-based linking
+            let location = SymbolLocation {
+                uri: vfile.uri.clone(),
+                range,
+                lang: vfile.lang_tag.clone(),
+            };
+            self.symbol_table.add_implementation(&name, location);
+        }
+        
+        // Scan for function calls - Python uses (call function: (identifier) @callee)
+        let call_query = Query::new(
+            tree_sitter_python::language(),
+            "(call function: (identifier) @callee)",
+        )
+        .unwrap();
+        let mut call_cursor = QueryCursor::new();
+        
+        for m in call_cursor.matches(&call_query, tree.root_node(), vfile.content.as_bytes()) {
+            let callee_node = m.captures[0].node;
+            let callee_name = callee_node
+                .utf8_text(vfile.content.as_bytes())
+                .unwrap()
+                .to_string();
+            
+            let range = Range {
+                start: Position {
+                    line: vfile.map_to_real(callee_node.start_position().row) as u32,
+                    character: callee_node.start_position().column as u32,
+                },
+                end: Position {
+                    line: vfile.map_to_real(callee_node.end_position().row) as u32,
+                    character: callee_node.end_position().column as u32,
+                },
+            };
+            
+            self.call_sites.push(CallSite {
+                callee_name: callee_name.clone(),
+                caller_lang: vfile.lang_tag.clone(),
+                range,
+                uri: vfile.uri.clone(),
+            });
+            
+            // Add to SymbolTable for AST-based linking
+            let location = SymbolLocation {
+                uri: vfile.uri.clone(),
+                range,
+                lang: vfile.lang_tag.clone(),
+            };
+            self.symbol_table.add_call_site(&callee_name, location);
         }
     }
+    
+    /// Find all call sites for a given function name
+    pub fn find_references(&self, name: &str) -> Vec<&CallSite> {
+        self.call_sites
+            .iter()
+            .filter(|cs| cs.callee_name == name)
+            .collect()
+    }
+    
+    /// Get implementation location for a function
+    pub fn get_implementation(&self, name: &str) -> Option<(&String, &TypeNode)> {
+        self.implementations.get(name).map(|(lang, node)| (lang, node))
+    }
+    
     pub fn add_implementation(&mut self, name: &str, lang: &str, node: TypeNode) {
         self.implementations
             .insert(name.to_string(), (lang.to_string(), node));

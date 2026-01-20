@@ -56,7 +56,37 @@
                     "description": "Traces the communication between VS Code and the polyglot language server."
                 }
             }
-        }
+        },
+        "commands": [
+            {
+                "command": "polyglot.build",
+                "title": "Polyglot: Build Current File"
+            },
+            {
+                "command": "polyglot.run",
+                "title": "Polyglot: Run Current File"
+            },
+            {
+                "command": "polyglot.check",
+                "title": "Polyglot: Check Current File"
+            },
+            {
+                "command": "polyglot.init",
+                "title": "Polyglot: Initialize Project"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "polyglot.build",
+                "key": "ctrl+shift+b",
+                "when": "resourceExtname == .poly"
+            },
+            {
+                "command": "polyglot.run",
+                "key": "ctrl+shift+r",
+                "when": "resourceExtname == .poly"
+            }
+        ]
     },
     "scripts": {
         "vscode:prepublish": "npm run compile",

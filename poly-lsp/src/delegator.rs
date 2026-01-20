@@ -1,6 +1,6 @@
 use tokio::sync::{Mutex, oneshot, mpsc};
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -22,6 +22,7 @@ struct ChildServer {
     stdin: tokio::process::ChildStdin,
     pending: Arc<DashMap<u64, oneshot::Sender<Value>>>,
     next_id: Arc<AtomicU64>,
+    initialized: Arc<AtomicBool>,
 }
 
 impl Delegator {
@@ -106,13 +107,40 @@ impl Delegator {
             }
         });
         
+        let initialized = Arc::new(AtomicBool::new(false));
+        
         let server = ChildServer {
             stdin,
             pending,
             next_id: Arc::new(AtomicU64::new(1)),
+            initialized: initialized.clone(),
         };
 
         self.servers.lock().await.insert(Self::normalize_lang(lang).to_string(), server);
+        
+        // Send initialize request - required by LSP protocol before any other messages
+        let init_params = json!({
+            "processId": std::process::id(),
+            "capabilities": {},
+            "rootUri": null,
+            "workspaceFolders": null
+        });
+        
+        match self.request(lang, "initialize", init_params).await {
+            Ok(_) => {
+                eprintln!("Delegator: Initialized LSP for {}", lang);
+                // Send initialized notification
+                if let Err(e) = self.notify(lang, "initialized", json!({})).await {
+                    eprintln!("Delegator: Failed to send initialized notification: {}", e);
+                }
+                // Mark server as fully initialized
+                initialized.store(true, Ordering::SeqCst);
+            },
+            Err(e) => {
+                eprintln!("Delegator: Failed to initialize LSP for {}: {}", lang, e);
+            }
+        }
+        
         Ok(())
     }
 
@@ -131,21 +159,38 @@ impl Delegator {
     }
 
     pub async fn sync_open(&self, vfile: &VirtualFile) -> anyhow::Result<()> {
-        // Construct a virtual URI
-        // transform file:///path/to/test.poly -> file:///path/to/test_virtual.rs
-        // This is a naive transformation
-        let ext = vfile.lang_tag.clone();
-        let uri_str = vfile.uri.to_string();
-        let virtual_uri_str = if uri_str.ends_with(".poly") {
-             uri_str.replace(".poly", &format!(".virtual.{}", ext))
-        } else {
-             format!("{}.virtual.{}", uri_str, ext)
-        };
+        let normalized = Self::normalize_lang(&vfile.lang_tag);
+        
+        // Wait for server to be initialized (max 5 seconds)
+        for _ in 0..50 {
+            let servers = self.servers.lock().await;
+            if let Some(server) = servers.get(normalized) {
+                if server.initialized.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            drop(servers);
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        
+        // Use the VirtualFile's virtual_uri which already normalizes the extension
+        let virtual_uri_str = vfile.virtual_uri();
+        
+        // Write virtual file to disk - pylsp needs physical files
+        // Convert URI to path: file:///c%3A/path/file.virtual.rs -> c:/path/file.virtual.rs
+        if let Some(path_str) = virtual_uri_str.strip_prefix("file:///") {
+            use std::io::Write;
+            let decoded = urlencoding::decode(path_str).unwrap_or_else(|_| path_str.into());
+            let path = std::path::PathBuf::from(decoded.as_ref());
+            if let Ok(mut f) = std::fs::File::create(&path) {
+                let _ = f.write_all(vfile.content.as_bytes());
+            }
+        }
         
         let params = json!({
             "textDocument": {
                 "uri": virtual_uri_str,
-                "languageId": match ext.as_str() { "rs" => "rust", "py" => "python", _ => "plaintext" },
+                "languageId": vfile.language_id(),
                 "version": vfile.version,
                 "text": vfile.content
             }

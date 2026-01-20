@@ -13,6 +13,7 @@ dashmap = "5.5" # For thread-safe state maps
 regex = "1"
 log = "0.4"
 env_logger = "0.10"
+urlencoding = "2"
 
 # Tree Sitter for robust parsing
 tree-sitter = "0.20"

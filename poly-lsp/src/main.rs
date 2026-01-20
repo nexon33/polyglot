@@ -9,6 +9,7 @@ mod virtual_fs;
 mod delegator;
 mod json_rpc;
 mod type_graph;
+mod symbol_table;
 
 use virtual_fs::VirtualFileManager;
 use delegator::Delegator;
@@ -44,6 +45,7 @@ impl LanguageServer for Backend {
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -145,10 +147,8 @@ impl LanguageServer for Backend {
         // Run Type Graph Analysis
         {
             let mut tg = self.type_graph.lock().await;
-            tg.clear();
-            // We need full text. valid for single file workspace. 
-            // In reality, type graph should be global.
-            // But here we scan strictly the current file's content.
+            // Only clear call sites for THIS file, preserving other files' data
+            tg.clear_for_file(&params.text_document.uri);
             tg.scan_file(&params.text_document.text, &vfiles);
             let diags = tg.check_consistency();
             
@@ -179,7 +179,8 @@ impl LanguageServer for Backend {
              // Run Type Graph Analysis
              {
                  let mut tg = self.type_graph.lock().await;
-                 tg.clear();
+                 // Only clear call sites for THIS file, preserving other files' data
+                 tg.clear_for_file(&params.text_document.uri);
                  tg.scan_file(&changes.text, &vfiles);
                  let diags = tg.check_consistency();
                  
@@ -202,15 +203,8 @@ impl LanguageServer for Backend {
         
         for vfile in vfiles {
             if let Some(v_line) = vfile.map_to_virtual(line) {
-                // Found the block!
-                // Construct virtual URI params
-                let ext = vfile.lang_tag.clone();
-                let uri_str = vfile.uri.to_string();
-                let virtual_uri_str = if uri_str.ends_with(".poly") {
-                    uri_str.replace(".poly", &format!(".virtual.{}", ext))
-                } else {
-                    format!("{}.virtual.{}", uri_str, ext)
-                };
+                // Found the block - use normalized virtual URI
+                let virtual_uri_str = vfile.virtual_uri();
 
                 let req_params = serde_json::json!({
                     "textDocument": {
@@ -242,6 +236,237 @@ impl LanguageServer for Backend {
         }
 
         Ok(None)
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri.clone();
+        let line = params.text_document_position_params.position.line as usize;
+        let character = params.text_document_position_params.position.character as usize;
+
+        // First, try to find the word at cursor and look it up in SymbolTable
+        let mut word = String::new();
+        
+        let vfiles = self.vfm.get_files(&uri).unwrap_or_default();
+        
+        // Try to extract word from virtual files
+        for vfile in &vfiles {
+            if let Some(v_line) = vfile.map_to_virtual(line) {
+                let lines: Vec<&str> = vfile.content.lines().collect();
+                if v_line < lines.len() {
+                    let line_content = lines[v_line];
+                    let char_idx = character.min(line_content.len());
+                    let before = &line_content[..char_idx];
+                    let after = &line_content[char_idx..];
+                    
+                    let start = before.rfind(|c: char| !c.is_alphanumeric() && c != '_').map(|i| i + 1).unwrap_or(0);
+                    let end = after.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after.len());
+                    
+                    word = format!("{}{}", &before[start..], &after[..end]);
+                    break;
+                }
+            }
+        }
+        
+        // Fallback: read from disk if not in virtual file (e.g., interface block)
+        if word.is_empty() {
+            if let Some(path_str) = uri.to_string().strip_prefix("file:///") {
+                let decoded = urlencoding::decode(path_str).unwrap_or_else(|_| path_str.into());
+                if let Ok(content) = std::fs::read_to_string(decoded.as_ref()) {
+                    let lines: Vec<&str> = content.lines().collect();
+                    if line < lines.len() {
+                        let line_content = lines[line];
+                        let char_idx = character.min(line_content.len());
+                        let before = &line_content[..char_idx];
+                        let after = &line_content[char_idx..];
+                        
+                        let start = before.rfind(|c: char| !c.is_alphanumeric() && c != '_').map(|i| i + 1).unwrap_or(0);
+                        let end = after.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after.len());
+                        
+                        word = format!("{}{}", &before[start..], &after[..end]);
+                    }
+                }
+            }
+        }
+
+        // Look up in SymbolTable - prefer declaration, then implementation
+        if !word.is_empty() {
+            self.client.log_message(MessageType::INFO, format!("Definition lookup for word: '{}'", word)).await;
+            
+            let type_graph = self.type_graph.lock().await;
+            let symbol_count = type_graph.symbol_table.all_symbols().count();
+            self.client.log_message(MessageType::INFO, format!("SymbolTable has {} symbols", symbol_count)).await;
+            
+            if let Some(symbol) = type_graph.symbol_table.get_by_name(&word) {
+                self.client.log_message(MessageType::INFO, format!("Found symbol: {} with {} impls, decl={}", 
+                    symbol.name, symbol.implementations.len(), symbol.declaration.is_some())).await;
+                
+                // Prefer implementation (actual code) over declaration (interface)
+                if let Some(imp) = symbol.implementations.first() {
+                    self.client.log_message(MessageType::INFO, format!("Definition found for {} (implementation)", word)).await;
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: imp.uri.clone(),
+                        range: imp.range,
+                    })));
+                }
+                
+                // Fall back to declaration if no implementation
+                if let Some(decl) = &symbol.declaration {
+                    self.client.log_message(MessageType::INFO, format!("Definition found for {} (declaration)", word)).await;
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: decl.uri.clone(),
+                        range: decl.range,
+                    })));
+                }
+            } else {
+                self.client.log_message(MessageType::INFO, format!("Symbol '{}' NOT found in SymbolTable", word)).await;
+            }
+        } else {
+            self.client.log_message(MessageType::INFO, "Definition lookup: word is empty").await;
+        }
+
+        // Fallback to delegated LSP for intra-block definitions (e.g., local variables)
+        for vfile in &vfiles {
+            if let Some(v_line) = vfile.map_to_virtual(line) {
+                let virtual_uri_str = vfile.virtual_uri();
+                let req_params = serde_json::json!({
+                    "textDocument": {
+                        "uri": virtual_uri_str
+                    },
+                    "position": {
+                        "line": v_line,
+                        "character": character
+                    }
+                });
+
+                match self.delegator.request(&vfile.lang_tag, "textDocument/definition", req_params).await {
+                    Ok(resp) => {
+                        if let Ok(mut loc) = serde_json::from_value::<Location>(resp.clone()) {
+                            if loc.uri == uri {
+                                loc.range.start.line = vfile.map_to_real(loc.range.start.line as usize) as u32;
+                                loc.range.end.line = vfile.map_to_real(loc.range.end.line as usize) as u32;
+                            }
+                            return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                        }
+                        if resp.is_null() {
+                            return Ok(None);
+                        }
+                    },
+                    Err(e) => {
+                        self.client.log_message(MessageType::ERROR, format!("Definition failed: {}", e)).await;
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+    
+    /// Handle textDocument/references - Find all call sites of a function across all languages
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri.clone();
+        let line = params.text_document_position.position.line as usize;
+        let character = params.text_document_position.position.character as usize;
+        
+        // Get ALL vfiles for this document to access their content
+        let vfiles = match self.vfm.files.get(&uri) {
+            Some(vf) => vf.clone(),
+            None => return Ok(None),
+        };
+        
+        // Try to extract word from any virtual file that contains this line
+        let mut word = String::new();
+        
+        // First try virtual files
+        for vfile in &vfiles {
+            if let Some(v_line) = vfile.map_to_virtual(line) {
+                let lines: Vec<&str> = vfile.content.lines().collect();
+                if v_line < lines.len() {
+                    let line_content = lines[v_line];
+                    let char_idx = character.min(line_content.len());
+                    let before = &line_content[..char_idx];
+                    let after = &line_content[char_idx..];
+                    
+                    let start = before.rfind(|c: char| !c.is_alphanumeric() && c != '_').map(|i| i + 1).unwrap_or(0);
+                    let end = after.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after.len());
+                    
+                    word = format!("{}{}", &before[start..], &after[..end]);
+                    break;
+                }
+            }
+        }
+        
+        // If still no word (e.g., in interface block), try reading from the virtual file URI on disk
+        if word.is_empty() {
+            // Read the poly file content from the file path
+            if let Some(path_str) = uri.to_string().strip_prefix("file:///") {
+                let decoded = urlencoding::decode(path_str).unwrap_or_else(|_| path_str.into());
+                if let Ok(content) = std::fs::read_to_string(decoded.as_ref()) {
+                    let lines: Vec<&str> = content.lines().collect();
+                    if line < lines.len() {
+                        let line_content = lines[line];
+                        let char_idx = character.min(line_content.len());
+                        let before = &line_content[..char_idx];
+                        let after = &line_content[char_idx..];
+                        
+                        let start = before.rfind(|c: char| !c.is_alphanumeric() && c != '_').map(|i| i + 1).unwrap_or(0);
+                        let end = after.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after.len());
+                        
+                        word = format!("{}{}", &before[start..], &after[..end]);
+                    }
+                }
+            }
+        }
+        
+        if word.is_empty() {
+            return Ok(None);
+        }
+        
+        self.client.log_message(MessageType::INFO, format!("Find references for: {}", word)).await;
+        
+        // Query SymbolTable for ALL references (AST-based symbol linking)
+        let type_graph = self.type_graph.lock().await;
+        
+        // Use SymbolTable for proper AST-based linking
+        let mut locations: Vec<Location> = Vec::new();
+        
+        if let Some(symbol) = type_graph.symbol_table.get_by_name(&word) {
+            // Add all call sites
+            for loc in &symbol.call_sites {
+                locations.push(Location {
+                    uri: loc.uri.clone(),
+                    range: loc.range,
+                });
+            }
+            
+            // Add all implementations  
+            for loc in &symbol.implementations {
+                locations.push(Location {
+                    uri: loc.uri.clone(),
+                    range: loc.range,
+                });
+            }
+            
+            // Also include the declaration if requested
+            if params.context.include_declaration {
+                if let Some(decl) = &symbol.declaration {
+                    locations.push(Location {
+                        uri: decl.uri.clone(),
+                        range: decl.range,
+                    });
+                }
+            }
+        }
+        
+        self.client.log_message(MessageType::INFO, format!("Found {} references via SymbolTable", locations.len())).await;
+        
+        if locations.is_empty() {
+            return Ok(None);
+        }
+        
+        Ok(Some(locations))
     }
 }
 

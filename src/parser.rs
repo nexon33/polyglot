@@ -112,16 +112,12 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             if let Ok(interfaces) = crate::interface::parser::parse_interface(tag_content) {
                 parsed.interfaces.extend(interfaces); // Extend instead of overwrite
             }
-            continue; // Don't add interface as a code block
+            // Fall through to also add interface as a code block for LSP VirtualFile tracking
         }
 
         let mut options = HashMap::new();
         for opt in parts {
             options.insert(opt.to_string(), "true".to_string());
-        }
-
-        if lang_tag == "interface" {
-            continue;
         }
 
         // Calculate start line
