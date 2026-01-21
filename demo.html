@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MiniGPT Training</title>
+    <title>Polyglot Dev</title>
     <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://unpkg.com/hyparquet@1.7.2/dist/hyparquet.min.js"></script>
     <style>
 :root {
-    --primary: #6366f1;
+    --primary: #ff1493;
     --secondary: #22d3ee;
     --bg-dark: #0f172a;
     --text-light: #f1f5f9;
@@ -40,7 +40,7 @@ body {
 }
 
 .btn {
-    background: linear-gradient(135deg, #6366f1, #22d3ee);
+    background: linear-gradient(135deg, #ff1493, #22d3ee);
     color: white;
     border: none;
     padding: 1rem 2rem;
@@ -383,7 +383,7 @@ const App = () => {
     const [dataLoaded, setDataLoaded] = React.useState(false);
     const [dataRows, setDataRows] = React.useState(0);
     const [steps, setSteps] = React.useState(0);
-    const [logs, setLogs] = React.useState(['Ready to train CharLM...']);
+    const [logs, setLogs] = React.useState(['🔥 HOT RELOAD WORKS! Ready to train MiniGPT...']);
     const [isTraining, setIsTraining] = React.useState(false);
     const [authToken, setAuthToken] = React.useState('');
     const [generatedText, setGeneratedText] = React.useState('');

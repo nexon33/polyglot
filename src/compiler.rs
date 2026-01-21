@@ -305,6 +305,7 @@ fn link_modules(modules: &[Vec<u8>], opts: &CompileOptions) -> Result<Vec<u8>, C
 /// - CSS is <style> inlined  
 /// - JS is <script> inlined
 /// - WGSL shaders are embedded for WebGPU
+/// - Source map for .poly line number mapping
 pub fn generate_inline_bundle(
     wasm_bytes: &[u8],
     css: &str,
@@ -312,6 +313,7 @@ pub fn generate_inline_bundle(
     wgsl: &str,
     html_template: Option<&str>,
     title: &str,
+    source_map_js: &str,
 ) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -353,6 +355,14 @@ pub fn generate_inline_bundle(
     if !wgsl.is_empty() {
         html.push_str("    <script id=\"wgsl-shaders\" type=\"x-shader/wgsl\">\n");
         html.push_str(wgsl);
+        html.push_str("\n    </script>\n\n");
+    }
+
+    // Source map for .poly line number mapping (inject before other scripts)
+    if !source_map_js.is_empty() {
+        html.push_str("    <script type=\"text/javascript\">\n");
+        html.push_str("    // Polyglot Source Map - maps errors to .poly file lines\n");
+        html.push_str(source_map_js);
         html.push_str("\n    </script>\n\n");
     }
 
@@ -521,8 +531,57 @@ pub fn bundle_to_single_file(
     let css = fs::read_to_string(temp_dir.join("styles.css")).unwrap_or_default();
     let js = fs::read_to_string(temp_dir.join("app.js")).unwrap_or_default();
     let wgsl = fs::read_to_string(temp_dir.join("shaders.wgsl")).unwrap_or_default();
+    let source_map_js = fs::read_to_string(temp_dir.join("source_map.js")).unwrap_or_default();
 
     Ok(generate_inline_bundle(
-        wasm_bytes, &css, &js, &wgsl, None, title,
+        wasm_bytes,
+        &css,
+        &js,
+        &wgsl,
+        None,
+        title,
+        &source_map_js,
+    ))
+}
+
+/// Create inline bundle with source map from parsed file
+pub fn bundle_with_source_map(
+    temp_dir: &std::path::Path,
+    wasm_bytes: &[u8],
+    title: &str,
+    parsed: &crate::parser::ParsedFile,
+    source_file: &str,
+) -> Result<String, std::io::Error> {
+    use crate::source_map::SourceTracker;
+
+    let css = fs::read_to_string(temp_dir.join("styles.css")).unwrap_or_default();
+    let js = fs::read_to_string(temp_dir.join("app.js")).unwrap_or_default();
+    let wgsl = fs::read_to_string(temp_dir.join("shaders.wgsl")).unwrap_or_default();
+
+    // Build source map from parsed blocks
+    let mut tracker = SourceTracker::new(source_file);
+
+    for block in &parsed.blocks {
+        tracker.track_block(block.start_line, &block.code, &block.lang_tag);
+    }
+
+    let source_map = tracker.finalize();
+    let source_map_js = source_map.to_js_lookup_function();
+
+    // Write source map for debugging
+    fs::write(temp_dir.join("source_map.js"), &source_map_js)?;
+    fs::write(
+        temp_dir.join("source_map.json"),
+        source_map.to_inline_json(),
+    )?;
+
+    Ok(generate_inline_bundle(
+        wasm_bytes,
+        &css,
+        &js,
+        &wgsl,
+        None,
+        title,
+        &source_map_js,
     ))
 }

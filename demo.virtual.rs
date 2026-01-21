@@ -557,6 +557,142 @@ body {
 // React UI with TinyStories Dataset Support
 // ============================================================
 
+// ============================================================
+// WebGPU Acceleration (optional - graceful fallback to CPU)
+// ============================================================
+
+let gpuDevice = null;
+let gpuMatmulPipeline = null;
+let gpuAvailable = false;
+
+const initWebGPU = async () => {
+    if (!navigator.gpu) {
+        console.log('WebGPU not supported');
+        return false;
+    }
+    
+    try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+            console.log('No GPU adapter found');
+            return false;
+        }
+        
+        gpuDevice = await adapter.requestDevice();
+        console.log('WebGPU device initialized');
+        
+        // Get WGSL shader from embedded shaders
+        const shaderCode = window.polyglotShaders?.matmul || `
+            struct Uniforms { M: u32, K: u32, N: u32 }
+            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+            @group(0) @binding(1) var<storage, read> a: array<f32>;
+            @group(0) @binding(2) var<storage, read> b: array<f32>;
+            @group(0) @binding(3) var<storage, read_write> c: array<f32>;
+            
+            @compute @workgroup_size(16, 16)
+            fn matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let row = gid.y;
+                let col = gid.x;
+                if (row >= uniforms.M || col >= uniforms.N) { return; }
+                var sum: f32 = 0.0;
+                for (var k: u32 = 0u; k < uniforms.K; k = k + 1u) {
+                    sum = sum + a[row * uniforms.K + k] * b[k * uniforms.N + col];
+                }
+                c[row * uniforms.N + col] = sum;
+            }
+        `;
+        
+        const shaderModule = gpuDevice.createShaderModule({ code: shaderCode });
+        
+        gpuMatmulPipeline = gpuDevice.createComputePipeline({
+            layout: 'auto',
+            compute: {
+                module: shaderModule,
+                entryPoint: 'matmul',
+            },
+        });
+        
+        gpuAvailable = true;
+        console.log('GPU matmul pipeline ready');
+        return true;
+    } catch (e) {
+        console.log('WebGPU init failed:', e.message);
+        return false;
+    }
+};
+
+// GPU Matrix Multiplication: C = A @ B
+const gpuMatmul = async (a, b, M, K, N) => {
+    if (!gpuAvailable || !gpuDevice) return null;
+    
+    try {
+        const uniformBuffer = gpuDevice.createBuffer({
+            size: 12, // 3 * u32
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        gpuDevice.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([M, K, N]));
+        
+        const aBuffer = gpuDevice.createBuffer({
+            size: a.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        gpuDevice.queue.writeBuffer(aBuffer, 0, a);
+        
+        const bBuffer = gpuDevice.createBuffer({
+            size: b.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        gpuDevice.queue.writeBuffer(bBuffer, 0, b);
+        
+        const cBuffer = gpuDevice.createBuffer({
+            size: M * N * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        });
+        
+        const readBuffer = gpuDevice.createBuffer({
+            size: M * N * 4,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+        
+        const bindGroup = gpuDevice.createBindGroup({
+            layout: gpuMatmulPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: { buffer: aBuffer } },
+                { binding: 2, resource: { buffer: bBuffer } },
+                { binding: 3, resource: { buffer: cBuffer } },
+            ],
+        });
+        
+        const commandEncoder = gpuDevice.createCommandEncoder();
+        const pass = commandEncoder.beginComputePass();
+        pass.setPipeline(gpuMatmulPipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(N / 16), Math.ceil(M / 16));
+        pass.end();
+        
+        commandEncoder.copyBufferToBuffer(cBuffer, 0, readBuffer, 0, M * N * 4);
+        gpuDevice.queue.submit([commandEncoder.finish()]);
+        
+        await readBuffer.mapAsync(GPUMapMode.READ);
+        const result = new Float32Array(readBuffer.getMappedRange().slice(0));
+        readBuffer.unmap();
+        
+        // Cleanup
+        [uniformBuffer, aBuffer, bBuffer, cBuffer, readBuffer].forEach(b => b.destroy());
+        
+        return result;
+    } catch (e) {
+        console.log('GPU matmul error:', e.message);
+        return null;
+    }
+};
+
+// Initialize WebGPU on load
+initWebGPU().then(ok => {
+    if (ok) console.log('GPU acceleration enabled');
+});
+
 const App = () => {
     const [state, setState] = React.useState('idle');
     const [loss, setLoss] = React.useState(null);
@@ -581,32 +717,45 @@ const App = () => {
         
         try {
             // Build fetch headers with optional auth
-            const headers = {};
+            const headers = { 'Accept': 'application/json' };
             if (authToken) {
                 headers['Authorization'] = `Bearer ${authToken}`;
                 log('Using HuggingFace auth token');
             }
             
-            // Try HuggingFace datasets-server API
-            const url = 'https://datasets-server.huggingface.co/rows?dataset=roneneldan%2FTinyStories&config=default&split=train&offset=0&length=500';
+            // Try multiple HuggingFace API endpoints
+            const endpoints = [
+                // first-rows endpoint (simpler API)
+                'https://datasets-server.huggingface.co/first-rows?dataset=roneneldan/TinyStories&config=default&split=train',
+                // rows endpoint with proper encoding
+                'https://datasets-server.huggingface.co/rows?dataset=roneneldan/TinyStories&config=default&split=train&offset=0&length=100',
+                // Alternative: parquet endpoint for direct download
+                'https://huggingface.co/api/datasets/roneneldan/TinyStories/parquet/default/train/0.parquet',
+            ];
             
             let texts = [];
             
-            try {
-                const resp = await fetch(url, { headers });
-                if (resp.ok) {
-                    const data = await resp.json();
-                    if (data.rows) {
-                        texts = data.rows.map(r => r.row?.text || '').filter(t => t.length > 0);
-                        log(`Loaded ${texts.length} stories from HuggingFace`);
+            for (const url of endpoints) {
+                if (texts.length > 0) break;
+                try {
+                    log(`Trying: ${url.split('?')[0].split('/').pop()}...`);
+                    const resp = await fetch(url, { headers });
+                    if (resp.ok) {
+                        const contentType = resp.headers.get('content-type') || '';
+                        if (contentType.includes('json')) {
+                            const data = await resp.json();
+                            // Handle first-rows format
+                            if (data.rows) {
+                                texts = data.rows.map(r => r.row?.text || r.text || '').filter(t => t.length > 0);
+                                log(`Loaded ${texts.length} stories from HuggingFace`);
+                            }
+                        }
+                    } else {
+                        log(`${url.split('/').pop().split('?')[0]}: ${resp.status}`);
                     }
-                } else if (resp.status === 401) {
-                    log('Auth required - enter HuggingFace token above');
-                } else {
-                    log(`API returned ${resp.status}`);
+                } catch (e) {
+                    // Continue to next endpoint
                 }
-            } catch (e) {
-                log(`Fetch failed: ${e.message}`);
             }
             
             // If no data loaded, use better synthetic fallback
