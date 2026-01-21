@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::alloc::{alloc, dealloc, Layout};
 
 // Design tokens - SINGLE SOURCE OF TRUTH
-pub const PRIMARY: &str = "#6366f1";
+pub const PRIMARY: &str = "#ff1493";  // 🔥 Changed to hot pink!
 pub const SECONDARY: &str = "#22d3ee";
 pub const BG_DARK: &str = "#0f172a";
 pub const TEXT_LIGHT: &str = "#f1f5f9";
@@ -701,7 +701,7 @@ const App = () => {
     const [dataLoaded, setDataLoaded] = React.useState(false);
     const [dataRows, setDataRows] = React.useState(0);
     const [steps, setSteps] = React.useState(0);
-    const [logs, setLogs] = React.useState(['Ready to train CharLM...']);
+    const [logs, setLogs] = React.useState(['🔥 HOT RELOAD WORKS! Ready to train MiniGPT...']);
     const [isTraining, setIsTraining] = React.useState(false);
     const [authToken, setAuthToken] = React.useState('');
     const [generatedText, setGeneratedText] = React.useState('');
