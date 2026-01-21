@@ -4,9 +4,16 @@ exports.deactivate = exports.activate = void 0;
 const path = require("path");
 const vscode_1 = require("vscode");
 const node_1 = require("vscode-languageclient/node");
+const dualViewManager_1 = require("./dualViewManager");
+const polyTreeProvider_1 = require("./polyTreeProvider");
+const docBlockProvider_1 = require("./docBlockProvider");
+const polyglotFileSystemProvider_1 = require("./polyglotFileSystemProvider");
 let client;
 let polyglotBin;
 let terminal;
+let dualViewManager;
+let polyTreeProvider;
+let docBlockProvider;
 function getTerminal() {
     if (!terminal || terminal.exitStatus !== undefined) {
         terminal = vscode_1.window.createTerminal('Polyglot');
@@ -63,8 +70,54 @@ function activate(context) {
             process.env.PATH = binDir + pathSep + process.env.PATH;
         }
     }
+    // Initialize Dual View components
+    dualViewManager = new dualViewManager_1.DualViewManager(context);
+    polyTreeProvider = new polyTreeProvider_1.PolyTreeProvider();
+    docBlockProvider = new docBlockProvider_1.DocBlockProvider();
+    // Register virtual file system
+    const polyFs = new polyglotFileSystemProvider_1.PolyglotFileSystemProvider();
+    context.subscriptions.push(vscode_1.workspace.registerFileSystemProvider('polyglot', polyFs, { isCaseSensitive: true }));
+    // Register tree view
+    const treeView = vscode_1.window.createTreeView('polyglotVirtualFiles', {
+        treeDataProvider: polyTreeProvider,
+        showCollapseAll: true
+    });
+    context.subscriptions.push(treeView);
+    // Register document providers
+    context.subscriptions.push(require('vscode').languages.registerHoverProvider({ language: 'polyglot' }, docBlockProvider), require('vscode').languages.registerDocumentLinkProvider({ language: 'polyglot' }, docBlockProvider));
     // Register commands
-    context.subscriptions.push(vscode_1.commands.registerCommand('polyglot.build', () => runPolyglotCommand('build')), vscode_1.commands.registerCommand('polyglot.run', () => runPolyglotCommand('run')), vscode_1.commands.registerCommand('polyglot.check', () => runPolyglotCommand('check')), vscode_1.commands.registerCommand('polyglot.init', () => runPolyglotCommand('init')));
+    context.subscriptions.push(vscode_1.commands.registerCommand('polyglot.build', () => runPolyglotCommand('build')), vscode_1.commands.registerCommand('polyglot.run', () => runPolyglotCommand('run')), vscode_1.commands.registerCommand('polyglot.check', () => runPolyglotCommand('check')), vscode_1.commands.registerCommand('polyglot.init', () => runPolyglotCommand('init')), vscode_1.commands.registerCommand('polyglot.test', () => runPolyglotCommand('test')), vscode_1.commands.registerCommand('polyglot.toggleView', () => dualViewManager.toggle()), vscode_1.commands.registerCommand('polyglot.showVirtualTree', () => {
+        const editor = vscode_1.window.activeTextEditor;
+        if (editor?.document.uri.fsPath.endsWith('.poly')) {
+            polyTreeProvider.refresh(editor.document.uri);
+        }
+    }), vscode_1.commands.registerCommand('polyglot.openVirtualFile', async (file) => {
+        if (!file)
+            return;
+        const virtualUri = require('vscode').Uri.parse(`polyglot:/${file.path}?blockId=${file.language}_${file.blockIndex}&realPath=${encodeURIComponent(file.polyUri.fsPath)}`);
+        await vscode_1.commands.executeCommand('vscode.open', virtualUri);
+    }), vscode_1.commands.registerCommand('polyglot.goToSymbol', async (args) => {
+        // Search for symbol definition in the file
+        const uri = require('vscode').Uri.parse(args.uri);
+        const doc = await vscode_1.workspace.openTextDocument(uri);
+        const text = doc.getText();
+        // Simple regex search for fn symbol or similar
+        const symbolRegex = new RegExp(`\\b(fn|function|def|const|let|var)\\s+${args.symbol}\\b`);
+        const match = symbolRegex.exec(text);
+        if (match) {
+            const pos = doc.positionAt(match.index);
+            await vscode_1.window.showTextDocument(doc, { selection: new (require('vscode').Range)(pos, pos) });
+        }
+        else {
+            vscode_1.window.showWarningMessage(`Symbol "${args.symbol}" not found`);
+        }
+    }));
+    // Listen for active editor changes to refresh tree
+    context.subscriptions.push(vscode_1.window.onDidChangeActiveTextEditor(editor => {
+        if (editor?.document.uri.fsPath.endsWith('.poly') && dualViewManager.mode === 'split') {
+            polyTreeProvider.refresh(editor.document.uri);
+        }
+    }));
     const serverOptions = {
         run: { command: serverPath, transport: node_1.TransportKind.stdio },
         debug: {

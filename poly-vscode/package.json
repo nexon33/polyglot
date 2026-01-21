@@ -73,8 +73,36 @@
             {
                 "command": "polyglot.init",
                 "title": "Polyglot: Initialize Project"
+            },
+            {
+                "command": "polyglot.test",
+                "title": "Polyglot: Run Tests"
+            },
+            {
+                "command": "polyglot.toggleView",
+                "title": "Polyglot: Toggle Combined/Split View",
+                "icon": "$(split-horizontal)"
             }
         ],
+        "views": {
+            "explorer": [
+                {
+                    "id": "polyglotVirtualFiles",
+                    "name": "Poly Virtual Files",
+                    "when": "resourceExtname == .poly",
+                    "icon": "$(files)"
+                }
+            ]
+        },
+        "menus": {
+            "editor/title": [
+                {
+                    "command": "polyglot.toggleView",
+                    "when": "resourceExtname == .poly",
+                    "group": "navigation"
+                }
+            ]
+        },
         "keybindings": [
             {
                 "command": "polyglot.build",
@@ -84,6 +112,11 @@
             {
                 "command": "polyglot.run",
                 "key": "ctrl+shift+r",
+                "when": "resourceExtname == .poly"
+            },
+            {
+                "command": "polyglot.toggleView",
+                "key": "ctrl+shift+v",
                 "when": "resourceExtname == .poly"
             }
         ]

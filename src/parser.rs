@@ -81,8 +81,8 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
 
     // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[types], #[main], etc.
     // Only matches known polyglot tags, not Rust attributes like #[no_mangle]
-    // Supported: rust/rs, python/py, interface, types, main, gpu, wgsl, js, jsx, html, rscss, css, test
-    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|main|gpu|wgsl|js|jsx|html|rscss|css|test)(?::[a-zA-Z0-9_:]+)?\]\s*$")
+    // Supported: rust/rs, python/py, interface, types, main, gpu, wgsl, js, jsx, html, rscss, css, test, doc
+    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|main|gpu|wgsl|js|jsx|html|rscss|css|test|doc)(?::[a-zA-Z0-9_:/\.]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
         .unwrap();
 
     let matches: Vec<_> = re.find_iter(source).collect();

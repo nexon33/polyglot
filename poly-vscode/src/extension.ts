@@ -9,9 +9,17 @@ import {
     TransportKind
 } from 'vscode-languageclient/node';
 
+import { DualViewManager } from './dualViewManager';
+import { PolyTreeProvider } from './polyTreeProvider';
+import { DocBlockProvider } from './docBlockProvider';
+import { PolyglotFileSystemProvider } from './polyglotFileSystemProvider';
+
 let client: LanguageClient;
 let polyglotBin: string | undefined;
 let terminal: Terminal | undefined;
+let dualViewManager: DualViewManager;
+let polyTreeProvider: PolyTreeProvider;
+let docBlockProvider: DocBlockProvider;
 
 function getTerminal(): Terminal {
     if (!terminal || terminal.exitStatus !== undefined) {
@@ -76,12 +84,77 @@ export function activate(context: ExtensionContext) {
         }
     }
 
+    // Initialize Dual View components
+    dualViewManager = new DualViewManager(context);
+    polyTreeProvider = new PolyTreeProvider();
+    docBlockProvider = new DocBlockProvider();
+
+    // Register virtual file system
+    const polyFs = new PolyglotFileSystemProvider();
+    context.subscriptions.push(
+        workspace.registerFileSystemProvider('polyglot', polyFs, { isCaseSensitive: true })
+    );
+
+    // Register tree view
+    const treeView = window.createTreeView('polyglotVirtualFiles', {
+        treeDataProvider: polyTreeProvider,
+        showCollapseAll: true
+    });
+    context.subscriptions.push(treeView);
+
+    // Register document providers
+    context.subscriptions.push(
+        require('vscode').languages.registerHoverProvider({ language: 'polyglot' }, docBlockProvider),
+        require('vscode').languages.registerDocumentLinkProvider({ language: 'polyglot' }, docBlockProvider)
+    );
+
     // Register commands
     context.subscriptions.push(
         commands.registerCommand('polyglot.build', () => runPolyglotCommand('build')),
         commands.registerCommand('polyglot.run', () => runPolyglotCommand('run')),
         commands.registerCommand('polyglot.check', () => runPolyglotCommand('check')),
-        commands.registerCommand('polyglot.init', () => runPolyglotCommand('init'))
+        commands.registerCommand('polyglot.init', () => runPolyglotCommand('init')),
+        commands.registerCommand('polyglot.test', () => runPolyglotCommand('test')),
+        commands.registerCommand('polyglot.toggleView', () => dualViewManager.toggle()),
+        commands.registerCommand('polyglot.showVirtualTree', () => {
+            const editor = window.activeTextEditor;
+            if (editor?.document.uri.fsPath.endsWith('.poly')) {
+                polyTreeProvider.refresh(editor.document.uri);
+            }
+        }),
+        commands.registerCommand('polyglot.openVirtualFile', async (file: any) => {
+            if (!file) return;
+            const virtualUri = require('vscode').Uri.parse(
+                `polyglot:/${file.path}?blockId=${file.language}_${file.blockIndex}&realPath=${encodeURIComponent(file.polyUri.fsPath)}`
+            );
+            await commands.executeCommand('vscode.open', virtualUri);
+        }),
+        commands.registerCommand('polyglot.goToSymbol', async (args: { symbol: string, uri: string }) => {
+            // Search for symbol definition in the file
+            const uri = require('vscode').Uri.parse(args.uri);
+            const doc = await workspace.openTextDocument(uri);
+            const text = doc.getText();
+
+            // Simple regex search for fn symbol or similar
+            const symbolRegex = new RegExp(`\\b(fn|function|def|const|let|var)\\s+${args.symbol}\\b`);
+            const match = symbolRegex.exec(text);
+
+            if (match) {
+                const pos = doc.positionAt(match.index);
+                await window.showTextDocument(doc, { selection: new (require('vscode').Range)(pos, pos) });
+            } else {
+                window.showWarningMessage(`Symbol "${args.symbol}" not found`);
+            }
+        })
+    );
+
+    // Listen for active editor changes to refresh tree
+    context.subscriptions.push(
+        window.onDidChangeActiveTextEditor(editor => {
+            if (editor?.document.uri.fsPath.endsWith('.poly') && dualViewManager.mode === 'split') {
+                polyTreeProvider.refresh(editor.document.uri);
+            }
+        })
     );
 
     const serverOptions: ServerOptions = {
