@@ -1075,3 +1075,9 @@ ReactDOM.render(<App />, document.getElementById('root'));
     <div id="root"></div>
 </body>
 </html>
+
+#[test]
+fn test_sanity_check() {
+    assert_eq!(2 + 2, 4);
+    println!("✅ Sanity check passed from #[test] block!");
+}
