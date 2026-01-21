@@ -55,6 +55,7 @@ pub struct CompileOptions {
     pub temp_dir: PathBuf,
     /// Which language contains the main entry point: "rust" or "python"
     pub main_lang: Option<String>,
+    pub test_mode: bool,
 }
 
 impl Default for CompileOptions {
@@ -64,6 +65,7 @@ impl Default for CompileOptions {
             target: WasmTarget::default(),
             temp_dir: PathBuf::from("target/polyglot_tmp"),
             main_lang: None,
+            test_mode: false,
         }
     }
 }

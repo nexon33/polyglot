@@ -32,6 +32,7 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
     let mut js_blocks = Vec::new(); // JS/JSX components
     let mut html_blocks = Vec::new(); // HTML entry points
     let mut css_blocks = Vec::new(); // rscss/css blocks
+    let mut test_blocks = Vec::new(); // #[test] blocks
     let mut main_locations: Vec<(&str, &str)> = Vec::new(); // (language, block_preview)
 
     for block in &parsed.blocks {
@@ -67,6 +68,11 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
             }
             "rscss" | "css" => {
                 css_blocks.push(block.code.clone());
+            }
+            "test" => {
+                if opts.test_mode {
+                    test_blocks.push(block.code.clone());
+                }
             }
             "interface" => {
                 // Already processed via parsed.interfaces
@@ -126,10 +132,22 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
     // - "export fn" -> "pub fn" (cross-file callable)
     // - "public fn" -> "pub fn" (FFI/external callable)
     // - "internal fn" -> "fn" (file-private, default)
-    let merged_rust_code = merged_rust_code
+    let mut merged_rust_code = merged_rust_code
         .replace("export fn ", "pub fn ")
         .replace("public fn ", "pub fn ")
         .replace("internal fn ", "fn ");
+
+    if opts.test_mode && !test_blocks.is_empty() {
+        merged_rust_code.push_str("\n#[cfg(test)]\nmod poly_tests {\n    use super::*;\n");
+        for block in test_blocks {
+            // Add #[test] attribute to each fn definition
+            let with_test_attr = block.replace("fn ", "#[test]\n    fn ");
+            merged_rust_code.push_str("    ");
+            merged_rust_code.push_str(&with_test_attr);
+            merged_rust_code.push('\n');
+        }
+        merged_rust_code.push_str("}\n");
+    }
 
     // Compile merged Rust code as single unit (with embedded Python)
     if !merged_rust_code.trim().is_empty() {
@@ -141,6 +159,11 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
 
         let wasm = rust_lang.compile(&merged_rust_code, &rust_opts)?;
         wasm_modules.push(wasm);
+    }
+
+    // In test mode, we're done after running tests - skip artifact generation
+    if opts.test_mode {
+        return Ok(Vec::new());
     }
 
     // Note: Python is now embedded in Rust via RustPython bridge

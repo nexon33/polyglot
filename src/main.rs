@@ -92,6 +92,11 @@ enum Commands {
         #[arg(long)]
         open: bool,
     },
+    /// Run inline tests
+    Test {
+        /// Input poly file
+        file: PathBuf,
+    },
     /// Create a new project from a template
     New {
         /// Template name: react-app, ml-demo, or game
@@ -126,14 +131,14 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Build { file, release } => {
-            build_poly(&file, release)?;
+            build_poly(&file, release, false)?;
         }
         Commands::Run {
             file,
             release,
             args,
         } => {
-            let wasm_path = build_poly(&file, release)?;
+            let wasm_path = build_poly(&file, release, false)?;
             run_wasm(&wasm_path, &args)?;
         }
         Commands::Init { name } => {
@@ -142,13 +147,17 @@ fn main() -> anyhow::Result<()> {
         Commands::New { template, name } => {
             new_from_template(&template, name)?;
         }
+        Commands::Test { file } => {
+            eprintln!("🧪 Running inline tests for {}", file.display());
+            build_poly(&file, false, true)?; // release=false, test_mode=true
+        }
         Commands::Bundle {
             file,
             output,
             title,
         } => {
             // Build first
-            let wasm_path = build_poly(&file, true)?;
+            let wasm_path = build_poly(&file, true, false)?;
 
             // Read WASM bytes
             let wasm_bytes = fs::read(&wasm_path)?;
@@ -277,7 +286,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_poly(file: &PathBuf, release: bool) -> anyhow::Result<PathBuf> {
+fn build_poly(file: &PathBuf, release: bool, test_mode: bool) -> anyhow::Result<PathBuf> {
     println!("🔨 Compiling {}", file.display());
     let source = fs::read_to_string(file)?;
     let mut parsed = parse_poly(&source).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -300,11 +309,16 @@ fn build_poly(file: &PathBuf, release: bool) -> anyhow::Result<PathBuf> {
 
     let opts = CompileOptions {
         release,
+        test_mode,
         ..Default::default()
     };
 
     match compile(&parsed, &opts) {
         Ok(wasm) => {
+            if test_mode {
+                // Tests already ran and printed output, just return dummy path
+                return Ok(file.with_extension("test"));
+            }
             println!("✅ Successfully compiled {} bytes", wasm.len());
             let out_path = file.with_extension("wasm");
             fs::write(&out_path, wasm)?;

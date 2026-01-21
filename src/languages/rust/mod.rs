@@ -108,18 +108,40 @@ pub extern "C" fn __pyrs_keepalive() {{}}
         }
 
         let mut cmd = Command::new("cargo");
-        cmd.current_dir(&opts.temp_dir)
-            .env("RUSTFLAGS", "-C target-feature=+simd128")
-            .arg("build")
-            .arg("--target=wasm32-wasip1")
-            .arg("--release"); // Always release for WASM size/speed in demo
+        cmd.current_dir(&opts.temp_dir);
 
-        // Suppress output unless error
-        // cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
+        if opts.test_mode {
+            // Run tests natively (not WASM) - tests run on host
+            cmd.arg("test")
+                .arg("--lib") // Only test the library code
+                .arg("--")
+                .arg("--nocapture"); // Show println! output
+        } else {
+            // Normal WASM build
+            cmd.env("RUSTFLAGS", "-C target-feature=+simd128")
+                .arg("build")
+                .arg("--target=wasm32-wasip1")
+                .arg("--release");
+        }
+
+        // Suppress output unless error OR test mode (we want test output)
+        if !opts.test_mode {
+            // cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
+        } else {
+            // For tests, we want to see output
+            cmd.stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit());
+        }
 
         let status = cmd.status()?;
         if !status.success() {
             return Err(anyhow::anyhow!("Rust compilation failed"));
+        }
+
+        // In test mode, we don't produce WASM - just return empty
+        if opts.test_mode {
+            println!("✅ Tests completed successfully!");
+            return Ok(Vec::new());
         }
 
         // Path to the output WASM
