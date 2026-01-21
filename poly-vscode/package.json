@@ -10,6 +10,10 @@
     "categories": [
         "Programming Languages"
     ],
+    "activationEvents": [
+        "onLanguage:polyglot",
+        "workspaceContains:**/*.poly"
+    ],
     "main": "./out/extension.js",
     "contributes": {
         "languages": [

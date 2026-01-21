@@ -1,25 +1,43 @@
 @echo off
-REM Bundle polyglot binaries into the VS Code extension
+REM Bundle script for poly-vscode extension
+REM Builds Rust binaries and copies them to bin/
 
-echo Building Polyglot release binaries...
-cd /d "%~dp0.."
+echo === Building Polyglot Binaries ===
+
+REM Navigate to Rust project root
+pushd ..
+
+REM Build release binaries
+echo Building release binaries...
 cargo build --release
-if errorlevel 1 exit /b 1
 
-echo Creating bin directory...
-if not exist "%~dp0bin" mkdir "%~dp0bin"
+REM Create bin directory in extension
+if not exist "poly-vscode\bin" mkdir "poly-vscode\bin"
 
+REM Copy binaries
 echo Copying binaries...
-copy /y "target\release\polyglot.exe" "%~dp0bin\"
-copy /y "target\release\poly-lsp.exe" "%~dp0bin\"
+if exist "target\release\polyglot.exe" (
+    copy /Y "target\release\polyglot.exe" "poly-vscode\bin\"
+    echo   Copied polyglot.exe
+)
+if exist "target\release\poly-lsp.exe" (
+    copy /Y "target\release\poly-lsp.exe" "poly-vscode\bin\"
+    echo   Copied poly-lsp.exe
+)
 
-echo Compiling TypeScript...
-cd /d "%~dp0"
+REM Also check for poly.exe (might be named differently)
+if exist "target\release\poly.exe" (
+    copy /Y "target\release\poly.exe" "poly-vscode\bin\polyglot.exe"
+    echo   Copied poly.exe as polyglot.exe
+)
+
+popd
+
+echo === Building Extension ===
 call npm run compile
-if errorlevel 1 exit /b 1
 
-echo Packaging extension...
-call npx vsce package
+echo === Packaging VSIX ===
+call npx @vscode/vsce package --no-dependencies --allow-missing-repository --skip-license
 
-echo Done! Extension packaged with bundled binaries.
-dir /b *.vsix
+echo === Done! ===
+echo Install with: code --install-extension poly-vscode-0.1.0.vsix

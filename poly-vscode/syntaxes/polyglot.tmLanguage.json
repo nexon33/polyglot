@@ -136,7 +136,159 @@
                     "include": "#polyglot-visibility-rust"
                 },
                 {
-                    "include": "source.rust"
+                    "include": "#rust-comments"
+                },
+                {
+                    "include": "#rust-strings"
+                },
+                {
+                    "include": "#rust-attributes"
+                },
+                {
+                    "include": "#rust-keywords"
+                },
+                {
+                    "include": "#rust-types"
+                },
+                {
+                    "include": "#rust-functions"
+                },
+                {
+                    "include": "#rust-numbers"
+                },
+                {
+                    "include": "#rust-operators"
+                },
+                {
+                    "include": "#rust-macros"
+                }
+            ]
+        },
+        "rust-comments": {
+            "patterns": [
+                {
+                    "match": "//.*$",
+                    "name": "comment.line.double-slash.rust"
+                },
+                {
+                    "begin": "/\\*",
+                    "end": "\\*/",
+                    "name": "comment.block.rust"
+                },
+                {
+                    "match": "///.*$",
+                    "name": "comment.line.documentation.rust"
+                }
+            ]
+        },
+        "rust-strings": {
+            "patterns": [
+                {
+                    "begin": "\"",
+                    "end": "\"",
+                    "name": "string.quoted.double.rust",
+                    "patterns": [
+                        {
+                            "match": "\\\\.",
+                            "name": "constant.character.escape.rust"
+                        }
+                    ]
+                },
+                {
+                    "begin": "r#*\"",
+                    "end": "\"#*",
+                    "name": "string.quoted.raw.rust"
+                },
+                {
+                    "match": "'[^'\\\\]'",
+                    "name": "string.quoted.single.rust"
+                },
+                {
+                    "match": "'\\\\.'",
+                    "name": "string.quoted.single.rust"
+                }
+            ]
+        },
+        "rust-attributes": {
+            "patterns": [
+                {
+                    "match": "#!?\\[[^\\]]+\\]",
+                    "name": "meta.attribute.rust"
+                }
+            ]
+        },
+        "rust-keywords": {
+            "match": "\\b(as|async|await|break|const|continue|crate|dyn|else|enum|extern|false|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|true|type|unsafe|use|where|while|yield)\\b",
+            "name": "keyword.control.rust"
+        },
+        "rust-types": {
+            "patterns": [
+                {
+                    "match": "\\b(bool|char|f32|f64|i8|i16|i32|i64|i128|isize|str|u8|u16|u32|u64|u128|usize|String|Vec|Option|Result|Box|Rc|Arc|Cell|RefCell|HashMap|HashSet|BTreeMap|BTreeSet|PathBuf|Path|OsStr|OsString|Duration|Instant|SystemTime)\\b",
+                    "name": "support.type.primitive.rust"
+                },
+                {
+                    "match": "\\b[A-Z][a-zA-Z0-9_]*\\b",
+                    "name": "entity.name.type.rust"
+                },
+                {
+                    "match": "'[a-z_][a-zA-Z0-9_]*",
+                    "name": "storage.modifier.lifetime.rust"
+                }
+            ]
+        },
+        "rust-functions": {
+            "patterns": [
+                {
+                    "match": "\\b(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\(|<)",
+                    "captures": {
+                        "1": {
+                            "name": "keyword.other.fn.rust"
+                        },
+                        "2": {
+                            "name": "entity.name.function.rust"
+                        }
+                    }
+                },
+                {
+                    "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+                    "captures": {
+                        "1": {
+                            "name": "entity.name.function.rust"
+                        }
+                    }
+                }
+            ]
+        },
+        "rust-numbers": {
+            "patterns": [
+                {
+                    "match": "\\b0x[0-9a-fA-F_]+\\b",
+                    "name": "constant.numeric.hex.rust"
+                },
+                {
+                    "match": "\\b0o[0-7_]+\\b",
+                    "name": "constant.numeric.octal.rust"
+                },
+                {
+                    "match": "\\b0b[01_]+\\b",
+                    "name": "constant.numeric.binary.rust"
+                },
+                {
+                    "match": "\\b[0-9][0-9_]*\\.?[0-9_]*([eE][+-]?[0-9_]+)?([f32|f64|i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize])?\\b",
+                    "name": "constant.numeric.rust"
+                }
+            ]
+        },
+        "rust-operators": {
+            "match": "(->|=>|::|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=|==|!=|<=|>=|&&|\\|\\||!|&|\\||\\^|<<|>>|\\+|-|\\*|/|%|=|<|>)",
+            "name": "keyword.operator.rust"
+        },
+        "rust-macros": {
+            "patterns": [
+                {
+                    "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)!",
+                    "name": "entity.name.function.macro.rust"
                 }
             ]
         },

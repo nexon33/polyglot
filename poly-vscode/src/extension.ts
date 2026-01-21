@@ -13,6 +13,7 @@ import { DualViewManager } from './dualViewManager';
 import { PolyTreeProvider } from './polyTreeProvider';
 import { DocBlockProvider } from './docBlockProvider';
 import { PolyglotFileSystemProvider } from './polyglotFileSystemProvider';
+import { AutoWorkspaceManager } from './autoWorkspaceManager';
 
 let client: LanguageClient;
 let polyglotBin: string | undefined;
@@ -20,6 +21,7 @@ let terminal: Terminal | undefined;
 let dualViewManager: DualViewManager;
 let polyTreeProvider: PolyTreeProvider;
 let docBlockProvider: DocBlockProvider;
+let autoWorkspaceManager: AutoWorkspaceManager;
 
 function getTerminal(): Terminal {
     if (!terminal || terminal.exitStatus !== undefined) {
@@ -88,6 +90,7 @@ export function activate(context: ExtensionContext) {
     dualViewManager = new DualViewManager(context);
     polyTreeProvider = new PolyTreeProvider();
     docBlockProvider = new DocBlockProvider();
+    autoWorkspaceManager = new AutoWorkspaceManager();
 
     // Register virtual file system
     const polyFs = new PolyglotFileSystemProvider();
@@ -101,6 +104,27 @@ export function activate(context: ExtensionContext) {
         showCollapseAll: true
     });
     context.subscriptions.push(treeView);
+
+    // Auto-create workspace for .poly files without Cargo.toml
+    context.subscriptions.push(
+        workspace.onDidOpenTextDocument(async (doc) => {
+            if (doc.uri.fsPath.endsWith('.poly') && autoWorkspaceManager.needsWorkspace(doc.uri)) {
+                const text = doc.getText();
+                // Extract Rust code from blocks
+                const rustBlocks: string[] = [];
+                const blockRegex = /#\[(rust|rs)(?::[^\]]+)?\]\s*\n([\s\S]*?)(?=\n#\[|$)/g;
+                let match;
+                while ((match = blockRegex.exec(text)) !== null) {
+                    rustBlocks.push(match[2]);
+                }
+                if (rustBlocks.length > 0) {
+                    const rustCode = rustBlocks.join('\n\n');
+                    const workspacePath = autoWorkspaceManager.createWorkspace(doc.uri, rustCode);
+                    window.showInformationMessage(`📦 Created temp Rust workspace: ${workspacePath}`);
+                }
+            }
+        })
+    );
 
     // Register document providers
     context.subscriptions.push(

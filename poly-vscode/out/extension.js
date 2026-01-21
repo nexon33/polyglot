@@ -8,12 +8,14 @@ const dualViewManager_1 = require("./dualViewManager");
 const polyTreeProvider_1 = require("./polyTreeProvider");
 const docBlockProvider_1 = require("./docBlockProvider");
 const polyglotFileSystemProvider_1 = require("./polyglotFileSystemProvider");
+const autoWorkspaceManager_1 = require("./autoWorkspaceManager");
 let client;
 let polyglotBin;
 let terminal;
 let dualViewManager;
 let polyTreeProvider;
 let docBlockProvider;
+let autoWorkspaceManager;
 function getTerminal() {
     if (!terminal || terminal.exitStatus !== undefined) {
         terminal = vscode_1.window.createTerminal('Polyglot');
@@ -74,6 +76,7 @@ function activate(context) {
     dualViewManager = new dualViewManager_1.DualViewManager(context);
     polyTreeProvider = new polyTreeProvider_1.PolyTreeProvider();
     docBlockProvider = new docBlockProvider_1.DocBlockProvider();
+    autoWorkspaceManager = new autoWorkspaceManager_1.AutoWorkspaceManager();
     // Register virtual file system
     const polyFs = new polyglotFileSystemProvider_1.PolyglotFileSystemProvider();
     context.subscriptions.push(vscode_1.workspace.registerFileSystemProvider('polyglot', polyFs, { isCaseSensitive: true }));
@@ -83,6 +86,24 @@ function activate(context) {
         showCollapseAll: true
     });
     context.subscriptions.push(treeView);
+    // Auto-create workspace for .poly files without Cargo.toml
+    context.subscriptions.push(vscode_1.workspace.onDidOpenTextDocument(async (doc) => {
+        if (doc.uri.fsPath.endsWith('.poly') && autoWorkspaceManager.needsWorkspace(doc.uri)) {
+            const text = doc.getText();
+            // Extract Rust code from blocks
+            const rustBlocks = [];
+            const blockRegex = /#\[(rust|rs)(?::[^\]]+)?\]\s*\n([\s\S]*?)(?=\n#\[|$)/g;
+            let match;
+            while ((match = blockRegex.exec(text)) !== null) {
+                rustBlocks.push(match[2]);
+            }
+            if (rustBlocks.length > 0) {
+                const rustCode = rustBlocks.join('\n\n');
+                const workspacePath = autoWorkspaceManager.createWorkspace(doc.uri, rustCode);
+                vscode_1.window.showInformationMessage(`📦 Created temp Rust workspace: ${workspacePath}`);
+            }
+        }
+    }));
     // Register document providers
     context.subscriptions.push(require('vscode').languages.registerHoverProvider({ language: 'polyglot' }, docBlockProvider), require('vscode').languages.registerDocumentLinkProvider({ language: 'polyglot' }, docBlockProvider));
     // Register commands
