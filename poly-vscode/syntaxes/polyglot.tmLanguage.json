@@ -300,7 +300,6 @@
                 }
             },
             "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
-            ,
             "contentName": "meta.embedded.python",
             "patterns": [
                 {
