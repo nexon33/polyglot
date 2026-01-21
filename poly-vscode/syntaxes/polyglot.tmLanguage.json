@@ -30,6 +30,21 @@
         },
         {
             "include": "#main-block"
+        },
+        {
+            "include": "#toml-block"
+        },
+        {
+            "include": "#json-block"
+        },
+        {
+            "include": "#md-block"
+        },
+        {
+            "include": "#test-block"
+        },
+        {
+            "include": "#doc-block"
         }
     ],
     "repository": {
@@ -595,6 +610,81 @@
         "ts-keywords": {
             "match": "\\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|this|class|extends|import|export|from|default|async|await|try|catch|finally|throw|typeof|instanceof|in|of|null|undefined|true|false|interface|type|enum|namespace|declare|abstract|implements|readonly|as|is|keyof|infer|never|unknown|any|void|public|private|protected)\\b",
             "name": "keyword.control.ts"
+        },
+        "toml-block": {
+            "begin": "^\\s*(#\\[(toml)(:[^\\]]+)?\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "source.toml",
+            "patterns": [
+                {
+                    "include": "source.toml"
+                }
+            ]
+        },
+        "json-block": {
+            "begin": "^\\s*(#\\[(json)(:[^\\]]+)?\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "source.json",
+            "patterns": [
+                {
+                    "include": "source.json"
+                }
+            ]
+        },
+        "md-block": {
+            "begin": "^\\s*(#\\[(md|markdown)(:[^\\]]+)?\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "text.html.markdown",
+            "patterns": [
+                {
+                    "include": "text.html.markdown"
+                }
+            ]
+        },
+        "test-block": {
+            "begin": "^\\s*(#\\[test(:[^\\]]+)?\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "meta.embedded.rust",
+            "patterns": [
+                {
+                    "include": "source.rust"
+                }
+            ]
+        },
+        "doc-block": {
+            "begin": "^\\s*(#\\[doc(:[^\\]]+)?\\])\\s*$",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.directive.polyglot"
+                }
+            },
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "text.html.markdown",
+            "patterns": [
+                {
+                    "include": "text.html.markdown"
+                }
+            ]
         }
     }
 }
