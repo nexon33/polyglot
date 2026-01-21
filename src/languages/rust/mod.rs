@@ -1,5 +1,5 @@
 use crate::languages::Language;
-use crate::parser::{parse_rust_params, parse_rust_type, ParseError};
+use crate::parser::{ParseError, parse_rust_params, parse_rust_type};
 use crate::types::{CompileOptions, FunctionSig, Param, WitType};
 use anyhow::Result;
 use regex::Regex;
@@ -109,6 +109,7 @@ pub extern "C" fn __pyrs_keepalive() {{}}
 
         let mut cmd = Command::new("cargo");
         cmd.current_dir(&opts.temp_dir)
+            .env("RUSTFLAGS", "-C target-feature=+simd128")
             .arg("build")
             .arg("--target=wasm32-wasip1")
             .arg("--release"); // Always release for WASM size/speed in demo

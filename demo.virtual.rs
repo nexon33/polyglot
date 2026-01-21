@@ -150,12 +150,15 @@ impl MiniGPT {
         
         for t in 0..seq_len {
             for i in 0..3 {
-                for d in 0..D_MODEL {
-                    let mut sum = 0.0f32;
-                    for j in 0..D_MODEL {
-                        sum += x[t][j] * self.wqkv[wqkv_offset + i * D_MODEL * D_MODEL + j * D_MODEL + d];
+                // Optimized: Loop order j-then-d for contiguous access
+                // qkv[t][i] initialized to 0.0
+                for j in 0..D_MODEL {
+                    let xj = x[t][j];
+                    let w_base = wqkv_offset + i * D_MODEL * D_MODEL + j * D_MODEL;
+                    // Auto-vectorizable inner loop over d
+                    for d in 0..D_MODEL {
+                        qkv[t][i][d] += xj * self.wqkv[w_base + d];
                     }
-                    qkv[t][i][d] = sum;
                 }
             }
         }
@@ -201,12 +204,12 @@ impl MiniGPT {
         let wo_offset = layer * D_MODEL * D_MODEL;
         let mut projected = vec![vec![0.0f32; D_MODEL]; seq_len];
         for t in 0..seq_len {
-            for d in 0..D_MODEL {
-                let mut sum = 0.0f32;
-                for j in 0..D_MODEL {
-                    sum += out[t][j] * self.wo[wo_offset + j * D_MODEL + d];
+            for j in 0..D_MODEL {
+                let otj = out[t][j];
+                let w_base = wo_offset + j * D_MODEL;
+                for d in 0..D_MODEL {
+                    projected[t][d] += otj * self.wo[w_base + d];
                 }
-                projected[t][d] = sum;
             }
         }
         
@@ -219,23 +222,27 @@ impl MiniGPT {
         let ff2_offset = layer * D_MODEL * D_FF;
         
         // Up projection with GELU
-        let mut hidden = vec![0.0f32; D_FF];
-        for d in 0..D_FF {
-            let mut sum = 0.0f32;
-            for j in 0..D_MODEL {
-                sum += x[j] * self.wff1[ff1_offset + j * D_FF + d];
+        // Up projection with GELU
+        // Optimize: j then d
+        let mut hidden_pre = vec![0.0f32; D_FF];
+        for j in 0..D_MODEL {
+            let xj = x[j];
+            let w_base = ff1_offset + j * D_FF;
+            for d in 0..D_FF {
+                hidden_pre[d] += xj * self.wff1[w_base + d];
             }
-            hidden[d] = Self::gelu(sum);
         }
+        let hidden: Vec<f32> = hidden_pre.iter().map(|&v| Self::gelu(v)).collect();
         
         // Down projection
+        // Down projection
         let mut out = vec![0.0f32; D_MODEL];
-        for d in 0..D_MODEL {
-            let mut sum = 0.0f32;
-            for j in 0..D_FF {
-                sum += hidden[j] * self.wff2[ff2_offset + j * D_MODEL + d];
+        for j in 0..D_FF {
+            let hj = hidden[j];
+            let w_base = ff2_offset + j * D_MODEL;
+            for d in 0..D_MODEL {
+                out[d] += hj * self.wff2[w_base + d];
             }
-            out[d] = sum;
         }
         
         out
@@ -561,6 +568,31 @@ body {
 // WebGPU Acceleration (optional - graceful fallback to CPU)
 // ============================================================
 
+class GPUBufferManager {
+    constructor(device) {
+        this.device = device;
+        this.pools = new Map();
+    }
+    
+    getKey(size, usage) { return `${size}_${usage}`; }
+    
+    acquire(size, usage) {
+        const key = this.getKey(size, usage);
+        if (!this.pools.has(key)) this.pools.set(key, []);
+        const pool = this.pools.get(key);
+        if (pool.length > 0) return pool.pop();
+        console.log(`[GPU] 🆕 Allocating ${size} bytes`);
+        return this.device.createBuffer({ size, usage });
+    }
+    
+    release(buffer, size, usage) {
+        const key = this.getKey(size, usage);
+        if (!this.pools.has(key)) this.pools.set(key, []);
+        this.pools.get(key).push(buffer);
+    }
+}
+
+let bufferManager = null;
 let gpuDevice = null;
 let gpuMatmulPipeline = null;
 let gpuAvailable = false;
@@ -579,6 +611,7 @@ const initWebGPU = async () => {
         }
         
         gpuDevice = await adapter.requestDevice();
+        bufferManager = new GPUBufferManager(gpuDevice);
         console.log('WebGPU device initialized');
         
         // Get WGSL shader from embedded shaders
@@ -626,33 +659,29 @@ const gpuMatmul = async (a, b, M, K, N) => {
     if (!gpuAvailable || !gpuDevice) return null;
     
     try {
-        const uniformBuffer = gpuDevice.createBuffer({
-            size: 12, // 3 * u32
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
+        // Usage flags
+        const U_UNIFORM = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+        const U_STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+        const U_RESULT  = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC; // C buffer
+        const U_READ    = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
+
+        // Acquire buffers
+        const uniformSize = 12;
+        const uniformBuffer = bufferManager.acquire(uniformSize, U_UNIFORM);
         gpuDevice.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([M, K, N]));
         
-        const aBuffer = gpuDevice.createBuffer({
-            size: a.byteLength,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
+        const aSize = a.byteLength;
+        const aBuffer = bufferManager.acquire(aSize, U_STORAGE);
         gpuDevice.queue.writeBuffer(aBuffer, 0, a);
         
-        const bBuffer = gpuDevice.createBuffer({
-            size: b.byteLength,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
+        const bSize = b.byteLength;
+        const bBuffer = bufferManager.acquire(bSize, U_STORAGE);
         gpuDevice.queue.writeBuffer(bBuffer, 0, b);
         
-        const cBuffer = gpuDevice.createBuffer({
-            size: M * N * 4,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-        });
+        const cSize = M * N * 4;
+        const cBuffer = bufferManager.acquire(cSize, U_RESULT);
         
-        const readBuffer = gpuDevice.createBuffer({
-            size: M * N * 4,
-            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-        });
+        const readBuffer = bufferManager.acquire(cSize, U_READ);
         
         const bindGroup = gpuDevice.createBindGroup({
             layout: gpuMatmulPipeline.getBindGroupLayout(0),
@@ -671,15 +700,19 @@ const gpuMatmul = async (a, b, M, K, N) => {
         pass.dispatchWorkgroups(Math.ceil(N / 16), Math.ceil(M / 16));
         pass.end();
         
-        commandEncoder.copyBufferToBuffer(cBuffer, 0, readBuffer, 0, M * N * 4);
+        commandEncoder.copyBufferToBuffer(cBuffer, 0, readBuffer, 0, cSize);
         gpuDevice.queue.submit([commandEncoder.finish()]);
         
         await readBuffer.mapAsync(GPUMapMode.READ);
         const result = new Float32Array(readBuffer.getMappedRange().slice(0));
         readBuffer.unmap();
         
-        // Cleanup
-        [uniformBuffer, aBuffer, bBuffer, cBuffer, readBuffer].forEach(b => b.destroy());
+        // Release buffers back to pool
+        bufferManager.release(uniformBuffer, uniformSize, U_UNIFORM);
+        bufferManager.release(aBuffer, aSize, U_STORAGE);
+        bufferManager.release(bBuffer, bSize, U_STORAGE);
+        bufferManager.release(cBuffer, cSize, U_RESULT);
+        bufferManager.release(readBuffer, cSize, U_READ);
         
         return result;
     } catch (e) {
@@ -914,6 +947,33 @@ const App = () => {
         log('Training stopped');
     };
     
+    const runGpuBenchmark = async () => {
+        log('🚀 Starting GPU Benchmark (1024x1024)...');
+        
+        if (!gpuAvailable) { log('❌ WebGPU not available'); return; }
+
+        const N = 1024;
+        const size = N * N;
+        log(`Generating matrices (${size} floats)...`);
+        const a = new Float32Array(size);
+        const b = new Float32Array(size);
+        for(let i=0; i<size; i++) { a[i] = Math.random(); b[i] = Math.random(); }
+        
+        log('Run 1 (Expected allocation)...');
+        const t0 = performance.now();
+        await gpuMatmul(a, b, N, N, N);
+        const t1 = performance.now();
+        log(`Run 1: ${(t1-t0).toFixed(2)}ms`);
+        
+        log('Run 2 (Expected reuse)...');
+        const t2 = performance.now();
+        await gpuMatmul(a, b, N, N, N);
+        const t3 = performance.now();
+        log(`Run 2: ${(t3-t2).toFixed(2)}ms`);
+        
+        log('✅ Benchmark Complete');
+    };
+
     return (
         <div className="container">
             <h1>🔥 CharLM Training</h1>
@@ -982,6 +1042,13 @@ const App = () => {
                         {generatedText}
                     </div>
                 )}
+            </div>
+            
+            <div className="card">
+                <h2>Hardware Acceleration</h2>
+                <button className="btn" onClick={runGpuBenchmark}>
+                    🚀 Run GPU Benchmark (Buffer Pool)
+                </button>
             </div>
             
             <div className="card">

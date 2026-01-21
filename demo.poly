@@ -152,12 +152,15 @@ impl MiniGPT {
         
         for t in 0..seq_len {
             for i in 0..3 {
-                for d in 0..D_MODEL {
-                    let mut sum = 0.0f32;
-                    for j in 0..D_MODEL {
-                        sum += x[t][j] * self.wqkv[wqkv_offset + i * D_MODEL * D_MODEL + j * D_MODEL + d];
+                // Optimized: Loop order j-then-d for contiguous access
+                // qkv[t][i] initialized to 0.0
+                for j in 0..D_MODEL {
+                    let xj = x[t][j];
+                    let w_base = wqkv_offset + i * D_MODEL * D_MODEL + j * D_MODEL;
+                    // Auto-vectorizable inner loop over d
+                    for d in 0..D_MODEL {
+                        qkv[t][i][d] += xj * self.wqkv[w_base + d];
                     }
-                    qkv[t][i][d] = sum;
                 }
             }
         }
@@ -203,12 +206,12 @@ impl MiniGPT {
         let wo_offset = layer * D_MODEL * D_MODEL;
         let mut projected = vec![vec![0.0f32; D_MODEL]; seq_len];
         for t in 0..seq_len {
-            for d in 0..D_MODEL {
-                let mut sum = 0.0f32;
-                for j in 0..D_MODEL {
-                    sum += out[t][j] * self.wo[wo_offset + j * D_MODEL + d];
+            for j in 0..D_MODEL {
+                let otj = out[t][j];
+                let w_base = wo_offset + j * D_MODEL;
+                for d in 0..D_MODEL {
+                    projected[t][d] += otj * self.wo[w_base + d];
                 }
-                projected[t][d] = sum;
             }
         }
         
@@ -221,23 +224,27 @@ impl MiniGPT {
         let ff2_offset = layer * D_MODEL * D_FF;
         
         // Up projection with GELU
-        let mut hidden = vec![0.0f32; D_FF];
-        for d in 0..D_FF {
-            let mut sum = 0.0f32;
-            for j in 0..D_MODEL {
-                sum += x[j] * self.wff1[ff1_offset + j * D_FF + d];
+        // Up projection with GELU
+        // Optimize: j then d
+        let mut hidden_pre = vec![0.0f32; D_FF];
+        for j in 0..D_MODEL {
+            let xj = x[j];
+            let w_base = ff1_offset + j * D_FF;
+            for d in 0..D_FF {
+                hidden_pre[d] += xj * self.wff1[w_base + d];
             }
-            hidden[d] = Self::gelu(sum);
         }
+        let hidden: Vec<f32> = hidden_pre.iter().map(|&v| Self::gelu(v)).collect();
         
         // Down projection
+        // Down projection
         let mut out = vec![0.0f32; D_MODEL];
-        for d in 0..D_MODEL {
-            let mut sum = 0.0f32;
-            for j in 0..D_FF {
-                sum += hidden[j] * self.wff2[ff2_offset + j * D_MODEL + d];
+        for j in 0..D_FF {
+            let hj = hidden[j];
+            let w_base = ff2_offset + j * D_MODEL;
+            for d in 0..D_MODEL {
+                out[d] += hj * self.wff2[w_base + d];
             }
-            out[d] = sum;
         }
         
         out
