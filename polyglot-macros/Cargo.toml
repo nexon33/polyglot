@@ -1,0 +1,16 @@
+[package]
+name = "polyglot-macros"
+version = "0.1.0"
+edition = "2021"
+description = "Proc macros for inline foreign language expressions: py!{}, js!{}, cuda!{}, sql!{}"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
+
+[dev-dependencies]
+polyglot-runtime = { path = "../polyglot-runtime" }
