@@ -1,9 +1,11 @@
 //! Polyglot Runtime - Cross-language marshaling and interpreters
 //!
 //! Provides runtime support for the polyglot macros:
-//! - Python interpreter via PyO3
-//! - JavaScript engine via QuickJS (optional)
-//! - Type marshaling between Rust and foreign languages
+//! - JavaScript engine via Boa (pure Rust, no Node.js)
+//! - TypeScript via SWC transpiler + Boa
+//! - Python via RustPython (optional, pure Rust)
+//!
+//! All interpreters are fully embedded - no external runtimes needed!
 
 pub mod marshal;
 
@@ -13,12 +15,18 @@ pub mod python;
 #[cfg(feature = "javascript")]
 pub mod javascript;
 
+#[cfg(feature = "typescript")]
+pub mod typescript;
+
 pub mod prelude {
     #[cfg(feature = "python")]
     pub use crate::python::PythonRuntime;
 
     #[cfg(feature = "javascript")]
     pub use crate::javascript::JsRuntime;
+
+    #[cfg(feature = "typescript")]
+    pub use crate::typescript::TsRuntime;
 }
 
 /// Error type for polyglot operations
@@ -26,6 +34,7 @@ pub mod prelude {
 pub enum PolyglotError {
     Python(String),
     JavaScript(String),
+    TypeScript(String),
     TypeConversion(String),
     NotInitialized(String),
 }
@@ -35,6 +44,7 @@ impl std::fmt::Display for PolyglotError {
         match self {
             PolyglotError::Python(s) => write!(f, "Python error: {}", s),
             PolyglotError::JavaScript(s) => write!(f, "JavaScript error: {}", s),
+            PolyglotError::TypeScript(s) => write!(f, "TypeScript error: {}", s),
             PolyglotError::TypeConversion(s) => write!(f, "Type conversion error: {}", s),
             PolyglotError::NotInitialized(s) => write!(f, "Runtime not initialized: {}", s),
         }

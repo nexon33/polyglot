@@ -1,39 +1,38 @@
 //! Polyglot Macros - Inline foreign language expressions
 //!
-//! Provides proc macros for embedding Python, JavaScript, CUDA, and SQL
+//! Provides proc macros for embedding Python, JavaScript, TypeScript, CUDA, and SQL
 //! expressions directly in Rust code with automatic type marshaling.
+//!
+//! All interpreters are fully embedded - no external runtimes needed!
 //!
 //! # Example
 //! ```rust
 //! use polyglot::prelude::*;
 //!
 //! fn main() {
-//!     let data = vec![1, 2, 3, 4, 5];
-//!     let doubled: Vec<i32> = py!{ (np.array(data) * 2).tolist() };
-//!     println!("{:?}", doubled);
+//!     let js_result: i32 = js!{ 1 + 2 + 3 };
+//!     let ts_result: i32 = ts!{ (1 as number) + (2 as number) };
+//!     println!("{js_result}, {ts_result}");
 //! }
 //! ```
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
-use syn::{parse_macro_input, LitStr};
 
 mod capture;
 mod gpu_macro;
 mod js_macro;
 mod py_macro;
 mod sql_macro;
+mod ts_macro;
 
 /// Python expression macro - executes Python code and returns result
+///
+/// Uses RustPython (pure Rust interpreter, no system Python needed).
 ///
 /// # Example
 /// ```rust
 /// let result: i32 = py!{ 1 + 2 };
-/// let arr: Vec<f64> = py!{ np.array([1.0, 2.0, 3.0]).tolist() };
 /// ```
-///
-/// Captured Rust variables are automatically marshaled to Python.
 #[proc_macro]
 pub fn py(input: TokenStream) -> TokenStream {
     py_macro::expand(input.into()).into()
@@ -41,15 +40,29 @@ pub fn py(input: TokenStream) -> TokenStream {
 
 /// JavaScript expression macro - executes JS code and returns result
 ///
-/// Useful for WASM interop and DOM manipulation.
+/// Uses Boa engine (pure Rust, no Node.js needed).
 ///
 /// # Example
 /// ```rust
-/// let value: String = js!{ document.getElementById("input").value };
+/// let value: i32 = js!{ 1 + 2 + 3 };
+/// let arr: Vec<i32> = js!{ [1, 2, 3].map(x => x * 2) };
 /// ```
 #[proc_macro]
 pub fn js(input: TokenStream) -> TokenStream {
     js_macro::expand(input.into()).into()
+}
+
+/// TypeScript expression macro - compiles and executes TS code
+///
+/// Uses SWC (pure Rust) to transpile, then Boa to execute.
+///
+/// # Example
+/// ```rust
+/// let result: i32 = ts!{ const x: number = 5; x * 2 };
+/// ```
+#[proc_macro]
+pub fn ts(input: TokenStream) -> TokenStream {
+    ts_macro::expand(input.into()).into()
 }
 
 /// CUDA/GPU kernel macro (reserved - not yet implemented)
