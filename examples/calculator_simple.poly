@@ -1,0 +1,80 @@
+// calculator_simple.poly - Calculator demo without cross-language macros
+//
+// Shows multi-language .poly file with Rust, Python, and JS blocks
+//
+// Build: polyglot build calculator_simple.poly
+
+#[rust]
+pub fn calculate_stats(numbers: &[f64]) -> (f64, f64, f64) {
+    let sum: f64 = numbers.iter().sum();
+    let count = numbers.len() as f64;
+    let mean = sum / count;
+    
+    let variance: f64 = numbers.iter()
+        .map(|x| (x - mean).powi(2))
+        .sum::<f64>() / count;
+    
+    let std_dev = variance.sqrt();
+    
+    (sum, mean, std_dev)
+}
+
+pub fn main() {
+    let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+    let (sum, mean, std_dev) = calculate_stats(&data);
+    
+    println!("Data: {:?}", data);
+    println!("Sum: {}", sum);
+    println!("Mean: {}", mean);
+    println!("Std Dev: {:.4}", std_dev);
+}
+
+#[python]
+def process_data(raw_data):
+    """Clean and normalize data"""
+    max_val = max(raw_data) if raw_data else 1
+    return [x / max_val for x in raw_data]
+
+def outlier_filter(data, threshold=2.0):
+    """Remove outliers using z-score"""
+    if len(data) < 2:
+        return data
+    mean = sum(data) / len(data)
+    variance = sum((x - mean) ** 2 for x in data) / len(data)
+    std = variance ** 0.5 if variance > 0 else 1
+    return [x for x in data if abs(x - mean) / std < threshold]
+
+def moving_average(data, window=3):
+    """Calculate moving average"""
+    result = []
+    for i in range(len(data) - window + 1):
+        avg = sum(data[i:i+window]) / window
+        result.append(avg)
+    return result
+
+#[js]
+const chartConfig = {
+    type: "bar",
+    responsive: true,
+    animation: true
+};
+
+const renderChart = (data, options = {}) => {
+    const config = { ...chartConfig, ...options };
+    console.log("Rendering chart:", config, data);
+    return { config, data };
+};
+
+const formatNumber = (n, decimals = 2) => {
+    return n.toFixed(decimals);
+};
+
+const aggregate = (data, groupBy) => {
+    const groups = {};
+    data.forEach(item => {
+        const key = item[groupBy];
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(item);
+    });
+    return groups;
+};

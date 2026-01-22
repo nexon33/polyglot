@@ -47,6 +47,8 @@ path = "lib.rs"
 anyhow = "1.0" 
 wit-bindgen = "0.41"
 gridmesh = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/gridmesh" }
+polyglot-macros = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/polyglot-macros" }
+polyglot-runtime = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/polyglot-runtime", features = ["javascript", "scripting"] }
 "#,
         );
 

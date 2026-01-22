@@ -81,7 +81,7 @@ pub fn expand(args: TokenStream, input: TokenStream) -> TokenStream {
     // Parse trait definition
     let trait_def: ItemTrait = match parse2(input.clone()) {
         Ok(t) => t,
-        Err(e) => return quote! { compile_error!(#e); },
+        Err(e) => return e.to_compile_error(),
     };
 
     let trait_name = &trait_def.ident;

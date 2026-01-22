@@ -205,6 +205,50 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     // Pattern for expression-level: lang!{
     let expr_re = Regex::new(r"(?m)(rust|rs|python|py|js|ts|wgsl|gpu)!\s*\{").unwrap();
 
+    // === UNIFIED SYNTAX: #[lang:path] { } - combines tag header with braces ===
+    //
+    // Examples:
+    //   #[rust] { code }
+    //   #[rust:src/main.rs] { code }
+    //   #[python:utils.py] { code }
+    //
+    // The braces provide clear start/end markers, easier to parse and collapse
+    let unified_re = Regex::new(
+        r"(?m)^#\[(interface|types|rust|rs|python|py|main|gpu|wgsl|js|jsx|ts|html|rscss|css|test|doc)(?::([a-zA-Z0-9_:/\.\-]+))?\]\s*\{"
+    ).unwrap();
+
+    // Find unified syntax: #[lang] { ... } or #[lang:path] { ... }
+    for cap in unified_re.captures_iter(source) {
+        let m = cap.get(0).unwrap();
+        let lang = cap.get(1).unwrap().as_str();
+        let path = cap.get(2).map(|p| p.as_str().to_string());
+
+        // Find matching closing brace
+        if let Some((content, _end_pos)) = find_matching_brace(source, m.end() - 1) {
+            let start_line = source[..m.start()].lines().count();
+
+            // Normalize language tag
+            let lang_tag = match lang {
+                "rs" => "rust",
+                "py" => "python",
+                _ => lang,
+            }
+            .to_string();
+
+            let mut options = HashMap::new();
+            if let Some(p) = path {
+                options.insert("path".to_string(), p);
+            }
+
+            parsed.blocks.push(CodeBlock {
+                lang_tag,
+                code: content.trim().to_string(),
+                options,
+                start_line,
+            });
+        }
+    }
+
     // Find block-level syntax: lang { ... }
     for cap in block_re.captures_iter(source) {
         let m = cap.get(0).unwrap();

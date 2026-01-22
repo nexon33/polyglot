@@ -1,14 +1,14 @@
 // data_pipeline.poly - Data processing pipeline demo
 //
-// Shows how to combine Rust, JavaScript, and Python for a data pipeline
+// Shows unified syntax for multi-language data pipeline
 //
-// Compile: polyglot compile data_pipeline.poly --target wasm
+// Build: polyglot build data_pipeline.poly
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Rust Block - Type-Safe Core
+// Rust Block - Type-safe core
 // ═══════════════════════════════════════════════════════════════════════════
 
-rust {
+#[rust] {
     #[derive(Debug, Clone)]
     pub struct DataPoint {
         pub timestamp: u64,
@@ -32,32 +32,17 @@ rust {
         ]
     }
     
-    export fn main() {
+    pub fn main() {
+        println!("╔══════════════════════════════════════╗");
+        println!("║     Poly Data Pipeline Demo          ║");
+        println!("╚══════════════════════════════════════╝");
+        println!();
+        
         let data = generate_sample_data();
-        println!("Generated {} data points", data.len());
-        
-        // Process with JavaScript
-        let json_data = js!{
-            const points = [
-                { ts: 1000, val: 10.5 },
-                { ts: 2000, val: 22.3 },
-                { ts: 3000, val: 18.7 },
-            ];
-            points.map(p => p.val).reduce((a, b) => a + b, 0)
-        };
-        
-        println!("JS aggregation: {}", json_data);
-        
-        // Process with Rhai scripting
-        let script_result = py!{
-            let sum = 0;
-            for i in [10, 22, 18, 31, 25] {
-                sum += i;
-            }
-            sum
-        };
-        
-        println!("Script sum: {}", script_result);
+        println!("Generated {} data points:", data.len());
+        for point in &data {
+            println!("  {:?}", point);
+        }
     }
 }
 
@@ -65,7 +50,7 @@ rust {
 // JavaScript Block - Transformations
 // ═══════════════════════════════════════════════════════════════════════════
 
-javascript {
+#[js] {
     const pipeline = {
         normalize: (data) => {
             const max = Math.max(...data.map(d => d.value));
@@ -87,10 +72,10 @@ javascript {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Python Block - ML/Analytics
+// Python Block - Analytics
 // ═══════════════════════════════════════════════════════════════════════════
 
-python {
+#[python] {
     def moving_average(data, window=3):
         """Calculate moving average of values"""
         result = []
@@ -101,13 +86,15 @@ python {
     
     def detect_anomalies(data, threshold=2.5):
         """Simple z-score based anomaly detection"""
+        if len(data) < 2:
+            return []
         mean = sum(data) / len(data)
         variance = sum((x - mean) ** 2 for x in data) / len(data)
-        std = variance ** 0.5
+        std = variance ** 0.5 if variance > 0 else 1
         
         anomalies = []
         for i, x in enumerate(data):
-            z_score = abs(x - mean) / std if std > 0 else 0
+            z_score = abs(x - mean) / std
             if z_score > threshold:
                 anomalies.append((i, x, z_score))
         return anomalies
