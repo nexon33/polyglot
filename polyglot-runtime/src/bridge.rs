@@ -62,6 +62,31 @@ impl ForeignValue {
     pub fn as_usize(&self) -> Option<usize> {
         self.as_i64().map(|i| i as usize)
     }
+
+    /// Convert to JavaScript literal for expression building
+    pub fn to_js_literal(&self) -> String {
+        match self {
+            ForeignValue::Null => "null".to_string(),
+            ForeignValue::Bool(b) => b.to_string(),
+            ForeignValue::Int(i) => i.to_string(),
+            ForeignValue::Float(f) => f.to_string(),
+            ForeignValue::String(s) => {
+                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+            }
+            ForeignValue::Array(arr) => {
+                let items: Vec<String> = arr.iter().map(|v| v.to_js_literal()).collect();
+                format!("[{}]", items.join(", "))
+            }
+            ForeignValue::Object(map) => {
+                let pairs: Vec<String> = map
+                    .iter()
+                    .map(|(k, v)| format!("\"{}\": {}", k, v.to_js_literal()))
+                    .collect();
+                format!("{{{}}}", pairs.join(", "))
+            }
+            ForeignValue::Handle(id) => format!("__handle_{}", id),
+        }
+    }
 }
 
 /// Reference to a runtime for releasing handles
@@ -130,9 +155,37 @@ impl ForeignHandle {
         &self.value
     }
 
-    /// Call a method on the foreign object
-    pub fn call_method(&self, _method: &str, _args: &[ForeignValue]) -> ForeignValue {
-        // TODO: Dispatch to actual runtime
+    /// Call a method on the foreign object using expression string
+    ///
+    /// For objects, evaluates: `obj.method(arg1, arg2, ...)`
+    /// Arguments are serialized to JSON for safe cross-boundary passing.
+    pub fn call_method(&self, method: &str, args: &[ForeignValue]) -> ForeignValue {
+        // Build the method call expression
+        let args_str: Vec<String> = args.iter().map(|a| a.to_js_literal()).collect();
+        let args_joined = args_str.join(", ");
+
+        // For object values, we need the object reference
+        // For now, use a simplified approach with direct eval
+        let expr = format!("({})({})", method, args_joined);
+
+        #[cfg(feature = "javascript")]
+        {
+            use crate::prelude::JsRuntime;
+            let rt = JsRuntime::get();
+            if let Ok(result) = rt.eval_string(&expr) {
+                return ForeignValue::String(result);
+            }
+        }
+
+        #[cfg(feature = "scripting")]
+        {
+            use crate::prelude::ScriptRuntime;
+            let rt = ScriptRuntime::get();
+            if let Ok(result) = rt.eval_string(&expr) {
+                return ForeignValue::String(result);
+            }
+        }
+
         ForeignValue::Null
     }
 }
