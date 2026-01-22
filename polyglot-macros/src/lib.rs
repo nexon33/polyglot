@@ -117,3 +117,32 @@ pub fn sql(input: TokenStream) -> TokenStream {
 pub fn poly_bridge(args: TokenStream, input: TokenStream) -> TokenStream {
     bridge_macro::expand(args.into(), input.into()).into()
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Result-returning variants (reserved for v0.2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// JavaScript expression with Result return (reserved - v0.2)
+///
+/// ```rust
+/// let result: Result<i32, PolyglotError> = js_try!{ risky_operation() };
+/// ```
+#[proc_macro]
+pub fn js_try(input: TokenStream) -> TokenStream {
+    let _ = input;
+    quote::quote! { compile_error!("js_try! is reserved for v0.2 - use js! for now") }.into()
+}
+
+/// Python/Rhai expression with Result return (reserved - v0.2)
+#[proc_macro]
+pub fn py_try(input: TokenStream) -> TokenStream {
+    let _ = input;
+    quote::quote! { compile_error!("py_try! is reserved for v0.2 - use py! for now") }.into()
+}
+
+/// TypeScript expression with Result return (reserved - v0.2)
+#[proc_macro]
+pub fn ts_try(input: TokenStream) -> TokenStream {
+    let _ = input;
+    quote::quote! { compile_error!("ts_try! is reserved for v0.2 - use ts! for now") }.into()
+}
