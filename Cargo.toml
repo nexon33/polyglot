@@ -29,3 +29,6 @@ syn = { version = "2.0", features = ["full", "visit"] }
 quote = "1.0"
 notify = { version = "6.1", features = ["macos_kqueue"] }
 tiny_http = "0.12"
+
+[dev-dependencies]
+polyglot-runtime = { path = "./polyglot-runtime", features = ["javascript", "scripting"] }
