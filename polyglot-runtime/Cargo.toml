@@ -2,19 +2,23 @@
 name = "polyglot-runtime"
 version = "0.1.0"
 edition = "2021"
-description = "Runtime support for polyglot macros: Python/JS/GPU interpreters and type marshaling"
+description = "Runtime support for polyglot macros: embedded interpreters and type marshaling"
 
 [features]
 default = ["python"]
-python = ["pyo3"]
-javascript = ["rquickjs"]
+python = ["rustpython-vm", "rustpython-parser", "rustpython-compiler"]
+javascript = ["boa_engine"]
 gpu = []
 
 [dependencies]
-# PyO3 with ABI3 for broad Python version compatibility
-pyo3 = { version = "0.20", features = ["auto-initialize", "abi3-py38"], optional = true }
-rquickjs = { version = "0.4", optional = true }
-thiserror = "1"
+# RustPython - Fully embedded Python interpreter, no system Python needed!
+rustpython-vm = { version = "0.3", optional = true, default-features = false, features = ["freeze-stdlib"] }
+rustpython-parser = { version = "0.3", optional = true }
+rustpython-compiler = { version = "0.3", optional = true }
+
+# Boa - JavaScript engine in pure Rust
+boa_engine = { version = "0.17", optional = true }
+
 once_cell = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
