@@ -60,6 +60,37 @@ trait Calculator {
 // Generates JsCalculator with type-safe methods
 ```
 
+## The `.poly` Format
+
+Poly also supports `.poly` files - multi-language source files:
+
+```poly
+// main.poly
+
+import numpy as np  // Python imports
+
+rust {
+    // Macros are auto-imported in .poly files!
+    let data = vec![1, 2, 3, 4, 5];
+    let doubled = py!{ (np.array(data) * 2).tolist() };
+}
+
+python {
+    def process(data):
+        return [x * 2 for x in data]
+}
+
+javascript {
+    const render = (data) => console.log(data);
+}
+```
+
+Compile with:
+```bash
+polyglot compile main.poly --target wasm
+polyglot watch main.poly  # Hot reload
+```
+
 ## Documentation
 
 - [Language Spec](docs/LANGUAGE_SPEC.md) - Full specification
