@@ -39,6 +39,58 @@ pub struct ParseError {
     pub line: usize,
 }
 
+/// Find the matching closing brace for an opening brace at position `open_pos`.
+/// Returns the content between braces and the position after the closing brace.
+fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    if open_pos >= bytes.len() || bytes[open_pos] != b'{' {
+        return None;
+    }
+
+    let mut depth = 1;
+    let mut pos = open_pos + 1;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escape_next = false;
+
+    while pos < bytes.len() && depth > 0 {
+        let c = bytes[pos];
+
+        if escape_next {
+            escape_next = false;
+            pos += 1;
+            continue;
+        }
+
+        if c == b'\\' {
+            escape_next = true;
+            pos += 1;
+            continue;
+        }
+
+        if c == b'"' && !in_char {
+            in_string = !in_string;
+        } else if c == b'\'' && !in_string {
+            in_char = !in_char;
+        } else if !in_string && !in_char {
+            if c == b'{' {
+                depth += 1;
+            } else if c == b'}' {
+                depth -= 1;
+            }
+        }
+
+        pos += 1;
+    }
+
+    if depth == 0 {
+        let content = &source[open_pos + 1..pos - 1];
+        Some((content.to_string(), pos))
+    } else {
+        None
+    }
+}
+
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Parse error at line {}: {}", self.line, self.message)
@@ -138,6 +190,58 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             options,
             start_line,
         });
+    }
+
+    // === NEW SYNTAX: lang { } block-level and lang!{ } expression-level ===
+    //
+    // Block-level: `py { code }` or `rust { code }`
+    // Expression-level: `py!{ expr }` or `rust!{ expr }` (reserved, not yet implemented)
+    //
+    // This mirrors Rust macro syntax where ! signals "something special happening"
+
+    // Pattern for block-level: lang {
+    let block_re = Regex::new(r"(?m)^(rust|rs|python|py|js|ts|wgsl|gpu)\s*\{").unwrap();
+
+    // Pattern for expression-level: lang!{
+    let expr_re = Regex::new(r"(?m)(rust|rs|python|py|js|ts|wgsl|gpu)!\s*\{").unwrap();
+
+    // Find block-level syntax: lang { ... }
+    for cap in block_re.captures_iter(source) {
+        let m = cap.get(0).unwrap();
+        let lang = cap.get(1).unwrap().as_str();
+
+        // Find matching closing brace (handle nested braces)
+        if let Some((content, _end_pos)) = find_matching_brace(source, m.end() - 1) {
+            let start_line = source[..m.start()].lines().count();
+
+            // Normalize language tag
+            let lang_tag = match lang {
+                "rs" => "rust",
+                "py" => "python",
+                _ => lang,
+            }
+            .to_string();
+
+            parsed.blocks.push(CodeBlock {
+                lang_tag,
+                code: content.trim().to_string(),
+                options: HashMap::new(),
+                start_line,
+            });
+        }
+    }
+
+    // Find expression-level syntax: lang!{ ... } (reserved - not yet implemented)
+    for cap in expr_re.captures_iter(source) {
+        let m = cap.get(0).unwrap();
+        let lang = cap.get(1).unwrap().as_str();
+        let start_line = source[..m.start()].lines().count();
+
+        // For now, just record these as warnings - syntax is reserved but not implemented
+        eprintln!(
+            "⚠️ Line {}: Expression syntax `{}!{{}}` is reserved but not yet implemented. Use block syntax `{} {{}}` for now.",
+            start_line, lang, lang
+        );
     }
 
     // Auto-discover export/public functions from Rust/Python blocks

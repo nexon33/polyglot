@@ -45,6 +45,12 @@
         },
         {
             "include": "#doc-block"
+        },
+        {
+            "include": "#lang-block-syntax"
+        },
+        {
+            "include": "#lang-expr-syntax"
         }
     ],
     "repository": {
@@ -836,6 +842,67 @@
                     "include": "text.html.markdown"
                 }
             ]
+        },
+        "lang-block-syntax": {
+            "comment": "New syntax: lang { code } - block scope",
+            "begin": "^\\s*(rust|rs|python|py|js|ts|wgsl|gpu)\\s*(\\{)",
+            "beginCaptures": {
+                "1": {
+                    "name": "keyword.control.lang.polyglot"
+                },
+                "2": {
+                    "name": "punctuation.section.block.begin.polyglot"
+                }
+            },
+            "end": "(\\})",
+            "endCaptures": {
+                "1": {
+                    "name": "punctuation.section.block.end.polyglot"
+                }
+            },
+            "contentName": "meta.embedded.block.polyglot",
+            "patterns": [
+                {
+                    "include": "#rust-keywords"
+                },
+                {
+                    "include": "#rust-types"
+                },
+                {
+                    "include": "#rust-functions"
+                },
+                {
+                    "include": "#rust-strings"
+                },
+                {
+                    "include": "#rust-comments"
+                },
+                {
+                    "include": "#rust-numbers"
+                },
+                {
+                    "include": "#rust-operators"
+                },
+                {
+                    "include": "#rust-macros"
+                }
+            ]
+        },
+        "lang-expr-syntax": {
+            "comment": "Reserved syntax: lang!{ expr } - expression returning value (future)",
+            "match": "(rust|rs|python|py|js|ts|wgsl|gpu)(!)\\s*(\\{)",
+            "captures": {
+                "1": {
+                    "name": "keyword.control.lang.polyglot"
+                },
+                "2": {
+                    "name": "keyword.operator.macro.polyglot"
+                },
+                "3": {
+                    "name": "punctuation.section.block.begin.polyglot"
+                }
+            },
+            "name": "meta.macro-call.polyglot"
         }
     }
 }
