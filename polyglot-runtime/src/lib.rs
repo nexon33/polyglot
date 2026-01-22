@@ -4,9 +4,11 @@
 //! - JavaScript engine via Boa (pure Rust, no Node.js)
 //! - TypeScript via SWC transpiler + Boa
 //! - Scripting via Rhai (Python-like, pure Rust)
+//! - Bridge system for type-safe cross-language FFI
 //!
 //! All interpreters are fully embedded - no external runtimes needed!
 
+pub mod bridge;
 pub mod marshal;
 
 #[cfg(feature = "scripting")]

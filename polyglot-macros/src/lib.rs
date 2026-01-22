@@ -3,6 +3,8 @@
 //! Provides proc macros for embedding Python, JavaScript, TypeScript, CUDA, and SQL
 //! expressions directly in Rust code with automatic type marshaling.
 //!
+//! Also provides `#[poly_bridge]` for compile-time type-safe cross-language FFI.
+//!
 //! All interpreters are fully embedded - no external runtimes needed!
 //!
 //! # Example
@@ -18,6 +20,7 @@
 
 use proc_macro::TokenStream;
 
+mod bridge_macro;
 mod capture;
 mod gpu_macro;
 mod js_macro;
@@ -91,4 +94,26 @@ pub fn gpu(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn sql(input: TokenStream) -> TokenStream {
     sql_macro::expand(input.into()).into()
+}
+
+/// Type-safe cross-language FFI bridge
+///
+/// Generates wrapper types and trait implementations for calling
+/// foreign language methods with compile-time type checking.
+///
+/// # Example
+/// ```rust
+/// #[poly_bridge(javascript)]
+/// trait Calculator {
+///     fn add(&self, a: i32, b: i32) -> i32;
+///     fn multiply(&self, a: i32, b: i32) -> i32;
+/// }
+///
+/// // Generates JsCalculator with type-safe methods
+/// let calc: JsCalculator = js!{ ({ add: (a,b) => a+b, multiply: (a,b) => a*b }) };
+/// let sum = calc.add(2, 3);  // Type-checked at compile time!
+/// ```
+#[proc_macro_attribute]
+pub fn poly_bridge(args: TokenStream, input: TokenStream) -> TokenStream {
+    bridge_macro::expand(args.into(), input.into()).into()
 }
