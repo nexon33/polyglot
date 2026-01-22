@@ -1,0 +1,78 @@
+// calculator.poly - Simple calculator demo
+//
+// Demonstrates .poly format with multiple language blocks
+//
+// Compile: polyglot compile calculator.poly --target wasm
+// Watch:   polyglot watch calculator.poly
+
+import math  // Python-style imports work!
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Rust Block - Core Logic
+// ═══════════════════════════════════════════════════════════════════════════
+
+rust {
+    // Macros are auto-imported in .poly files!
+    
+    pub fn calculate_stats(numbers: &[f64]) -> (f64, f64, f64) {
+        let sum: f64 = numbers.iter().sum();
+        let count = numbers.len() as f64;
+        let mean = sum / count;
+        
+        let variance: f64 = numbers.iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>() / count;
+        
+        let std_dev = variance.sqrt();
+        
+        (sum, mean, std_dev)
+    }
+    
+    export fn main() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let (sum, mean, std_dev) = calculate_stats(&data);
+        
+        println!("Data: {:?}", data);
+        println!("Sum: {}", sum);
+        println!("Mean: {}", mean);
+        println!("Std Dev: {:.4}", std_dev);
+        
+        // Use JavaScript for visualization
+        let chart_data = js!{ 
+            JSON.stringify({ sum: sum, mean: mean, stdDev: std_dev }) 
+        };
+        println!("Chart Data: {}", chart_data);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JavaScript Block - Chart Rendering
+// ═══════════════════════════════════════════════════════════════════════════
+
+javascript {
+    const renderChart = (data) => {
+        console.log("📊 Rendering chart with:", data);
+        return { type: "bar", values: data };
+    };
+    
+    const formatNumber = (n, decimals = 2) => {
+        return n.toFixed(decimals);
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Python Block - Data Processing
+// ═══════════════════════════════════════════════════════════════════════════
+
+python {
+    def process_data(raw_data):
+        """Clean and normalize data"""
+        return [x / max(raw_data) for x in raw_data]
+    
+    def outlier_filter(data, threshold=2.0):
+        """Remove outliers using z-score"""
+        import statistics
+        mean = statistics.mean(data)
+        std = statistics.stdev(data)
+        return [x for x in data if abs(x - mean) / std < threshold]
+}

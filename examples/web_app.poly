@@ -1,0 +1,151 @@
+// web_app.poly - Full-stack web application demo
+//
+// Shows how Poly enables full-stack development in a single file
+//
+// Compile: polyglot compile web_app.poly --target wasm
+
+import React from 'react'  // Frontend
+import express             // Backend (conceptual)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared Types - Defined Once, Used Everywhere
+// ═══════════════════════════════════════════════════════════════════════════
+
+rust {
+    /// User data shared across all language boundaries
+    #[derive(Debug, Clone)]
+    pub struct User {
+        pub id: u64,
+        pub name: String,
+        pub email: String,
+        pub role: Role,
+    }
+    
+    #[derive(Debug, Clone)]
+    pub enum Role {
+        Admin,
+        User,
+        Guest,
+    }
+    
+    /// API response type
+    pub struct ApiResponse<T> {
+        pub success: bool,
+        pub data: Option<T>,
+        pub error: Option<String>,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Frontend - React Components (conceptual)
+// ═══════════════════════════════════════════════════════════════════════════
+
+javascript {
+    // User profile component
+    const UserProfile = ({ user }) => {
+        return {
+            type: 'div',
+            className: 'user-profile',
+            children: [
+                { type: 'h2', text: user.name },
+                { type: 'span', text: user.email },
+                { type: 'badge', text: user.role }
+            ]
+        };
+    };
+    
+    // Data fetching hook
+    const useUserData = (userId) => {
+        // In real app: return useSWR(`/api/users/${userId}`)
+        return {
+            data: { id: userId, name: "Demo User", email: "demo@poly.dev" },
+            loading: false,
+            error: null
+        };
+    };
+    
+    // Form validation
+    const validateEmail = (email) => {
+        const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        return re.test(email);
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Backend - API Routes
+// ═══════════════════════════════════════════════════════════════════════════
+
+rust {
+    use std::collections::HashMap;
+    
+    /// In-memory user store (would be database in production)
+    pub struct UserStore {
+        users: HashMap<u64, User>,
+        next_id: u64,
+    }
+    
+    impl UserStore {
+        pub fn new() -> Self {
+            Self { users: HashMap::new(), next_id: 1 }
+        }
+        
+        pub fn create_user(&mut self, name: &str, email: &str) -> User {
+            let user = User {
+                id: self.next_id,
+                name: name.to_string(),
+                email: email.to_string(),
+                role: Role::User,
+            };
+            self.users.insert(self.next_id, user.clone());
+            self.next_id += 1;
+            user
+        }
+        
+        pub fn get_user(&self, id: u64) -> Option<&User> {
+            self.users.get(&id)
+        }
+    }
+    
+    export fn main() {
+        let mut store = UserStore::new();
+        
+        // Create some users
+        let alice = store.create_user("Alice", "alice@poly.dev");
+        let bob = store.create_user("Bob", "bob@poly.dev");
+        
+        println!("Created users:");
+        println!("  {:?}", alice);
+        println!("  {:?}", bob);
+        
+        // Validate email with JavaScript
+        let is_valid = js!{
+            const email = "alice@poly.dev";
+            /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+        };
+        
+        println!("Email validation (JS): {}", is_valid);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Python Block - Analytics & ML
+// ═══════════════════════════════════════════════════════════════════════════
+
+python {
+    def calculate_user_engagement(user_actions):
+        """Calculate engagement score from user actions"""
+        weights = {
+            'click': 1,
+            'view': 0.5,
+            'purchase': 10,
+            'share': 5
+        }
+        
+        score = sum(weights.get(action, 0) for action in user_actions)
+        return min(100, score)  # Cap at 100
+    
+    def recommend_users(current_user, all_users, n=5):
+        """Simple recommendation based on shared interests"""
+        # In real app: use collaborative filtering or ML
+        return all_users[:n]
+}

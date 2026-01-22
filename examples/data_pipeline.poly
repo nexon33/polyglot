@@ -1,0 +1,114 @@
+// data_pipeline.poly - Data processing pipeline demo
+//
+// Shows how to combine Rust, JavaScript, and Python for a data pipeline
+//
+// Compile: polyglot compile data_pipeline.poly --target wasm
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Rust Block - Type-Safe Core
+// ═══════════════════════════════════════════════════════════════════════════
+
+rust {
+    #[derive(Debug, Clone)]
+    pub struct DataPoint {
+        pub timestamp: u64,
+        pub value: f64,
+        pub label: String,
+    }
+    
+    impl DataPoint {
+        pub fn new(timestamp: u64, value: f64, label: &str) -> Self {
+            Self { timestamp, value, label: label.to_string() }
+        }
+    }
+    
+    pub fn generate_sample_data() -> Vec<DataPoint> {
+        vec![
+            DataPoint::new(1000, 10.5, "sensor_a"),
+            DataPoint::new(2000, 22.3, "sensor_b"),
+            DataPoint::new(3000, 18.7, "sensor_a"),
+            DataPoint::new(4000, 31.2, "sensor_c"),
+            DataPoint::new(5000, 25.8, "sensor_b"),
+        ]
+    }
+    
+    export fn main() {
+        let data = generate_sample_data();
+        println!("Generated {} data points", data.len());
+        
+        // Process with JavaScript
+        let json_data = js!{
+            const points = [
+                { ts: 1000, val: 10.5 },
+                { ts: 2000, val: 22.3 },
+                { ts: 3000, val: 18.7 },
+            ];
+            points.map(p => p.val).reduce((a, b) => a + b, 0)
+        };
+        
+        println!("JS aggregation: {}", json_data);
+        
+        // Process with Rhai scripting
+        let script_result = py!{
+            let sum = 0;
+            for i in [10, 22, 18, 31, 25] {
+                sum += i;
+            }
+            sum
+        };
+        
+        println!("Script sum: {}", script_result);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JavaScript Block - Transformations
+// ═══════════════════════════════════════════════════════════════════════════
+
+javascript {
+    const pipeline = {
+        normalize: (data) => {
+            const max = Math.max(...data.map(d => d.value));
+            return data.map(d => ({ ...d, normalized: d.value / max }));
+        },
+        
+        filter: (data, predicate) => data.filter(predicate),
+        
+        aggregate: (data, groupBy) => {
+            const groups = {};
+            data.forEach(d => {
+                const key = d[groupBy];
+                if (!groups[key]) groups[key] = [];
+                groups[key].push(d);
+            });
+            return groups;
+        }
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Python Block - ML/Analytics
+// ═══════════════════════════════════════════════════════════════════════════
+
+python {
+    def moving_average(data, window=3):
+        """Calculate moving average of values"""
+        result = []
+        for i in range(len(data) - window + 1):
+            avg = sum(data[i:i+window]) / window
+            result.append(avg)
+        return result
+    
+    def detect_anomalies(data, threshold=2.5):
+        """Simple z-score based anomaly detection"""
+        mean = sum(data) / len(data)
+        variance = sum((x - mean) ** 2 for x in data) / len(data)
+        std = variance ** 0.5
+        
+        anomalies = []
+        for i, x in enumerate(data):
+            z_score = abs(x - mean) / std if std > 0 else 0
+            if z_score > threshold:
+                anomalies.append((i, x, z_score))
+        return anomalies
+}
