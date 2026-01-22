@@ -3,13 +3,13 @@
 //! Provides runtime support for the polyglot macros:
 //! - JavaScript engine via Boa (pure Rust, no Node.js)
 //! - TypeScript via SWC transpiler + Boa
-//! - Python via RustPython (optional, pure Rust)
+//! - Scripting via Rhai (Python-like, pure Rust)
 //!
 //! All interpreters are fully embedded - no external runtimes needed!
 
 pub mod marshal;
 
-#[cfg(feature = "python")]
+#[cfg(feature = "scripting")]
 pub mod python;
 
 #[cfg(feature = "javascript")]
@@ -19,8 +19,8 @@ pub mod javascript;
 pub mod typescript;
 
 pub mod prelude {
-    #[cfg(feature = "python")]
-    pub use crate::python::PythonRuntime;
+    #[cfg(feature = "scripting")]
+    pub use crate::python::{PythonRuntime, ScriptRuntime};
 
     #[cfg(feature = "javascript")]
     pub use crate::javascript::JsRuntime;
@@ -42,7 +42,7 @@ pub enum PolyglotError {
 impl std::fmt::Display for PolyglotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PolyglotError::Python(s) => write!(f, "Python error: {}", s),
+            PolyglotError::Python(s) => write!(f, "Script error: {}", s),
             PolyglotError::JavaScript(s) => write!(f, "JavaScript error: {}", s),
             PolyglotError::TypeScript(s) => write!(f, "TypeScript error: {}", s),
             PolyglotError::TypeConversion(s) => write!(f, "Type conversion error: {}", s),

@@ -5,17 +5,15 @@ edition = "2021"
 description = "Runtime support for polyglot macros: embedded interpreters and type marshaling"
 
 [features]
-default = ["javascript", "typescript"]
-python = ["rustpython-vm", "rustpython-parser", "rustpython-compiler"]
+default = ["javascript", "scripting"]
+scripting = ["rhai"]
 javascript = ["boa_engine"]
 typescript = ["boa_engine", "swc_core", "swc_ecma_parser", "swc_ecma_codegen"]
 gpu = []
 
 [dependencies]
-# RustPython - Fully embedded Python interpreter, no system Python needed!
-rustpython-vm = { version = "0.3", optional = true, default-features = false, features = ["freeze-stdlib"] }
-rustpython-parser = { version = "0.3", optional = true }
-rustpython-compiler = { version = "0.3", optional = true }
+# Rhai - Embedded Rust scripting engine (Python-like, very stable)
+rhai = { version = "1.17", optional = true }
 
 # Boa - JavaScript engine in pure Rust
 boa_engine = { version = "0.17", optional = true }
