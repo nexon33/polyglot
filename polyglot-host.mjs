@@ -494,6 +494,29 @@ function host_tcp_accept(serverHandle) {
   }
 }
 
+function host_tcp_accept_nonblocking(serverHandle) {
+  try {
+    if (worker) {
+      const result = workerCall('tcp_accept_nonblocking', { id: serverHandle });
+      if (result.ok) {
+        if (result.wouldBlock || result.id === null) {
+          return 0; // Would block
+        }
+        tcpHandleMap.set(result.id, { type: 'socket' });
+        return result.id;
+      } else {
+        console.error(`[host] tcp_accept_nonblocking error: ${result.error}`);
+        return -2;
+      }
+    }
+    console.error('[host] tcp_accept_nonblocking: worker not available');
+    return -2;
+  } catch (e) {
+    console.error(`[host] tcp_accept_nonblocking error: ${e.message}`);
+    return -2;
+  }
+}
+
 function host_tcp_read(handle, bufPtr, bufLen) {
   try {
     if (worker) {
@@ -512,6 +535,44 @@ function host_tcp_read(handle, bufPtr, bufLen) {
     return -1;
   } catch (e) {
     console.error(`[host] tcp_read error: ${e.message}`);
+    return -1;
+  }
+}
+
+function host_tcp_try_read(handle, bufPtr, bufLen) {
+  try {
+    if (worker) {
+      const result = workerCall('tcp_try_read', { id: handle, maxLen: bufLen });
+      if (result.ok) {
+        if (result.eof) return -1; // Connection closed
+        if (result.wouldBlock || result.data.length === 0) return 0; // Would block
+        writeBytes(bufPtr, new Uint8Array(result.data));
+        return result.data.length;
+      } else {
+        console.error(`[host] tcp_try_read error: ${result.error}`);
+        return -2;
+      }
+    }
+    console.error('[host] tcp_try_read: worker not available');
+    return -2;
+  } catch (e) {
+    console.error(`[host] tcp_try_read error: ${e.message}`);
+    return -2;
+  }
+}
+
+function host_tcp_readable(handle) {
+  try {
+    if (worker) {
+      const result = workerCall('tcp_readable', { id: handle });
+      if (result.ok) {
+        return result.readable ? 1 : 0;
+      } else {
+        return -1;
+      }
+    }
+    return -1;
+  } catch (e) {
     return -1;
   }
 }
@@ -1178,7 +1239,10 @@ const hostImports = {
     host_tcp_connect,
     host_tcp_listen,
     host_tcp_accept,
+    host_tcp_accept_nonblocking,
     host_tcp_read,
+    host_tcp_try_read,
+    host_tcp_readable,
     host_tcp_write,
     host_tcp_close,
     host_tcp_local_addr,

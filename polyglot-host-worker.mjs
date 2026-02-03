@@ -78,7 +78,7 @@ async function tcpConnect(host, port) {
   });
 }
 
-// Handle TCP read
+// Handle TCP read (non-blocking if data buffered, else waits with timeout)
 async function tcpRead(id, maxLen) {
   return new Promise((resolve) => {
     const s = sockets.get(id);
@@ -359,6 +359,25 @@ async function handleRequest(request) {
       return await tcpConnect(args.host, args.port);
     case 'tcp_read':
       return await tcpRead(args.id, args.maxLen);
+    case 'tcp_try_read': {
+      // Non-blocking read - returns immediately
+      const s = sockets.get(args.id);
+      if (!s) return { ok: false, error: 'Invalid socket' };
+      if (s.closed) return { ok: true, data: [], eof: true };
+      if (s.readBuffer.length > 0) {
+        const combined = Buffer.concat(s.readBuffer);
+        const toReturn = combined.subarray(0, args.maxLen);
+        s.readBuffer = combined.length > args.maxLen ? [combined.subarray(args.maxLen)] : [];
+        return { ok: true, data: Array.from(toReturn), eof: false };
+      }
+      return { ok: true, data: [], wouldBlock: true };
+    }
+    case 'tcp_readable': {
+      // Check if socket has data ready
+      const s = sockets.get(args.id);
+      if (!s) return { ok: false, error: 'Invalid socket' };
+      return { ok: true, readable: s.readBuffer.length > 0 || s.closed };
+    }
     case 'tcp_write':
       return tcpWrite(args.id, args.data);
     case 'tcp_close':
@@ -367,6 +386,15 @@ async function handleRequest(request) {
       return await tcpListen(args.host, args.port);
     case 'tcp_accept':
       return await tcpAccept(args.id);
+    case 'tcp_accept_nonblocking': {
+      // Non-blocking accept - returns immediately
+      const sv = servers.get(args.id);
+      if (!sv) return { ok: false, error: 'Invalid server' };
+      if (sv.pendingConnections.length > 0) {
+        return { ok: true, id: sv.pendingConnections.shift() };
+      }
+      return { ok: true, id: null, wouldBlock: true };
+    }
     case 'tcp_local_addr': {
       const s = sockets.get(args.id) || servers.get(args.id);
       if (!s) return { ok: false, error: 'Invalid handle' };

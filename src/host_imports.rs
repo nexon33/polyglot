@@ -188,8 +188,17 @@ extern "C" {
     /// Accept connection on server (blocking), returns socket handle
     fn host_tcp_accept(server_handle: i32) -> i32;
     
+    /// Accept connection non-blocking: returns handle (>0), 0 if would block, <0 on error
+    fn host_tcp_accept_nonblocking(server_handle: i32) -> i32;
+    
     /// Read from socket (blocking), returns bytes read (0 = closed, <0 = error)
     fn host_tcp_read(handle: i32, buf_ptr: *mut u8, buf_len: usize) -> i32;
+    
+    /// Try read non-blocking: returns bytes read, 0 if would block, -1 if closed, -2 on error
+    fn host_tcp_try_read(handle: i32, buf_ptr: *mut u8, buf_len: usize) -> i32;
+    
+    /// Check if socket has data ready to read: 1 = yes, 0 = no, <0 = error/closed
+    fn host_tcp_readable(handle: i32) -> i32;
     
     /// Write to socket, returns bytes written (<0 = error)
     fn host_tcp_write(handle: i32, data_ptr: *const u8, data_len: usize) -> i32;
@@ -770,6 +779,29 @@ pub mod tcp {
             Ok(buf)
         }
         
+        /// Try to read without blocking
+        /// Returns Ok(Some(n)) with bytes read, Ok(None) if would block
+        /// Returns Ok(Some(0)) if connection closed
+        pub fn try_read(&self, buf: &mut [u8]) -> HostResult<Option<usize>> {
+            unsafe {
+                let n = host_tcp_try_read(self.handle, buf.as_mut_ptr(), buf.len());
+                if n > 0 {
+                    Ok(Some(n as usize))
+                } else if n == 0 {
+                    Ok(None) // Would block
+                } else if n == -1 {
+                    Ok(Some(0)) // EOF/closed
+                } else {
+                    Err(HostError { code: n, message: "Read error".to_string() })
+                }
+            }
+        }
+        
+        /// Check if data is ready to read
+        pub fn readable(&self) -> bool {
+            unsafe { host_tcp_readable(self.handle) > 0 }
+        }
+        
         /// Write data to socket
         pub fn write(&self, data: &[u8]) -> HostResult<usize> {
             unsafe {
@@ -865,6 +897,21 @@ pub mod tcp {
                     return Err(HostError { code: handle, message: "Accept failed".to_string() });
                 }
                 Ok(TcpStream { handle })
+            }
+        }
+        
+        /// Try to accept a connection without blocking
+        /// Returns Ok(Some(stream)) if connection available, Ok(None) if would block
+        pub fn accept_nonblocking(&self) -> HostResult<Option<TcpStream>> {
+            unsafe {
+                let handle = host_tcp_accept_nonblocking(self.handle);
+                if handle > 0 {
+                    Ok(Some(TcpStream { handle }))
+                } else if handle == 0 {
+                    Ok(None) // Would block
+                } else {
+                    Err(HostError { code: handle, message: "Accept failed".to_string() })
+                }
             }
         }
         
