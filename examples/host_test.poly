@@ -1,12 +1,10 @@
 #[rust]
-//! Test file for Polyglot Host imports
-//! 
-//! This demonstrates filesystem, environment, and process access
-//! via the custom WASM-to-Node.js bridge.
-
-// Import the host bridge functions
-mod host_imports;
-use host_imports::{fs, env, console, process};
+// Test file for Polyglot Host imports
+// 
+// This demonstrates filesystem, environment, and process access
+// via the custom WASM-to-Node.js bridge.
+//
+// Note: fs, env, console, process modules are auto-injected by --target host
 
 fn main() {
     console::log("=== Polyglot Host Test ===");

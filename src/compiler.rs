@@ -289,7 +289,7 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
         // Inject host_imports module for host target
         if opts.target == crate::types::WasmTarget::Host {
             merged_rust_code.push_str("// Host imports for Node.js native access\n");
-            merged_rust_code.push_str(include_str!("host_imports.rs"));
+            merged_rust_code.push_str(include_str!("host_imports_injectable.rs"));
             merged_rust_code.push_str("\n\n");
         }
 

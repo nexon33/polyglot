@@ -430,12 +430,37 @@ async function main() {
     // Create memory if module doesn't export it
     const memory = new WebAssembly.Memory({ initial: 256, maximum: 65536 }); // 16MB - 4GB
     
-    // Add memory to imports if needed
+    // WASI stubs for compatibility (minimal implementation)
+    const wasiStubs = {
+      proc_exit: (code) => process.exit(code),
+      fd_write: (fd, iovs_ptr, iovs_len, nwritten_ptr) => {
+        // Stub: write to stdout/stderr
+        return 0;
+      },
+      fd_read: () => 0,
+      fd_close: () => 0,
+      fd_seek: () => 0,
+      fd_fdstat_get: () => 0,
+      fd_prestat_get: () => 8, // EBADF
+      fd_prestat_dir_name: () => 8,
+      environ_sizes_get: (count_ptr, buf_size_ptr) => 0,
+      environ_get: () => 0,
+      args_sizes_get: (argc_ptr, argv_buf_size_ptr) => 0,
+      args_get: () => 0,
+      clock_time_get: (id, precision, time_ptr) => 0,
+      random_get: (buf, len) => {
+        // Fill with random bytes
+        return 0;
+      },
+    };
+
+    // Add memory and WASI to imports
     const finalImports = {
       ...hostImports,
       env: {
         memory,
       },
+      wasi_snapshot_preview1: wasiStubs,
     };
     
     // Instantiate
