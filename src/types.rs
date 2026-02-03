@@ -70,9 +70,11 @@ impl Default for CompileOptions {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 pub enum WasmTarget {
     #[default]
     Wasm32Wasi,
     Wasm32Unknown,
+    /// Host target: WASM with custom imports for Node.js host
+    Host,
 }

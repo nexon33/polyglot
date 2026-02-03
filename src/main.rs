@@ -44,6 +44,10 @@ enum Commands {
         /// Emit additional artifacts (wit, ir)
         #[arg(long, value_parser = ["wit", "ir"])]
         emit: Option<String>,
+
+        /// Target: browser (default), host (Node.js with native access)
+        #[arg(long, short, value_parser = ["browser", "host"], default_value = "browser")]
+        target: String,
     },
     /// Generate WIT interface from a poly file
     Wit {
@@ -197,12 +201,13 @@ fn main() -> MietteResult<()> {
                 Err(e) => eprintln!("❌ {}", e),
             }
         }
-        Commands::Build { file, release, emit } => {
+        Commands::Build { file, release, emit, target } => {
             // Handle --emit=wit flag
             if emit.as_deref() == Some("wit") {
                 generate_wit_file(&file)?;
             }
-            build_poly(&file, release, false)?;
+            let is_host = target == "host";
+            build_poly(&file, release, false, is_host)?;
         }
         Commands::Wit { file, output } => {
             generate_wit_file_to(&file, output)?;
@@ -212,7 +217,7 @@ fn main() -> MietteResult<()> {
             release,
             args,
         } => {
-            let wasm_path = build_poly(&file, release, false)?;
+            let wasm_path = build_poly(&file, release, false, false)?;
             run_wasm(&wasm_path, &args)?;
         }
         Commands::Init { name } => {
@@ -223,7 +228,7 @@ fn main() -> MietteResult<()> {
         }
         Commands::Test { file } => {
             eprintln!("🧪 Running inline tests for {}", file.display());
-            build_poly(&file, false, true)?; // release=false, test_mode=true
+            build_poly(&file, false, true, false)?; // release=false, test_mode=true, host=false
         }
         Commands::Verify { file } => {
             verify_poly(&file)?;
@@ -243,7 +248,7 @@ fn main() -> MietteResult<()> {
             title,
         } => {
             // Build first
-            let wasm_path = build_poly(&file, true, false)?;
+            let wasm_path = build_poly(&file, true, false, false)?;
 
             // Read WASM bytes
             let wasm_bytes = fs::read(&wasm_path).into_diagnostic()?;
@@ -572,7 +577,7 @@ fn generate_wit_file_to(file: &PathBuf, output: Option<PathBuf>) -> MietteResult
     Ok(())
 }
 
-fn build_poly(file: &PathBuf, release: bool, test_mode: bool) -> MietteResult<PathBuf> {
+fn build_poly(file: &PathBuf, release: bool, test_mode: bool, host_target: bool) -> MietteResult<PathBuf> {
     println!("🔨 Compiling {}", file.display());
     let source = fs::read_to_string(file).into_diagnostic()?;
     let filename = file.display().to_string();
@@ -624,9 +629,20 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool) -> MietteResult<Pa
         ));
     }
 
+    let target = if host_target {
+        polyglot::types::WasmTarget::Host
+    } else {
+        polyglot::types::WasmTarget::default()
+    };
+
+    if host_target {
+        println!("🎯 Target: host (Node.js with native access)");
+    }
+
     let opts = CompileOptions {
         release,
         test_mode,
+        target,
         ..Default::default()
     };
 

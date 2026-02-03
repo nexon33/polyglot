@@ -286,6 +286,13 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
         merged_rust_code
             .push_str("use polyglot_macros::{js, py, ts, cuda, sql, gpu, poly_bridge};\n\n");
 
+        // Inject host_imports module for host target
+        if opts.target == crate::types::WasmTarget::Host {
+            merged_rust_code.push_str("// Host imports for Node.js native access\n");
+            merged_rust_code.push_str(include_str!("host_imports.rs"));
+            merged_rust_code.push_str("\n\n");
+        }
+
         merged_rust_code.push_str(&rs_interface);
         merged_rust_code.push_str(&python_bridge);
         merged_rust_code.push_str(&foreign_stubs);
