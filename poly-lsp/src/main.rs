@@ -4,24 +4,38 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use std::time::Instant;
+use std::path::PathBuf;
 
 mod virtual_fs;
 mod delegator;
 mod json_rpc;
 mod type_graph;
 mod symbol_table;
+mod semantic_tokens;
+mod shadow_indexer;
+mod sidecar_generator;
 
 use virtual_fs::VirtualFileManager;
 use delegator::Delegator;
+use shadow_indexer::ShadowIndex;
+use sidecar_generator::SidecarGenerator;
 use std::sync::Arc;
 
-#[derive(Debug)]
 struct Backend {
     client: Client,
     vfm: Arc<VirtualFileManager>,
     delegator: Arc<Delegator>,
     diag_rx: Arc<Mutex<mpsc::Receiver<Value>>>,
     type_graph: Arc<Mutex<type_graph::TypeGraph>>,
+    /// Shadow indexer for fast signature extraction (<5ms)
+    shadow_index: Arc<Mutex<ShadowIndex>>,
+    /// Sidecar generator for TypeScript type definitions
+    sidecar_generator: Arc<Mutex<SidecarGenerator>>,
+    /// Debounce timer for full Tree-sitter scan
+    debounce_timer: Arc<Mutex<Option<Instant>>>,
+    /// Workspace root for sidecar generation
+    workspace_root: Arc<Mutex<Option<PathBuf>>>,
 }
 
 #[tower_lsp::async_trait]
@@ -46,6 +60,16 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: semantic_tokens::get_legend(),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: Some(false),
+                            ..Default::default()
+                        }
+                    )
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -150,11 +174,11 @@ impl LanguageServer for Backend {
             // Only clear call sites for THIS file, preserving other files' data
             tg.clear_for_file(&params.text_document.uri);
             tg.scan_file(&params.text_document.text, &vfiles);
-            let diags = tg.check_consistency();
-            
+            let diags = tg.check_consistency(&params.text_document.uri);
+
             if !diags.is_empty() {
                 self.client.publish_diagnostics(
-                    params.text_document.uri,
+                    params.text_document.uri.clone(),
                     diags,
                     Some(params.text_document.version)
                 ).await;
@@ -163,34 +187,92 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-         self.client
+        self.client
             .log_message(MessageType::INFO, format!("file changed: {}", params.text_document.uri))
             .await;
-            
-          // Simplification: Assume full text sync for now, or handle incremental
+
+        // Simplification: Assume full text sync for now
         if let Some(changes) = params.content_changes.first() {
-             let vfiles = self.vfm.update_file(
-                 params.text_document.uri.clone(),
-                 &changes.text,
-                 params.text_document.version
-             );
-             // TODO: Sync changes to children
-             
-             // Run Type Graph Analysis
-             {
-                 let mut tg = self.type_graph.lock().await;
-                 // Only clear call sites for THIS file, preserving other files' data
-                 tg.clear_for_file(&params.text_document.uri);
-                 tg.scan_file(&changes.text, &vfiles);
-                 let diags = tg.check_consistency();
-                 
-                 // Always publish, even if empty, to clear old errors
-                 self.client.publish_diagnostics(
-                     params.text_document.uri,
-                     diags,
-                     Some(params.text_document.version)
-                 ).await;
-             }
+            let uri = params.text_document.uri.clone();
+            let content = changes.text.clone();
+            let version = params.text_document.version;
+
+            let vfiles = self.vfm.update_file(uri.clone(), &content, version);
+
+            // ========== PHASE 1: Quick Shadow Index Scan (<5ms) ==========
+            // This runs immediately on every keystroke for responsive IDE features
+            {
+                let mut shadow = self.shadow_index.lock().await;
+                for vfile in &vfiles {
+                    shadow.quick_scan(
+                        &vfile.content,
+                        &vfile.lang_tag,
+                        &uri,
+                        vfile.start_line,
+                    );
+                }
+
+                // Merge shadow signatures into TypeGraph's SymbolTable for immediate hover/completion
+                let mut tg = self.type_graph.lock().await;
+                shadow.merge_into_symbol_table(&mut tg.symbol_table, &uri);
+            }
+
+            // ========== PHASE 2: Debounced Full Tree-sitter Scan (500ms) ==========
+            // This schedules a full AST parse after typing pauses
+            let now = Instant::now();
+            {
+                let mut timer = self.debounce_timer.lock().await;
+                *timer = Some(now);
+            }
+
+            // Clone Arc references for the spawned task
+            let type_graph = self.type_graph.clone();
+            let debounce_timer = self.debounce_timer.clone();
+            let client = self.client.clone();
+            let shadow_index = self.shadow_index.clone();
+            let sidecar_gen = self.sidecar_generator.clone();
+            let workspace_root = self.workspace_root.clone();
+            let vfiles_clone = vfiles.clone();
+
+            // Spawn debounced full scan
+            tokio::spawn(async move {
+                // Wait 500ms before doing full scan
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                // Check if we're still the most recent change
+                let should_scan = {
+                    let timer = debounce_timer.lock().await;
+                    timer.map(|t| t == now).unwrap_or(false)
+                };
+
+                if should_scan {
+                    // Perform full Tree-sitter scan
+                    let mut tg = type_graph.lock().await;
+                    tg.clear_for_file(&uri);
+                    tg.scan_file(&content, &vfiles_clone);
+                    let diags = tg.check_consistency(&uri);
+
+                    // Publish diagnostics
+                    client
+                        .publish_diagnostics(uri.clone(), diags, Some(version))
+                        .await;
+
+                    // ========== PHASE 3: Regenerate Sidecar TypeScript Definitions ==========
+                    let ws_root = workspace_root.lock().await;
+                    if let Some(root) = ws_root.as_ref() {
+                        let shadow = shadow_index.lock().await;
+                        let mut sidecar = sidecar_gen.lock().await;
+                        if let Some(dts_path) = sidecar.generate_dts(&tg, &shadow, &uri) {
+                            client
+                                .log_message(
+                                    MessageType::INFO,
+                                    format!("Generated: {}", dts_path.display()),
+                                )
+                                .await;
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -511,8 +593,38 @@ impl LanguageServer for Backend {
         if locations.is_empty() {
             return Ok(None);
         }
-        
+
         Ok(Some(locations))
+    }
+
+    /// Handle textDocument/semanticTokens/full - Provide semantic tokens for highlighting
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+
+        // Get the source content
+        let source = match self.vfm.get_source(&uri) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        self.client
+            .log_message(MessageType::INFO, format!("Semantic tokens requested for: {}", uri))
+            .await;
+
+        // Tokenize the source
+        let tokenizer = semantic_tokens::PolyTokenizer::new();
+        let tokens = tokenizer.tokenize(&source);
+
+        // Encode tokens into LSP format
+        let data = semantic_tokens::encode_tokens_for_lsp(tokens);
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 }
 
@@ -616,14 +728,29 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
+    // Try to get workspace root from current directory
+    let workspace_root = std::env::current_dir().ok();
+
     let (service, socket) = LspService::new(|client| {
         let (tx, rx) = mpsc::channel(100);
-        Backend { 
+
+        // Initialize sidecar generator with workspace root
+        let sidecar = if let Some(ref root) = workspace_root {
+            SidecarGenerator::new(root.clone())
+        } else {
+            SidecarGenerator::new(std::env::temp_dir())
+        };
+
+        Backend {
             client,
             vfm: Arc::new(VirtualFileManager::new()),
             delegator: Arc::new(Delegator::new(Some(tx))),
             diag_rx: Arc::new(Mutex::new(rx)),
             type_graph: Arc::new(Mutex::new(type_graph::TypeGraph::new())),
+            shadow_index: Arc::new(Mutex::new(ShadowIndex::new())),
+            sidecar_generator: Arc::new(Mutex::new(sidecar)),
+            debounce_timer: Arc::new(Mutex::new(None)),
+            workspace_root: Arc::new(Mutex::new(workspace_root)),
         }
     });
     Server::new(stdin, stdout, socket).serve(service).await;

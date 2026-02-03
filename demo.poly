@@ -1,4 +1,3 @@
-
 #[rust]
 // ============================================================
 // CHANNELED LLM - Character-Level Language Model
@@ -7,10 +6,9 @@
 // ============================================================
 
 use std::cell::RefCell;
-use std::alloc::{alloc, dealloc, Layout};
 
 // Design tokens - SINGLE SOURCE OF TRUTH
-pub const PRIMARY: &str = "#ff1493";  // 🔥 Changed to hot pink!
+pub const PRIMARY: &str = "#ff1493";
 pub const SECONDARY: &str = "#22d3ee";
 pub const BG_DARK: &str = "#0f172a";
 pub const TEXT_LIGHT: &str = "#f1f5f9";
@@ -19,23 +17,6 @@ pub const SPACING_LG: &str = "2rem";
 pub const RADIUS: &str = "12px";
 
 pub enum State { Idle, Loading, Ready, Error, Training, DataLoaded }
-
-// ============================================================
-// Memory Management for JS<->WASM array passing
-// ============================================================
-
-#[no_mangle]
-pub extern "C" fn __malloc(size: usize) -> *mut u8 {
-    let layout = Layout::from_size_align(size, 4).unwrap();
-    unsafe { alloc(layout) }
-}
-
-#[no_mangle]
-pub extern "C" fn __free(ptr: *mut u8, size: usize) {
-    if ptr.is_null() { return; }
-    let layout = Layout::from_size_align(size, 4).unwrap();
-    unsafe { dealloc(ptr, layout); }
-}
 
 // ============================================================
 // 🌟 SOTA Mini-Transformer (GPT-style)

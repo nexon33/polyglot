@@ -4,10 +4,9 @@
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_until, take_while, take_while1},
-    character::complete::{char, line_ending, multispace0, multispace1, not_line_ending, space0},
-    combinator::{eof, map, opt, recognize, rest},
-    multi::{many0, many_till},
-    sequence::{delimited, pair, preceded, terminated, tuple},
+    character::complete::{char, line_ending, multispace0, multispace1, space0},
+    combinator::{map, opt, recognize},
+    sequence::{delimited, pair, preceded},
     IResult,
 };
 
@@ -28,6 +27,8 @@ pub struct CodeBlock {
     pub code: String,
     pub options: HashMap<String, String>,
     pub start_line: usize,
+    /// Line where the actual code starts (after header and any blank lines)
+    pub code_start_line: usize,
 }
 
 /// Complete parsed .poly file
@@ -57,6 +58,7 @@ impl std::error::Error for ParseError {}
 // ============ Nom Parsers ============
 
 /// Parse whitespace and comments (lines starting with //)
+#[allow(dead_code)]
 fn ws_and_comments(input: &str) -> IResult<&str, ()> {
     let (input, _) = multispace0(input)?;
     Ok((input, ()))
@@ -143,7 +145,7 @@ fn parse_block_header(input: &str) -> IResult<&str, (String, HashMap<String, Str
 }
 
 /// Find the content of a block (everything until next #[...] block header or EOF)
-fn block_content<'a>(input: &'a str, source: &'a str) -> (&'a str, &'a str) {
+fn block_content<'a>(input: &'a str, _source: &'a str) -> (&'a str, &'a str) {
     // Look for next block header
     let block_pattern = "\n#[";
 
@@ -201,9 +203,13 @@ pub fn parse_poly_ast(source: &str) -> Result<ParsedFile, ParseError> {
             match parse_block_header(remaining) {
                 Ok((rest, (tag_name, options))) => {
                     // Find content until next block or EOF
-                    let (next_remaining, content) = block_content(rest, source);
+                    let (next_remaining, raw_content) = block_content(rest, source);
 
-                    let content = content.trim().to_string();
+                    // Calculate code_start_line: header + 1, plus any leading blank lines that get trimmed
+                    let leading_newlines = raw_content.chars().take_while(|c| *c == '\n' || *c == '\r').filter(|c| *c == '\n').count();
+                    let code_start_line = line_num + 1 + leading_newlines;
+
+                    let content = raw_content.trim().to_string();
 
                     // Handle interface blocks specially
                     if tag_name == "interface" {
@@ -217,6 +223,7 @@ pub fn parse_poly_ast(source: &str) -> Result<ParsedFile, ParseError> {
                             code: content,
                             options,
                             start_line: line_num,
+                            code_start_line,
                         });
                     }
 

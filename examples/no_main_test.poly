@@ -1,0 +1,11 @@
+// Test file without a main function
+// Should trigger E001: No main entry point found
+
+#[rust]
+fn helper() -> i32 {
+    42
+}
+
+#[python]
+def calculate(x):
+    return x * 2

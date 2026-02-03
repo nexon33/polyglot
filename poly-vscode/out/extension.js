@@ -9,6 +9,7 @@ const polyTreeProvider_1 = require("./polyTreeProvider");
 const docBlockProvider_1 = require("./docBlockProvider");
 const polyglotFileSystemProvider_1 = require("./polyglotFileSystemProvider");
 const autoWorkspaceManager_1 = require("./autoWorkspaceManager");
+const languageBlockDecorator_1 = require("./languageBlockDecorator");
 let client;
 let polyglotBin;
 let terminal;
@@ -46,7 +47,21 @@ function activate(context) {
     const config = vscode_1.workspace.getConfiguration('polyglot');
     const fs = require('fs');
     // Check for bundled binary first, then fall back to config/PATH
-    const bundledPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'poly-lsp.exe' : 'poly-lsp');
+    // Priority: v6 > v5 > v4 > v3 > v2 > new > original (to allow hot-swapping without closing VSCode)
+    const v6BinaryPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'poly-lsp-v6.exe' : 'poly-lsp-v6');
+    const v5BinaryPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'poly-lsp-v5.exe' : 'poly-lsp-v5');
+    const v4BinaryPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'poly-lsp-v4.exe' : 'poly-lsp-v4');
+    const v3BinaryPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'poly-lsp-v3.exe' : 'poly-lsp-v3');
+    const v2BinaryPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'poly-lsp-v2.exe' : 'poly-lsp-v2');
+    const newBinaryPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'poly-lsp-new.exe' : 'poly-lsp-new');
+    const originalPath = path.join(context.extensionPath, 'bin', process.platform === 'win32' ? 'poly-lsp.exe' : 'poly-lsp');
+    const bundledPath = fs.existsSync(v6BinaryPath) ? v6BinaryPath
+        : fs.existsSync(v5BinaryPath) ? v5BinaryPath
+            : fs.existsSync(v4BinaryPath) ? v4BinaryPath
+                : fs.existsSync(v3BinaryPath) ? v3BinaryPath
+                    : fs.existsSync(v2BinaryPath) ? v2BinaryPath
+                        : fs.existsSync(newBinaryPath) ? newBinaryPath
+                            : originalPath;
     const configPath = config.get('serverPath');
     // Priority: bundled > config > PATH
     let serverPath;
@@ -77,6 +92,8 @@ function activate(context) {
     polyTreeProvider = new polyTreeProvider_1.PolyTreeProvider();
     docBlockProvider = new docBlockProvider_1.DocBlockProvider();
     autoWorkspaceManager = new autoWorkspaceManager_1.AutoWorkspaceManager();
+    // Activate language block decorations (background tint + gutter markers)
+    (0, languageBlockDecorator_1.activateBlockDecorations)(context);
     // Register virtual file system
     const polyFs = new polyglotFileSystemProvider_1.PolyglotFileSystemProvider();
     context.subscriptions.push(vscode_1.workspace.registerFileSystemProvider('polyglot', polyFs, { isCaseSensitive: true }));

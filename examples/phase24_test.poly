@@ -1,0 +1,40 @@
+// phase24_test.poly - Phase 24 Feature Tests
+// Tests working syntax normalization features
+
+#[main] {
+    pub fn main() {
+        // Test 1: Python keyword normalization
+        let value: Option<i32> = None;  // None stays None (Rust-compatible)
+        let active = true;              // True → true
+        let disabled = false;           // False → false
+
+        // Test 2: Operator normalization
+        // 'is' becomes '==' in Rust
+        if value.is_none() && active {
+            println!("Active with no value");
+        }
+
+        let valid = true;
+        let deleted = false;
+        if valid && !deleted {          // and not → && !
+            println!("Valid and not deleted");
+        }
+
+        // Test 3: F-string normalization
+        let name = "World";
+        let greeting = f"Hello, {name}!";  // → format!("Hello, {name}!")
+        println!("{}", greeting);
+
+        // Test 4: Template literal normalization
+        let count = 42;
+        let message = `Count: ${count}`;   // → format!("Count: {count}")
+        println!("{}", message);
+
+        // Test 5: Python booleans in conditions
+        if True && !False {
+            println!("Boolean normalization works");
+        }
+
+        println!("Phase 24 syntax normalization test complete!");
+    }
+}

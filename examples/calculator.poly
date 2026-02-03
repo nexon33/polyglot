@@ -1,88 +1,91 @@
-// calculator.poly - Calculator demo with unified syntax
+// calculator.poly - Working multi-block example
 //
-// Shows #[lang:path] { } syntax for organizing code
+// Demonstrates interfaces + Rust implementation that actually compiles and runs.
+// This is what works TODAY. Cross-language calls coming in Phase 26.
 //
-// Build: polyglot build calculator.poly
+// Run: polyglot run calculator.poly
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Rust Block - Core calculation logic
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERFACE - Define the contract
+// ═══════════════════════════════════════════════════════════════════════════════
 
-#[rust:src/calc.rs] {
-    pub fn calculate_stats(numbers: &[f64]) -> (f64, f64, f64) {
-        let sum: f64 = numbers.iter().sum();
-        let count = numbers.len() as f64;
-        let mean = sum / count;
-        
-        let variance: f64 = numbers.iter()
-            .map(|x| (x - mean).powi(2))
-            .sum::<f64>() / count;
-        
-        let std_dev = variance.sqrt();
-        
-        (sum, mean, std_dev)
-    }
-
-    pub fn main() {
-        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-        let (sum, mean, std_dev) = calculate_stats(&data);
-        
-        println!("╔══════════════════════════════════════╗");
-        println!("║       Poly Calculator Demo           ║");
-        println!("╚══════════════════════════════════════╝");
-        println!();
-        println!("Data: {:?}", data);
-        println!("Sum: {}", sum);
-        println!("Mean: {}", mean);
-        println!("Std Dev: {:.4}", std_dev);
+#[interface] {
+    /// Calculator operations interface
+    trait Calculator {
+        fn add(a: i32, b: i32) -> i32;
+        fn multiply(a: i32, b: i32) -> i32;
+        fn factorial(n: i32) -> i32;
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Python Block - Data processing utilities
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// RUST IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
 
-#[python:src/utils.py] {
-    def normalize(data):
-        """Normalize data to 0-1 range"""
-        max_val = max(data) if data else 1
-        return [x / max_val for x in data]
+#[rust] {
+    /// Rust implementation of Calculator
+    pub struct RustCalculator;
 
-    def moving_average(data, window=3):
-        """Calculate moving average"""
-        result = []
-        for i in range(len(data) - window + 1):
-            avg = sum(data[i:i+window]) / window
-            result.append(avg)
-        return result
+    impl RustCalculator {
+        pub fn add(a: i32, b: i32) -> i32 {
+            a + b
+        }
 
-    def filter_outliers(data, threshold=2.0):
-        """Remove outliers using z-score"""
-        if len(data) < 2:
-            return data
-        mean = sum(data) / len(data)
-        variance = sum((x - mean) ** 2 for x in data) / len(data)
-        std = variance ** 0.5 if variance > 0 else 1
-        return [x for x in data if abs(x - mean) / std < threshold]
+        pub fn multiply(a: i32, b: i32) -> i32 {
+            a * b
+        }
+
+        pub fn factorial(n: i32) -> i32 {
+            if n <= 1 { 1 } else { n * Self::factorial(n - 1) }
+        }
+    }
+
+    // Helper functions using iterators
+    fn sum_range(start: i32, end: i32) -> i32 {
+        (start..=end).sum()
+    }
+
+    fn fibonacci(n: usize) -> Vec<i32> {
+        let mut fib = vec![0, 1];
+        for i in 2..n {
+            fib.push(fib[i - 1] + fib[i - 2]);
+        }
+        fib.truncate(n);
+        fib
+    }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// JavaScript Block - Chart rendering
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN - Entry point
+// ═══════════════════════════════════════════════════════════════════════════════
 
-#[js:src/chart.js] {
-    const renderChart = (data, options = {}) => {
-        const config = {
-            type: options.type || "bar",
-            responsive: true,
-            animation: true,
-            ...options
-        };
-        console.log("📊 Rendering chart:", config);
-        return { config, data };
-    };
+#[main]
+fn main() {
+    println!("=== Polyglot Calculator Demo ===\n");
 
-    const formatNumber = (n, decimals = 2) => {
-        return n.toFixed(decimals);
-    };
+    // Basic operations
+    let a = 42;
+    let b = 13;
+
+    println!("Addition: {} + {} = {}", a, b, RustCalculator::add(a, b));
+    println!("Multiply: {} * {} = {}", a, b, RustCalculator::multiply(a, b));
+    println!("Factorial: {}! = {}", 7, RustCalculator::factorial(7));
+
+    // Range operations
+    println!("\nSum of 1..100 = {}", sum_range(1, 100));
+
+    // Fibonacci
+    let fib = fibonacci(10);
+    println!("First 10 Fibonacci: {:?}", fib);
+
+    // Functional style
+    let numbers: Vec<i32> = (1..=10).collect();
+    let squares: Vec<i32> = numbers.iter().map(|x| x * x).collect();
+    let evens: Vec<i32> = numbers.iter().filter(|x| *x % 2 == 0).cloned().collect();
+
+    println!("\nNumbers 1-10: {:?}", numbers);
+    println!("Squares: {:?}", squares);
+    println!("Evens: {:?}", evens);
+
+    println!("\n=== Demo Complete ===");
 }

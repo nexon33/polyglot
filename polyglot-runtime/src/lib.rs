@@ -3,7 +3,8 @@
 //! Provides runtime support for the polyglot macros:
 //! - JavaScript engine via Boa (pure Rust, no Node.js)
 //! - TypeScript via SWC transpiler + Boa
-//! - Scripting via Rhai (Python-like, pure Rust)
+//! - Python via RustPython (actual Python 3 interpreter)
+//! - Scripting via Rhai (Rust-like, pure Rust)
 //! - Bridge system for type-safe cross-language FFI
 //!
 //! All interpreters are fully embedded - no external runtimes needed!
@@ -14,6 +15,9 @@ pub mod marshal;
 #[cfg(feature = "scripting")]
 pub mod python;
 
+#[cfg(feature = "python")]
+pub mod rustpython;
+
 #[cfg(feature = "javascript")]
 pub mod javascript;
 
@@ -23,6 +27,9 @@ pub mod typescript;
 pub mod prelude {
     #[cfg(feature = "scripting")]
     pub use crate::python::{PythonRuntime, ScriptRuntime};
+
+    #[cfg(feature = "python")]
+    pub use crate::rustpython::PyRuntime;
 
     #[cfg(feature = "javascript")]
     pub use crate::javascript::JsRuntime;

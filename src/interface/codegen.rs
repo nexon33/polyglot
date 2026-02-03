@@ -25,9 +25,40 @@ pub fn generate_python(items: &[InterfaceItem]) -> String {
                     out.push_str(&format!("# Type import: {} = {}\n", td.name, py_impl));
                 }
             }
+            InterfaceItem::Trait(t) => {
+                // Generate Python Protocol/ABC for trait
+                out.push_str(&generate_python_trait(t));
+            }
         }
     }
 
+    out
+}
+
+fn generate_python_trait(t: &TraitDef) -> String {
+    let mut out = String::new();
+    out.push_str("from typing import Protocol\n\n");
+    out.push_str(&format!("class {}(Protocol):\n", t.name));
+    if let Some(doc) = &t.doc {
+        out.push_str(&format!("    \"\"\"{}\"\"\"\n", doc));
+    }
+    if t.methods.is_empty() {
+        out.push_str("    pass\n");
+    } else {
+        for method in &t.methods {
+            let params: Vec<String> = std::iter::once("self".to_string())
+                .chain(method.params.iter().map(|(name, ty)| {
+                    format!("{}: {}", name, type_to_python(ty))
+                }))
+                .collect();
+            let ret = method.return_type.as_ref()
+                .map(|ty| format!(" -> {}", type_to_python(ty)))
+                .unwrap_or_default();
+            out.push_str(&format!("    def {}({}){}:\n        ...\n\n",
+                method.name, params.join(", "), ret));
+        }
+    }
+    out.push_str("\n");
     out
 }
 
@@ -176,8 +207,33 @@ pub fn generate_rust_with_source(items: &[InterfaceItem], source_code: &str) -> 
             InterfaceItem::TypeDecl(_) => {
                 // Already handled at start
             }
+            InterfaceItem::Trait(t) => {
+                // Generate Rust trait definition
+                out.push_str(&generate_rust_trait(t));
+            }
         }
     }
+    out
+}
+
+fn generate_rust_trait(t: &TraitDef) -> String {
+    let mut out = String::new();
+    if let Some(doc) = &t.doc {
+        out.push_str(&format!("/// {}\n", doc));
+    }
+    out.push_str(&format!("pub trait {} {{\n", t.name));
+    for method in &t.methods {
+        let params: Vec<String> = std::iter::once("&self".to_string())
+            .chain(method.params.iter().map(|(name, ty)| {
+                format!("{}: {}", name, type_to_rust(ty))
+            }))
+            .collect();
+        let ret = method.return_type.as_ref()
+            .map(|ty| format!(" -> {}", type_to_rust(ty)))
+            .unwrap_or_default();
+        out.push_str(&format!("    fn {}({}){};\n", method.name, params.join(", "), ret));
+    }
+    out.push_str("}\n\n");
     out
 }
 

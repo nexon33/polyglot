@@ -9,11 +9,15 @@ default = ["javascript", "scripting"]
 scripting = ["rhai"]
 javascript = ["boa_engine"]
 typescript = ["boa_engine", "swc_core", "swc_ecma_parser", "swc_ecma_codegen"]
+python = ["rustpython-vm"]
 gpu = []
 
 [dependencies]
 # Rhai - Embedded Rust scripting engine (Python-like, very stable)
 rhai = { version = "1.17", optional = true }
+
+# RustPython - Full Python interpreter in Rust
+rustpython-vm = { version = "0.4", optional = true, default-features = false, features = ["compiler"] }
 
 # Boa - JavaScript engine in pure Rust
 boa_engine = { version = "0.17", optional = true }

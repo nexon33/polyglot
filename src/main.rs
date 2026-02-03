@@ -1,11 +1,15 @@
 use clap::{Parser, Subcommand};
 use polyglot::{
-    compiler::compile,
+    compiler::{compile, CompileError},
+    component_builder::{ComponentBuilder, check_component_tools},
+    diagnostic::{self, PolySource, NoMainError, MultipleMainError, ParseDiagnostic, RustCompileError},
+    implements_verify::verify_implementations,
     parser::{ParsedFile, parse_poly},
     types::CompileOptions,
     validate,
     wit_gen::generate_wit,
 };
+use miette::{IntoDiagnostic, Result as MietteResult};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,6 +40,19 @@ enum Commands {
         /// Release mode
         #[arg(long, short)]
         release: bool,
+
+        /// Emit additional artifacts (wit, ir)
+        #[arg(long, value_parser = ["wit", "ir"])]
+        emit: Option<String>,
+    },
+    /// Generate WIT interface from a poly file
+    Wit {
+        /// Input file
+        file: PathBuf,
+
+        /// Output file (default: <name>.wit)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// Build and run a poly file with wasmtime
     Run {
@@ -47,7 +64,7 @@ enum Commands {
         release: bool,
 
         /// Arguments to pass to the WASM program (use -- before args)
-        #[arg(trailing_var_arg = true, last = true)]
+        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Initialize a new polyglot project
@@ -97,6 +114,11 @@ enum Commands {
         /// Input poly file
         file: PathBuf,
     },
+    /// Verify @implements declarations match interface traits
+    Verify {
+        /// Input poly file
+        file: PathBuf,
+    },
     /// Create a new project from a template
     New {
         /// Template name: react-app, ml-demo, or game
@@ -106,15 +128,60 @@ enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
+    /// Check which component tools are installed
+    Tools,
+    /// Build language blocks as WASM components (requires jco, componentize-py)
+    Component {
+        /// Input poly file
+        file: PathBuf,
+
+        /// Output directory (default: target/components)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Also compose components into single composed.wasm (requires wasm-compose)
+        #[arg(long)]
+        compose: bool,
+    },
+    /// Compose multiple WASM components into one (requires wasm-compose)
+    Compose {
+        /// Input WASM component files
+        #[arg(required = true)]
+        components: Vec<PathBuf>,
+
+        /// Output file (default: composed.wasm)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> MietteResult<()> {
+    // Install miette's fancy error handler for beautiful diagnostics
+    miette::set_hook(Box::new(|_| {
+        Box::new(
+            miette::MietteHandlerOpts::new()
+                .terminal_links(true)
+                .unicode(true)
+                .context_lines(2)
+                .tab_width(4)
+                .build(),
+        )
+    }))?;
+
     let args = Args::parse();
 
     match args.command {
         Commands::Check { file } => {
             println!("🔍 Checking {}", file.display());
-            let source = fs::read_to_string(&file)?;
+            let source = fs::read_to_string(&file).into_diagnostic()?;
             match parse_poly(&source) {
                 Ok(parsed) => {
                     println!("✅ Successfully parsed {} blocks", parsed.blocks.len());
@@ -130,8 +197,15 @@ fn main() -> anyhow::Result<()> {
                 Err(e) => eprintln!("❌ {}", e),
             }
         }
-        Commands::Build { file, release } => {
+        Commands::Build { file, release, emit } => {
+            // Handle --emit=wit flag
+            if emit.as_deref() == Some("wit") {
+                generate_wit_file(&file)?;
+            }
             build_poly(&file, release, false)?;
+        }
+        Commands::Wit { file, output } => {
+            generate_wit_file_to(&file, output)?;
         }
         Commands::Run {
             file,
@@ -151,6 +225,18 @@ fn main() -> anyhow::Result<()> {
             eprintln!("🧪 Running inline tests for {}", file.display());
             build_poly(&file, false, true)?; // release=false, test_mode=true
         }
+        Commands::Verify { file } => {
+            verify_poly(&file)?;
+        }
+        Commands::Tools => {
+            check_tools();
+        }
+        Commands::Component { file, output, verbose, compose } => {
+            build_components(&file, output, verbose, compose)?;
+        }
+        Commands::Compose { components, output, verbose } => {
+            compose_components(&components, output, verbose)?;
+        }
         Commands::Bundle {
             file,
             output,
@@ -160,7 +246,7 @@ fn main() -> anyhow::Result<()> {
             let wasm_path = build_poly(&file, true, false)?;
 
             // Read WASM bytes
-            let wasm_bytes = fs::read(&wasm_path)?;
+            let wasm_bytes = fs::read(&wasm_path).into_diagnostic()?;
 
             // Get temp dir from the file's parent
             let temp_dir = file
@@ -169,7 +255,7 @@ fn main() -> anyhow::Result<()> {
                 .join("target/polyglot_tmp");
 
             // Generate bundle
-            let bundle = polyglot::compiler::bundle_to_single_file(&temp_dir, &wasm_bytes, &title)?;
+            let bundle = polyglot::compiler::bundle_to_single_file(&temp_dir, &wasm_bytes, &title).into_diagnostic()?;
 
             // Determine output path
             let out_path = output.unwrap_or_else(|| {
@@ -177,7 +263,7 @@ fn main() -> anyhow::Result<()> {
                 PathBuf::from(format!("{}.html", stem))
             });
 
-            fs::write(&out_path, &bundle)?;
+            fs::write(&out_path, &bundle).into_diagnostic()?;
 
             let size_kb = bundle.len() / 1024;
             println!(
@@ -191,7 +277,7 @@ fn main() -> anyhow::Result<()> {
             println!("   ✓ GPU:  WGSL shaders embedded");
             println!(
                 "\n🌐 Open in browser: file://{}",
-                fs::canonicalize(&out_path)?.display()
+                fs::canonicalize(&out_path).into_diagnostic()?.display()
             );
         }
         Commands::Npm { action, packages } => {
@@ -251,7 +337,7 @@ fn main() -> anyhow::Result<()> {
 
                     // Create entry point that re-exports all dependencies
                     let entry = "// Auto-generated entry point\nexport * from './node_modules';\n";
-                    fs::write("_poly_entry.js", entry)?;
+                    fs::write("_poly_entry.js", entry).into_diagnostic()?;
 
                     let status = Command::new("npx")
                         .args([
@@ -286,14 +372,245 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_poly(file: &PathBuf, release: bool, test_mode: bool) -> anyhow::Result<PathBuf> {
+/// Check which component tools are installed
+fn check_tools() {
+    println!("🔧 Component Model Tools Status:\n");
+
+    let tools = check_component_tools();
+    for (name, available, status) in &tools {
+        let icon = if *available { "✅" } else { "❌" };
+        println!("  {} {}: {}", icon, name, status.split(": ").last().unwrap_or(status));
+    }
+
+    let available_count = tools.iter().filter(|(_, a, _)| *a).count();
+    println!("\n📊 {}/{} tools available", available_count, tools.len());
+
+    if available_count < tools.len() {
+        println!("\n💡 Install missing tools to enable full component model support.");
+    }
+}
+
+/// Build language blocks as WASM components
+fn build_components(file: &PathBuf, output: Option<PathBuf>, verbose: bool, compose: bool) -> MietteResult<()> {
+    println!("🔨 Building WASM components from {}", file.display());
+
+    let source = fs::read_to_string(file).into_diagnostic()?;
+    let filename = file.display().to_string();
+
+    let parsed = parse_poly(&source).map_err(|e| {
+        miette::miette!("Parse error: {}", e)
+    })?;
+
+    // Determine output directory
+    let work_dir = output.unwrap_or_else(|| {
+        file.parent()
+            .unwrap_or(Path::new("."))
+            .join("target/components")
+    });
+
+    let mut builder = ComponentBuilder::new(work_dir.clone());
+    builder.verbose = verbose;
+
+    // Count componentizable blocks in the file
+    let componentizable_count = parsed.blocks.iter()
+        .filter(|b| matches!(b.lang_tag.as_str(), "typescript" | "ts" | "javascript" | "js" | "python" | "py"))
+        .count();
+
+    match builder.build_all(&parsed, &filename) {
+        Ok(results) => {
+            if results.is_empty() {
+                if componentizable_count > 0 {
+                    println!("⚠️  Found {} componentizable blocks but couldn't build any.", componentizable_count);
+                    println!("   Run `polyglot tools` to check which tools are installed.");
+                } else {
+                    println!("⚠️  No componentizable blocks found (need #[typescript], #[javascript], or #[python])");
+                }
+            } else {
+                println!("\n✅ Built {} component(s):\n", results.len());
+                for result in &results {
+                    println!("  📦 {}: {} ({} KB)",
+                        result.language,
+                        result.wasm_path.display(),
+                        result.size_bytes / 1024
+                    );
+                }
+
+                // Optionally compose components
+                if compose && results.len() >= 2 {
+                    println!("\n🔗 Composing {} components...", results.len());
+                    let wit_path = work_dir.join("interfaces.wit");
+                    let mut linker = polyglot::ComponentLinker::new(work_dir);
+                    linker.verbose = verbose;
+
+                    match linker.link(&results, &wit_path) {
+                        Ok(link_result) => {
+                            println!("\n✅ Composed component: {} ({} KB)",
+                                link_result.output_path.display(),
+                                link_result.size_bytes / 1024
+                            );
+                        }
+                        Err(e) => {
+                            println!("⚠️  Composition failed: {}", e);
+                            println!("   Run `polyglot tools` to check if wasm-compose is installed.");
+                        }
+                    }
+                } else if compose && results.len() < 2 {
+                    println!("\n⚠️  Need at least 2 components to compose (got {})", results.len());
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            Err(miette::miette!("Component build failed: {}", e))
+        }
+    }
+}
+
+/// Compose multiple WASM components into one
+fn compose_components(components: &[PathBuf], output: Option<PathBuf>, verbose: bool) -> MietteResult<()> {
+    use polyglot::component_builder::ComponentBuildResult;
+
+    if components.len() < 2 {
+        return Err(miette::miette!("Need at least 2 components to compose (got {})", components.len()));
+    }
+
+    println!("🔗 Composing {} components...", components.len());
+
+    // Convert PathBuf to ComponentBuildResult
+    let results: Vec<ComponentBuildResult> = components.iter().enumerate().map(|(i, path)| {
+        let size = fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+        ComponentBuildResult {
+            language: format!("component_{}", i),
+            wasm_path: path.clone(),
+            size_bytes: size,
+        }
+    }).collect();
+
+    // Determine output directory
+    let work_dir = output.clone().unwrap_or_else(|| PathBuf::from("target/components"));
+    fs::create_dir_all(&work_dir).into_diagnostic()?;
+
+    let mut linker = polyglot::ComponentLinker::new(work_dir.clone());
+    linker.verbose = verbose;
+    if let Some(out) = output {
+        linker.output_path = out;
+    }
+
+    // Create a dummy WIT path (composition doesn't always need it)
+    let wit_path = work_dir.join("interfaces.wit");
+
+    match linker.link(&results, &wit_path) {
+        Ok(link_result) => {
+            println!("\n✅ Composed component: {} ({} KB)",
+                link_result.output_path.display(),
+                link_result.size_bytes / 1024
+            );
+            println!("   Linked {} components", link_result.components_linked);
+            Ok(())
+        }
+        Err(e) => {
+            Err(miette::miette!("Composition failed: {}", e))
+        }
+    }
+}
+
+/// Verify @implements declarations against interface traits
+fn verify_poly(file: &PathBuf) -> MietteResult<()> {
+    println!("🔍 Verifying @implements in {}", file.display());
+    let source = fs::read_to_string(file).into_diagnostic()?;
+
+    let parsed = parse_poly(&source).map_err(|e| {
+        miette::miette!("Parse error: {}", e)
+    })?;
+
+    let errors = verify_implementations(&parsed);
+
+    if errors.is_empty() {
+        println!("✅ All @implements declarations are valid");
+        Ok(())
+    } else {
+        println!("\n❌ Found {} verification error(s):\n", errors.len());
+        for err in &errors {
+            eprintln!("   {} (line {}): class `{}` @implements({}):",
+                err.lang_tag, err.line, err.class_name, err.trait_name);
+            eprintln!("      {}\n", err.message);
+        }
+        Err(miette::miette!(
+            "{} @implements verification error(s) found",
+            errors.len()
+        ))
+    }
+}
+
+/// Generate WIT file from a poly file (writes to <name>.wit)
+fn generate_wit_file(file: &PathBuf) -> MietteResult<()> {
+    let wit_path = file.with_extension("wit");
+    generate_wit_file_to(file, Some(wit_path))
+}
+
+/// Generate WIT file from a poly file to specified output
+fn generate_wit_file_to(file: &PathBuf, output: Option<PathBuf>) -> MietteResult<()> {
+    use polyglot::wit_gen::generate_wit_for_file;
+
+    let source = fs::read_to_string(file).into_diagnostic()?;
+    let filename = file.display().to_string();
+
+    let parsed = parse_poly(&source).map_err(|e| {
+        miette::miette!("Parse error: {}", e)
+    })?;
+
+    let wit = generate_wit_for_file(&parsed, &filename).map_err(|e| {
+        miette::miette!("WIT generation error: {}", e)
+    })?;
+
+    let output_path = output.unwrap_or_else(|| file.with_extension("wit"));
+    fs::write(&output_path, &wit).into_diagnostic()?;
+
+    println!("📄 Generated WIT: {}", output_path.display());
+    println!("{}", wit);
+
+    Ok(())
+}
+
+fn build_poly(file: &PathBuf, release: bool, test_mode: bool) -> MietteResult<PathBuf> {
     println!("🔨 Compiling {}", file.display());
-    let source = fs::read_to_string(file)?;
-    let mut parsed = parse_poly(&source).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let source = fs::read_to_string(file).into_diagnostic()?;
+    let filename = file.display().to_string();
+
+    // Create source holder for error reporting
+    let poly_src = PolySource::new(&filename, &source);
+
+    let mut parsed = match parse_poly(&source) {
+        Ok(p) => p,
+        Err(e) => {
+            // Convert parse error to miette diagnostic
+            let err_msg = e.to_string();
+            return Err(ParseDiagnostic {
+                message: err_msg.clone(),
+                src: poly_src.named_source(),
+                span: diagnostic::line_span(&source, 1), // Default to first line if no position
+            }.into());
+        }
+    };
 
     // Resolve imports - load and merge imported files
     let base_dir = file.parent().unwrap_or(std::path::Path::new("."));
     resolve_imports(&mut parsed, base_dir)?;
+
+    // Phase 26b: Verify @implements declarations match interface traits
+    let impl_errors = verify_implementations(&parsed);
+    if !impl_errors.is_empty() {
+        println!("\n❌ @implements Verification Errors:");
+        for err in &impl_errors {
+            eprintln!("   {} (line {}): class `{}` @implements({}):",
+                err.lang_tag, err.line, err.class_name, err.trait_name);
+            eprintln!("      {}", err.message);
+        }
+        return Err(miette::miette!(
+            "{} @implements verification error(s) found",
+            impl_errors.len()
+        ));
+    }
 
     // Validate interface contracts
     if let Err(errors) = validate(&parsed) {
@@ -301,7 +618,7 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool) -> anyhow::Result<
         for err in &errors {
             eprintln!("   {}", err);
         }
-        return Err(anyhow::anyhow!(
+        return Err(miette::miette!(
             "{} validation error(s) found",
             errors.len()
         ));
@@ -321,25 +638,108 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool) -> anyhow::Result<
             }
             println!("✅ Successfully compiled {} bytes", wasm.len());
             let out_path = file.with_extension("wasm");
-            fs::write(&out_path, wasm)?;
+            fs::write(&out_path, wasm).into_diagnostic()?;
             println!("📦 Wrote to {}", out_path.display());
             Ok(out_path)
         }
         Err(e) => {
-            eprintln!("❌ Compilation error: {}", e);
-            Err(anyhow::anyhow!("Compilation failed"))
+            // Convert compile errors to miette diagnostics with source context
+            match &e {
+                CompileError::Build(msg) if msg.contains("No main function found") => {
+                    return Err(NoMainError {
+                        src: poly_src.named_source(),
+                        span: (0, source.len().min(50)).into(),
+                        block_count: parsed.blocks.len(),
+                    }.into());
+                }
+                CompileError::Build(msg) if msg.contains("Multiple main functions found") => {
+                    // Find main function locations
+                    let mut first_span = (0usize, 10usize);
+                    let mut second_span = (0usize, 10usize);
+
+                    for (i, block) in parsed.blocks.iter().enumerate() {
+                        if block.code.contains("fn main(") || block.code.contains("def main(") {
+                            let offset = diagnostic::line_col_to_offset(&source, block.start_line, 1);
+                            if first_span.0 == 0 && i == 0 || first_span == (0, 10) {
+                                first_span = (offset, 15);
+                            } else {
+                                second_span = (offset, 15);
+                                break;
+                            }
+                        }
+                    }
+
+                    return Err(MultipleMainError {
+                        src: poly_src.named_source(),
+                        first: first_span.into(),
+                        second: second_span.into(),
+                    }.into());
+                }
+                CompileError::UnknownLanguage(tag) => {
+                    // Find the unknown language tag in source
+                    let pattern = format!("#[{}]", tag);
+                    let span = diagnostic::find_pattern_span(&source, &pattern, 0)
+                        .unwrap_or_else(|| (0, 10).into());
+
+                    return Err(diagnostic::UnknownLanguageError {
+                        tag: tag.clone(),
+                        src: poly_src.named_source(),
+                        span,
+                    }.into());
+                }
+                CompileError::Other(ref anyhow_err) => {
+                    let err_str = anyhow_err.to_string();
+
+                    // Check if this is a Rust compilation error with details
+                    if err_str.contains("Rust compilation failed") {
+                        // Find the first Rust or main block for context
+                        let rust_block_line = parsed.blocks.iter()
+                            .find(|b| matches!(b.lang_tag.as_str(), "rust" | "rs" | "main"))
+                            .map(|b| b.start_line)
+                            .unwrap_or(1);
+
+                        let span_offset = diagnostic::line_col_to_offset(&source, rust_block_line, 1);
+
+                        // Print the detailed error directly (miette will also show context)
+                        eprintln!("\n{}", err_str);
+
+                        return Err(RustCompileError {
+                            src: poly_src.named_source(),
+                            span: diagnostic::span_to_eol(&source, span_offset),
+                            details: err_str,
+                        }.into());
+                    }
+
+                    // Generic build error
+                    return Err(diagnostic::BuildError {
+                        message: err_str,
+                        src: Some(poly_src.named_source()),
+                        span: Some((0, 1).into()),
+                        suggestion: None,
+                    }.into());
+                }
+                _ => {
+                    // Generic build error - show with source context if possible
+                    return Err(diagnostic::BuildError {
+                        message: e.to_string(),
+                        src: Some(poly_src.named_source()),
+                        span: Some((0, 1).into()),
+                        suggestion: None,
+                    }.into());
+                }
+            }
         }
     }
 }
 
-fn run_wasm(wasm_path: &PathBuf, args: &[String]) -> anyhow::Result<()> {
+fn run_wasm(wasm_path: &PathBuf, args: &[String]) -> MietteResult<()> {
     println!("🚀 Running {}...\n", wasm_path.display());
 
     let mut cmd = Command::new("wasmtime");
     cmd.arg(wasm_path);
     cmd.args(args);
 
-    let status = cmd.status()?;
+    let status = cmd.status().into_diagnostic()?;
 
     if !status.success() {
         if let Some(code) = status.code() {
@@ -350,7 +750,7 @@ fn run_wasm(wasm_path: &PathBuf, args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_project(name: Option<String>) -> anyhow::Result<()> {
+fn init_project(name: Option<String>) -> MietteResult<()> {
     let project_name = name.unwrap_or_else(|| {
         std::env::current_dir()
             .ok()
@@ -380,7 +780,7 @@ fn main() {{
 "#
     );
 
-    fs::write("main.poly", main_poly)?;
+    fs::write("main.poly", main_poly).into_diagnostic()?;
     println!("📝 Created main.poly");
 
     // Create poly.toml (project manifest)
@@ -396,7 +796,7 @@ version = "0.1.0"
         project_name
     );
 
-    fs::write("poly.toml", poly_toml)?;
+    fs::write("poly.toml", poly_toml).into_diagnostic()?;
     println!("📝 Created poly.toml");
 
     println!("\n✅ Project initialized! Run:");
@@ -407,18 +807,18 @@ version = "0.1.0"
 }
 
 /// Create a new project from a template
-fn new_from_template(template: &str, name: Option<String>) -> anyhow::Result<()> {
+fn new_from_template(template: &str, name: Option<String>) -> MietteResult<()> {
     let project_name = name.unwrap_or_else(|| template.to_string());
     let project_dir = PathBuf::from(&project_name);
 
     if project_dir.exists() {
-        return Err(anyhow::anyhow!(
+        return Err(miette::miette!(
             "Directory '{}' already exists",
             project_name
         ));
     }
 
-    fs::create_dir_all(&project_dir)?;
+    fs::create_dir_all(&project_dir).into_diagnostic()?;
 
     println!("🎉 Creating {} project: {}", template, project_name);
 
@@ -427,14 +827,14 @@ fn new_from_template(template: &str, name: Option<String>) -> anyhow::Result<()>
         "ml-demo" => get_ml_template(&project_name),
         "game" => get_game_template(&project_name),
         _ => {
-            return Err(anyhow::anyhow!(
+            return Err(miette::miette!(
                 "Unknown template '{}'. Available: react-app, ml-demo, game",
                 template
             ));
         }
     };
 
-    fs::write(project_dir.join("main.poly"), main_poly)?;
+    fs::write(project_dir.join("main.poly"), main_poly).into_diagnostic()?;
     println!("📝 Created main.poly");
 
     // Create poly.toml
@@ -446,7 +846,7 @@ template = "{}"
 "#,
         project_name, template
     );
-    fs::write(project_dir.join("poly.toml"), poly_toml)?;
+    fs::write(project_dir.join("poly.toml"), poly_toml).into_diagnostic()?;
     println!("📝 Created poly.toml");
 
     println!("\n✅ Project created! Run:");
@@ -1006,14 +1406,14 @@ fn main() {{
 }
 
 /// Resolve imports by loading and merging imported .poly files
-fn resolve_imports(parsed: &mut ParsedFile, base_dir: &Path) -> anyhow::Result<()> {
+fn resolve_imports(parsed: &mut ParsedFile, base_dir: &Path) -> MietteResult<()> {
     use std::collections::HashSet;
 
     fn resolve_inner(
         parsed: &mut ParsedFile,
         base_dir: &Path,
         visited: &mut HashSet<PathBuf>,
-    ) -> anyhow::Result<()> {
+    ) -> MietteResult<()> {
         // Take imports to avoid borrowing issues
         let imports = std::mem::take(&mut parsed.imports);
 
@@ -1035,15 +1435,15 @@ fn resolve_imports(parsed: &mut ParsedFile, base_dir: &Path) -> anyhow::Result<(
             }
 
             if !import_path.exists() {
-                return Err(anyhow::anyhow!("Import not found: {}", import.path));
+                return Err(miette::miette!("Import not found: {}", import.path));
             }
 
             println!("   ← {}", import.path);
             visited.insert(import_path.clone());
 
-            let import_source = fs::read_to_string(&import_path)?;
+            let import_source = fs::read_to_string(&import_path).into_diagnostic()?;
             let mut import_parsed = parse_poly(&import_source)
-                .map_err(|e| anyhow::anyhow!("Error parsing {}: {}", import.path, e))?;
+                .map_err(|e| miette::miette!("Error parsing {}: {}", import.path, e))?;
 
             // Recursively resolve nested imports FIRST
             let child_base = import_path.parent().unwrap_or(base_dir);
@@ -1068,7 +1468,7 @@ fn resolve_imports(parsed: &mut ParsedFile, base_dir: &Path) -> anyhow::Result<(
 }
 
 /// Watch mode with hot reload
-fn watch_poly(file: &PathBuf, port: u16, open: bool) -> anyhow::Result<()> {
+fn watch_poly(file: &PathBuf, port: u16, open: bool) -> MietteResult<()> {
     use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
     use std::sync::mpsc::channel;
     use std::thread;
@@ -1094,8 +1494,8 @@ fn watch_poly(file: &PathBuf, port: u16, open: bool) -> anyhow::Result<()> {
 
     // Start file watcher in a thread
     let (tx, rx) = channel();
-    let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-    watcher.watch(&watch_dir, RecursiveMode::Recursive)?;
+    let mut watcher = RecommendedWatcher::new(tx, Config::default()).into_diagnostic()?;
+    watcher.watch(&watch_dir, RecursiveMode::Recursive).into_diagnostic()?;
 
     // Spawn watcher thread
     thread::spawn(move || {
@@ -1140,7 +1540,7 @@ fn watch_poly(file: &PathBuf, port: u16, open: bool) -> anyhow::Result<()> {
     // Start HTTP server
     let addr = format!("127.0.0.1:{}", port);
     let server = tiny_http::Server::http(&addr)
-        .map_err(|e| anyhow::anyhow!("Failed to start server: {}", e))?;
+        .map_err(|e| miette::miette!("Failed to start server: {}", e))?;
 
     println!("\n🌐 Dev server running at http://localhost:{}", port);
     println!("   Serving: {}", html_path.display());
@@ -1227,16 +1627,16 @@ fn rebuild_for_watch(
     file: &PathBuf,
     html_path: &PathBuf,
     version: &Arc<AtomicU64>,
-) -> anyhow::Result<()> {
+) -> MietteResult<()> {
     // Build WASM first
-    let source = fs::read_to_string(file)?;
-    let mut parsed = parse_poly(&source).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let source = fs::read_to_string(file).into_diagnostic()?;
+    let mut parsed = parse_poly(&source).map_err(|e| miette::miette!("{}", e))?;
 
     let base_dir = file.parent().unwrap_or(Path::new("."));
     resolve_imports(&mut parsed, base_dir)?;
 
     if let Err(errors) = validate(&parsed) {
-        return Err(anyhow::anyhow!("Validation failed: {:?}", errors));
+        return Err(miette::miette!("Validation failed: {:?}", errors));
     }
 
     let opts = CompileOptions {
@@ -1244,16 +1644,16 @@ fn rebuild_for_watch(
         ..Default::default()
     };
 
-    let wasm = compile(&parsed, &opts)?;
+    let wasm = compile(&parsed, &opts).into_diagnostic()?;
 
     // Bundle to HTML
     let temp_dir = file
         .parent()
         .unwrap_or(Path::new("."))
         .join("target/polyglot_tmp");
-    let bundle = polyglot::compiler::bundle_to_single_file(&temp_dir, &wasm, "Polyglot Dev")?;
+    let bundle = polyglot::compiler::bundle_to_single_file(&temp_dir, &wasm, "Polyglot Dev").into_diagnostic()?;
 
-    fs::write(html_path, &bundle)?;
+    fs::write(html_path, &bundle).into_diagnostic()?;
 
     // Increment version
     version.fetch_add(1, Ordering::SeqCst);

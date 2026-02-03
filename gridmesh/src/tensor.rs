@@ -1,6 +1,5 @@
 use crate::header::{BorrowError, TensorHeader};
 use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
 
 // Placeholder for now, can be expanded to constrain T
 pub trait TensorElement {}

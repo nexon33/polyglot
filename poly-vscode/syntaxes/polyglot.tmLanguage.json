@@ -92,13 +92,14 @@
             ]
         },
         "interface-block": {
-            "begin": "^\\s*(#\\[interface\\])\\s*$",
+            "begin": "^\\s*(#\\[interface\\])\\s*\\{?\\s*$",
             "beginCaptures": {
                 "1": {
-                    "name": "keyword.control.directive.polyglot"
+                    "name": "keyword.control.directive.polyglot keyword.control.interface.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|javascript|js|jsx|typescript|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "meta.embedded.block.interface.polyglot",
             "patterns": [
                 {
                     "match": "\\b(fn)\\s+(\\w+)",
@@ -132,12 +133,33 @@
             "begin": "^\\s*(#\\[(rust|rs)(:[^\\]]+)?\\])\\s*$",
             "beginCaptures": {
                 "1": {
-                    "name": "keyword.control.directive.polyglot"
+                    "name": "keyword.control.directive.polyglot keyword.control.rust.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
-            "contentName": "meta.embedded.rust",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|javascript|js|jsx|typescript|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "meta.embedded.block.rust.polyglot",
             "patterns": [
+                {
+                    "include": "#polyglot-decorators"
+                },
+                {
+                    "include": "#polyglot-class-keywords"
+                },
+                {
+                    "include": "#polyglot-function-keywords"
+                },
+                {
+                    "include": "#polyglot-arrow-functions"
+                },
+                {
+                    "include": "#polyglot-self-this"
+                },
+                {
+                    "include": "#polyglot-python-operators"
+                },
+                {
+                    "include": "#polyglot-keywords"
+                },
                 {
                     "include": "#polyglot-visibility-rust"
                 },
@@ -299,17 +321,35 @@
             ]
         },
         "python-block": {
-            "begin": "^\\s*(#\\[(python|py)(:[^\\]]+)?\\])\\s*$",
+            "begin": "^\\s*(#\\[(python|py)(:[^\\]]+)?\\])\\s*\\{?\\s*$",
             "beginCaptures": {
                 "1": {
-                    "name": "keyword.control.directive.polyglot"
+                    "name": "keyword.control.directive.polyglot keyword.control.python.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
-            "contentName": "meta.embedded.python",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|javascript|js|jsx|typescript|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "meta.embedded.block.python.polyglot",
             "patterns": [
                 {
+                    "include": "#polyglot-decorators"
+                },
+                {
+                    "include": "#polyglot-class-keywords"
+                },
+                {
+                    "include": "#polyglot-function-keywords"
+                },
+                {
+                    "include": "#polyglot-arrow-functions"
+                },
+                {
+                    "include": "#polyglot-self-this"
+                },
+                {
                     "include": "#polyglot-visibility-python"
+                },
+                {
+                    "include": "#rust-attributes"
                 },
                 {
                     "include": "#python-keywords"
@@ -338,14 +378,14 @@
             ]
         },
         "main-block": {
-            "begin": "^\\s*(#\\[main(:[^\\]]+)?\\])\\s*$",
+            "begin": "^\\s*(#\\[main(:[^\\]]+)?\\])\\s*\\{?\\s*$",
             "beginCaptures": {
                 "1": {
-                    "name": "keyword.control.directive.polyglot"
+                    "name": "keyword.control.directive.polyglot keyword.control.main.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])|\\z",
-            "contentName": "meta.embedded.rust",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|javascript|js|jsx|typescript|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])|\\z",
+            "contentName": "meta.embedded.block.main.polyglot",
             "patterns": [
                 {
                     "include": "#polyglot-visibility-rust"
@@ -356,15 +396,30 @@
             ]
         },
         "js-block": {
-            "begin": "^\\s*(#\\[(js|jsx)(:[^\\]]+)?\\])\\s*$",
+            "begin": "^\\s*(#\\[(javascript|js|jsx)(:[^\\]]+)?\\])\\s*\\{?\\s*$",
             "beginCaptures": {
                 "1": {
-                    "name": "keyword.control.directive.polyglot"
+                    "name": "keyword.control.directive.polyglot keyword.control.javascript.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|jsx|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
-            "contentName": "meta.embedded.js",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|javascript|js|jsx|typescript|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "meta.embedded.block.javascript.polyglot",
             "patterns": [
+                {
+                    "include": "#polyglot-decorators"
+                },
+                {
+                    "include": "#polyglot-arrow-functions"
+                },
+                {
+                    "include": "#polyglot-self-this"
+                },
+                {
+                    "include": "#polyglot-python-operators"
+                },
+                {
+                    "include": "#polyglot-keywords"
+                },
                 {
                     "include": "#js-template-string"
                 },
@@ -389,15 +444,27 @@
             ]
         },
         "ts-block": {
-            "begin": "^\\s*(#\\[(ts|tsx|typescript)\\])\\s*$",
+            "begin": "^\\s*(#\\[(typescript|ts|tsx)(:[^\\]]+)?\\])\\s*\\{?\\s*$",
             "beginCaptures": {
                 "1": {
-                    "name": "keyword.control.directive.polyglot"
+                    "name": "keyword.control.directive.polyglot keyword.control.typescript.polyglot"
                 }
             },
-            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|js|ts|tsx|typescript|rscss|gpu|html|main)\\])",
-            "contentName": "meta.embedded.ts",
+            "end": "(?=^\\s*#\\[(types|interface|rust|rs|python|py|javascript|js|jsx|typescript|ts|tsx|rscss|css|gpu|wgsl|html|main|test|doc|toml|json|md)(:[^\\]]+)?\\])",
+            "contentName": "meta.embedded.block.typescript.polyglot",
             "patterns": [
+                {
+                    "include": "#polyglot-decorators"
+                },
+                {
+                    "include": "#polyglot-class-keywords"
+                },
+                {
+                    "include": "#polyglot-arrow-functions"
+                },
+                {
+                    "include": "#polyglot-self-this"
+                },
                 {
                     "include": "#ts-types"
                 },
@@ -903,6 +970,105 @@
                 }
             },
             "name": "meta.macro-call.polyglot"
+        },
+        "polyglot-decorators": {
+            "comment": "Phase 24: Python-style @decorator support",
+            "patterns": [
+                {
+                    "match": "^\\s*(@)([a-zA-Z_][a-zA-Z0-9_.]*)(?:\\(([^)]*)\\))?",
+                    "captures": {
+                        "1": {
+                            "name": "punctuation.definition.decorator.polyglot"
+                        },
+                        "2": {
+                            "name": "entity.name.function.decorator.polyglot"
+                        },
+                        "3": {
+                            "name": "meta.decorator.arguments.polyglot"
+                        }
+                    }
+                }
+            ]
+        },
+        "polyglot-arrow-functions": {
+            "comment": "Phase 24: JS-style arrow function support",
+            "patterns": [
+                {
+                    "match": "(=>)",
+                    "name": "keyword.operator.arrow.polyglot"
+                },
+                {
+                    "match": "(const|let|var)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*=\\s*(async\\s+)?\\([^)]*\\)\\s*=>",
+                    "captures": {
+                        "1": {
+                            "name": "keyword.control.declaration.polyglot"
+                        },
+                        "2": {
+                            "name": "entity.name.function.polyglot"
+                        },
+                        "3": {
+                            "name": "keyword.control.async.polyglot"
+                        }
+                    }
+                },
+                {
+                    "match": "([a-zA-Z_][a-zA-Z0-9_]*)\\s*=\\s*\\([^)]*\\)\\s*=>",
+                    "captures": {
+                        "1": {
+                            "name": "entity.name.function.polyglot"
+                        }
+                    }
+                }
+            ]
+        },
+        "polyglot-self-this": {
+            "comment": "Phase 24: Unified self/this reference",
+            "match": "\\b(self|this)\\b",
+            "name": "variable.language.this.polyglot"
+        },
+        "polyglot-function-keywords": {
+            "comment": "Phase 24: Unified def/fn function keywords",
+            "patterns": [
+                {
+                    "match": "\\b(async\\s+)?(fn|def)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+                    "captures": {
+                        "1": {
+                            "name": "keyword.control.async.polyglot"
+                        },
+                        "2": {
+                            "name": "keyword.control.function.polyglot"
+                        },
+                        "3": {
+                            "name": "entity.name.function.polyglot"
+                        }
+                    }
+                }
+            ]
+        },
+        "polyglot-class-keywords": {
+            "comment": "Phase 24: Class definition support",
+            "match": "\\b(class)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\\s*\\(([^)]*)\\))?",
+            "captures": {
+                "1": {
+                    "name": "keyword.control.class.polyglot"
+                },
+                "2": {
+                    "name": "entity.name.type.class.polyglot"
+                },
+                "3": {
+                    "name": "entity.other.inherited-class.polyglot"
+                }
+            }
+        },
+        "polyglot-python-operators": {
+            "comment": "Phase 24: Python-style operators (and, or, not, is)",
+            "match": "\\b(and|or|not|is)\\b",
+            "name": "keyword.operator.logical.polyglot"
+        },
+        "polyglot-keywords": {
+            "comment": "Phase 24: Python keywords that might appear in mixed blocks",
+            "match": "\\b(None|True|False|elif|yield|pass)\\b",
+            "name": "constant.language.polyglot"
         }
     }
 }

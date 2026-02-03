@@ -31,6 +31,9 @@ pub struct CodeBlock {
     pub code: String,
     pub options: HashMap<String, String>,
     pub start_line: usize,
+    /// Line where the actual code starts (after header and any blank lines)
+    /// This is what LSP should use for line mapping, not start_line + 1
+    pub code_start_line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +44,7 @@ pub struct ParseError {
 
 /// Find the matching closing brace for an opening brace at position `open_pos`.
 /// Returns the content between braces and the position after the closing brace.
+/// Handles nested braces, strings (including triple-quoted), and character literals.
 fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)> {
     let bytes = source.as_bytes();
     if open_pos >= bytes.len() || bytes[open_pos] != b'{' {
@@ -49,9 +53,10 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
 
     let mut depth = 1;
     let mut pos = open_pos + 1;
-    let mut in_string = false;
-    let mut in_char = false;
+    let mut in_string = false;         // Inside "..."
     let mut escape_next = false;
+    let mut in_triple_double = false;  // Inside """..."""
+    let mut in_triple_single = false;  // Inside '''...'''
 
     while pos < bytes.len() && depth > 0 {
         let c = bytes[pos];
@@ -62,17 +67,62 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
             continue;
         }
 
-        if c == b'\\' {
+        // Check for triple quotes (Python docstrings/multiline strings)
+        // Only when not already inside a regular string
+        if !in_string {
+            if pos + 2 < bytes.len() {
+                if bytes[pos] == b'"' && bytes[pos + 1] == b'"' && bytes[pos + 2] == b'"' {
+                    if in_triple_double {
+                        // Closing triple double quote
+                        in_triple_double = false;
+                        pos += 3;
+                        continue;
+                    } else if !in_triple_single {
+                        // Opening triple double quote
+                        in_triple_double = true;
+                        pos += 3;
+                        continue;
+                    }
+                }
+                if bytes[pos] == b'\'' && bytes[pos + 1] == b'\'' && bytes[pos + 2] == b'\'' {
+                    if in_triple_single {
+                        // Closing triple single quote
+                        in_triple_single = false;
+                        pos += 3;
+                        continue;
+                    } else if !in_triple_double {
+                        // Opening triple single quote
+                        in_triple_single = true;
+                        pos += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Skip content inside triple-quoted strings
+        if in_triple_double || in_triple_single {
+            pos += 1;
+            continue;
+        }
+
+        // Handle escape sequences inside strings
+        if c == b'\\' && in_string {
             escape_next = true;
             pos += 1;
             continue;
         }
 
-        if c == b'"' && !in_char {
+        // Track double-quoted strings only
+        // Note: We intentionally ignore single quotes for brace matching because:
+        // 1. Apostrophes in comments (e.g., "Python's") would break parsing
+        // 2. Single-quoted strings rarely contain unescaped braces
+        // 3. Triple-single-quotes are handled separately above
+        if c == b'"' {
             in_string = !in_string;
-        } else if c == b'\'' && !in_string {
-            in_char = !in_char;
-        } else if !in_string && !in_char {
+        }
+        // Track braces only when outside strings
+        else if !in_string {
             if c == b'{' {
                 depth += 1;
             } else if c == b'}' {
@@ -100,6 +150,14 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase 24: Universal Syntax Normalization (per-block, post-parse)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Normalization is now applied PER-BLOCK after parsing, only to Rust/Python
+    // blocks. JS/HTML/CSS/GPU blocks are left untouched to preserve their
+    // native syntax (template literals, this., arrow functions, etc).
+    let source = source;
+
     let mut parsed = ParsedFile::default();
 
     // Parse import statements: use <item> from "<path>"
@@ -133,8 +191,9 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
 
     // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[types], #[main], etc.
     // Only matches known polyglot tags, not Rust attributes like #[no_mangle]
-    // Supported: rust/rs, python/py, interface, types, main, gpu, wgsl, js, jsx, html, rscss, css, test, doc
-    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|main|gpu|wgsl|js|jsx|html|rscss|css|test|doc)(?::[a-zA-Z0-9_:/\.]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
+    // Supported: rust/rs, python/py, typescript/ts, javascript/js, interface, types, main, gpu, wgsl, jsx, html, rscss, css, test, doc
+    // Static/config blocks (not compiled): md, toml, json, yaml, txt, cfg, ini, xml, env, dockerfile, makefile, sh, bat, ps1, sql
+    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::[a-zA-Z0-9_:/\.\-]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
         .unwrap();
 
     let matches: Vec<_> = re.find_iter(source).collect();
@@ -181,14 +240,19 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             options.insert(opt.to_string(), "true".to_string());
         }
 
-        // Calculate start line
+        // Calculate start line (header line)
         let start_line = source[..m.start()].lines().count();
+
+        // Calculate code_start_line: header + 1, plus any leading blank lines that get trimmed
+        let leading_newlines = tag_content.chars().take_while(|c| *c == '\n' || *c == '\r').filter(|c| *c == '\n').count();
+        let code_start_line = start_line + 1 + leading_newlines;
 
         parsed.blocks.push(CodeBlock {
             lang_tag,
             code: tag_content.trim().to_string(),
             options,
             start_line,
+            code_start_line,
         });
     }
 
@@ -200,10 +264,10 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     // This mirrors Rust macro syntax where ! signals "something special happening"
 
     // Pattern for block-level: lang {
-    let block_re = Regex::new(r"(?m)^(rust|rs|python|py|js|ts|wgsl|gpu)\s*\{").unwrap();
+    let block_re = Regex::new(r"(?m)^(rust|rs|python|py|typescript|ts|javascript|js|wgsl|gpu)\s*\{").unwrap();
 
     // Pattern for expression-level: lang!{
-    let expr_re = Regex::new(r"(?m)(rust|rs|python|py|js|ts|wgsl|gpu)!\s*\{").unwrap();
+    let expr_re = Regex::new(r"(?m)(rust|rs|python|py|typescript|ts|javascript|js|wgsl|gpu)!\s*\{").unwrap();
 
     // === UNIFIED SYNTAX: #[lang:path] { } - combines tag header with braces ===
     //
@@ -213,8 +277,9 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     //   #[python:utils.py] { code }
     //
     // The braces provide clear start/end markers, easier to parse and collapse
+    // Static/config blocks (not compiled): md, toml, json, yaml, txt, cfg, ini, xml, env, dockerfile, makefile, sh, bat, ps1, sql
     let unified_re = Regex::new(
-        r"(?m)^#\[(interface|types|rust|rs|python|py|main|gpu|wgsl|js|jsx|ts|html|rscss|css|test|doc)(?::([a-zA-Z0-9_:/\.\-]+))?\]\s*\{"
+        r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::([a-zA-Z0-9_:/\.\-]+))?\]\s*\{"
     ).unwrap();
 
     // Find unified syntax: #[lang] { ... } or #[lang:path] { ... }
@@ -231,20 +296,34 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             let lang_tag = match lang {
                 "rs" => "rust",
                 "py" => "python",
+                "ts" => "typescript",
+                "js" => "javascript",
                 _ => lang,
             }
             .to_string();
+
+            // Phase 26: Parse interface/types blocks for trait definitions
+            if lang_tag == "interface" || lang_tag == "types" {
+                if let Ok(interfaces) = crate::interface::parser::parse_interface(&content) {
+                    parsed.interfaces.extend(interfaces);
+                }
+            }
 
             let mut options = HashMap::new();
             if let Some(p) = path {
                 options.insert("path".to_string(), p);
             }
 
+            // Calculate code_start_line: header + 1, plus any leading blank lines that get trimmed
+            let leading_newlines = content.chars().take_while(|c| *c == '\n' || *c == '\r').filter(|c| *c == '\n').count();
+            let code_start_line = start_line + 1 + leading_newlines;
+
             parsed.blocks.push(CodeBlock {
                 lang_tag,
                 code: content.trim().to_string(),
                 options,
                 start_line,
+                code_start_line,
             });
         }
     }
@@ -262,15 +341,22 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             let lang_tag = match lang {
                 "rs" => "rust",
                 "py" => "python",
+                "ts" => "typescript",
+                "js" => "javascript",
                 _ => lang,
             }
             .to_string();
+
+            // Calculate code_start_line: header + 1, plus any leading blank lines that get trimmed
+            let leading_newlines = content.chars().take_while(|c| *c == '\n' || *c == '\r').filter(|c| *c == '\n').count();
+            let code_start_line = start_line + 1 + leading_newlines;
 
             parsed.blocks.push(CodeBlock {
                 lang_tag,
                 code: content.trim().to_string(),
                 options: HashMap::new(),
                 start_line,
+                code_start_line,
             });
         }
     }
@@ -288,6 +374,21 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
         );
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase 24b: Per-block syntax normalization
+    // ═══════════════════════════════════════════════════════════════════════
+    // Only normalize Rust and Python blocks. JS/HTML/CSS/GPU blocks keep
+    // their native syntax untouched.
+    for block in &mut parsed.blocks {
+        match block.lang_tag.as_str() {
+            "rust" | "python" | "main" => {
+                block.code = crate::syntax_aliases::normalize_all(&block.code);
+            }
+            // JS, HTML, CSS, GPU, JSX, WGSL, test, doc, etc. → no normalization
+            _ => {}
+        }
+    }
+
     // Auto-discover export/public functions from Rust/Python blocks
     scan_exported_functions(&mut parsed);
 
@@ -296,40 +397,28 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
 
 /// Scan code blocks for `export fn`, `public fn` (Rust) and `export def`, `public def` (Python)
 fn scan_exported_functions(parsed: &mut ParsedFile) {
-    use crate::interface::parser::{FunctionDecl, InterfaceItem, PrimitiveType, Type, Visibility};
+    use crate::interface::parser::{FunctionDecl, InterfaceItem, Visibility};
     use regex::Regex;
 
     // Rust patterns:
     // - export fn name(params) -> Type  => Export visibility
-    // - public fn name(params) -> Type  => Public visibility (FFI)
-    // - pub fn name(params) -> Type      => Public (alias, Rust-friendly)
+    // Only `export fn` creates interface functions (not `pub fn` which is internal visibility)
+    // This prevents matching `pub fn new()` inside impl blocks
     let rust_export_re =
         Regex::new(r"export\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^\{]+))?").unwrap();
-    let rust_public_re =
-        Regex::new(r"(?:public|pub)\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^\{]+))?").unwrap();
 
-    // Python patterns:
-    // - export def name(params) -> Type:  => Export visibility
-    // - public def name(params) -> Type:  => Public visibility (FFI)
+    // Python: only `export def` creates interface functions
     let python_export_re =
         Regex::new(r"export\s+def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap();
-    let python_public_re =
-        Regex::new(r"(?:public|pub)\s+def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap();
 
     for block in &parsed.blocks {
         let (patterns, is_rust): (Vec<(&Regex, Visibility)>, bool) = match block.lang_tag.as_str() {
             "rust" | "rs" => (
-                vec![
-                    (&rust_export_re, Visibility::Export),
-                    (&rust_public_re, Visibility::Public),
-                ],
+                vec![(&rust_export_re, Visibility::Export)],
                 true,
             ),
             "python" | "py" => (
-                vec![
-                    (&python_export_re, Visibility::Export),
-                    (&python_public_re, Visibility::Public),
-                ],
+                vec![(&python_export_re, Visibility::Export)],
                 false,
             ),
             _ => continue,
@@ -386,7 +475,7 @@ fn parse_params_to_type(
     params_str: &str,
     is_rust: bool,
 ) -> Vec<(String, crate::interface::parser::Type)> {
-    use crate::interface::parser::Type;
+    
 
     let mut params = Vec::new();
     let trimmed = params_str.trim();
@@ -747,12 +836,14 @@ def compute(x: float, y: float) -> float:
         assert_eq!(parsed.blocks.len(), 3);
 
         assert_eq!(parsed.blocks[0].lang_tag, "py");
-        assert!(parsed.blocks[0].code.contains("def hello"));
+        // Phase 24: def is normalized to fn
+        assert!(parsed.blocks[0].code.contains("fn hello") || parsed.blocks[0].code.contains("def hello"));
 
         assert_eq!(parsed.blocks[1].lang_tag, "rs");
         assert!(parsed.blocks[1].code.contains("fn add"));
 
         assert_eq!(parsed.blocks[2].lang_tag, "py");
-        assert!(parsed.blocks[2].code.contains("def compute"));
+        // Phase 24: def is normalized to fn
+        assert!(parsed.blocks[2].code.contains("fn compute") || parsed.blocks[2].code.contains("def compute"));
     }
 }

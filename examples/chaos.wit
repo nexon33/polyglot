@@ -1,0 +1,23 @@
+package polyglot:chaos@0.1.0;
+
+interface processor {
+    process: func(data: list<s32>) -> s32;
+    name: func() -> string;
+}
+
+interface filter {
+    filter: func(data: list<s32>, threshold: s32) -> list<s32>;
+    description: func() -> string;
+}
+
+interface viewer {
+    render: func(data: list<s32>) -> string;
+    set-state: func(state: string);
+    get-state: func() -> string;
+}
+
+world chaos {
+    export processor;
+    export filter;
+    export viewer;
+}

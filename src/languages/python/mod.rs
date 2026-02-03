@@ -1,6 +1,6 @@
 use crate::languages::Language;
 use crate::parser::{parse_python_params, parse_python_type, ParseError};
-use crate::types::{CompileOptions, FunctionSig, Param, WitType};
+use crate::types::{CompileOptions, FunctionSig, WitType};
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use std::fs;
@@ -13,6 +13,7 @@ impl Python {
         Self
     }
 
+    #[allow(dead_code)]
     fn to_lang_type(&self, wit_type: &WitType, options: &CompileOptions) -> String {
         match wit_type {
             WitType::Bool => "bool".to_string(),
@@ -65,7 +66,7 @@ impl Language for Python {
         // Implement compilation logic for Python
         // This creates a Rust wrapper and compiles it using Cargo to pull in rustpython_vm
 
-        let package_name = "poly_py_cell";
+        let _package_name = "poly_py_cell";
         let cargo_toml_content = r#"
 [workspace]
 
@@ -150,8 +151,10 @@ rustpython-vm = { git = "https://github.com/RustPython/RustPython", default-feat
     fn parse_signatures(&self, source: &str) -> Result<Vec<FunctionSig>, ParseError> {
         let mut sigs = Vec::new();
 
+        // Match both 'def' (original Python) and 'fn' (normalized)
+        // Also handle optional leading whitespace since blocks may be indented
         let func_regex =
-            Regex::new(r"(?m)^(async\s+)?def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^:]+))?\s*:")
+            Regex::new(r"(?m)^\s*(async\s+)?(?:def|fn)\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^:]+))?\s*:")
                 .unwrap();
 
         for caps in func_regex.captures_iter(source) {

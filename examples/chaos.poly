@@ -1,0 +1,250 @@
+// chaos.poly - Polyglot Architecture Demo
+//
+// Demonstrates the "traits as boundaries" pattern:
+// - #[interface] blocks compile to WIT
+// - @implements(Trait) for cross-language contracts
+// - Single-language inheritance within blocks
+// - Composition over cross-language inheritance
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CROSS-LANGUAGE INTERFACES (compile to WIT)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[interface] {
+    /// Data processing contract - any language can implement
+    trait Processor {
+        fn process(data: list<i32>) -> i32;
+        fn name() -> string;
+    }
+
+    /// Filtering contract with predicate support
+    trait Filter {
+        fn filter(data: list<i32>, threshold: i32) -> list<i32>;
+        fn description() -> string;
+    }
+
+    /// Stateful viewer contract
+    trait Viewer {
+        fn render(data: list<i32>) -> string;
+        fn set_state(state: string);
+        fn get_state() -> string;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PYTHON IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[python] {
+    @implements(Processor)
+    class PyProcessor:
+        """Python implementation using list comprehensions"""
+
+        def process(self, data: list[int]) -> int:
+            # Python's sum() is optimized for this
+            return sum(x * 2 for x in data if x > 0)
+
+        def name(self) -> str:
+            return "PyProcessor"
+
+    @implements(Filter)
+    class PyFilter:
+        """Pythonic filtering with list comprehensions"""
+
+        def filter(self, data: list[int], threshold: int) -> list[int]:
+            return [x for x in data if x >= threshold]
+
+        def description(self) -> str:
+            return "Python list comprehension filter"
+
+    # Single-language inheritance is fine
+    class AdvancedPyFilter(PyFilter):
+        """Extends PyFilter within Python - allowed!"""
+
+        def filter(self, data: list[int], threshold: int) -> list[int]:
+            # Add logging, then delegate to parent
+            print(f"Filtering {len(data)} items with threshold {threshold}")
+            return super().filter(data, threshold)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RUST IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[rust] {
+    /// Rust implementation using iterators
+    pub struct RustProcessor;
+
+    impl Processor for RustProcessor {
+        fn process(&self, data: Vec<i32>) -> i32 {
+            data.iter()
+                .filter(|&&x| x > 0)
+                .map(|x| x * 2)
+                .sum()
+        }
+
+        fn name(&self) -> String {
+            "RustProcessor".to_string()
+        }
+    }
+
+    /// High-performance Rust filter
+    pub struct RustFilter;
+
+    impl Filter for RustFilter {
+        fn filter(&self, data: Vec<i32>, threshold: i32) -> Vec<i32> {
+            data.into_iter()
+                .filter(|&x| x >= threshold)
+                .collect()
+        }
+
+        fn description(&self) -> String {
+            "Rust iterator-based filter".to_string()
+        }
+    }
+
+    /// Stateful viewer with interior mutability
+    pub struct RustViewer {
+        state: std::cell::RefCell<String>,
+    }
+
+    impl RustViewer {
+        pub fn new() -> Self {
+            Self {
+                state: std::cell::RefCell::new("initial".to_string()),
+            }
+        }
+    }
+
+    impl Viewer for RustViewer {
+        fn render(&self, data: Vec<i32>) -> String {
+            let state = self.state.borrow();
+            format!("[{}] Data: {:?}", state, data)
+        }
+
+        fn set_state(&self, state: String) {
+            *self.state.borrow_mut() = state;
+        }
+
+        fn get_state(&self) -> String {
+            self.state.borrow().clone()
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TYPESCRIPT IMPLEMENTATION (preferred over JS - has types!)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[typescript] {
+    @implements(Processor)
+    class TsProcessor {
+        process(data: number[]): number {
+            return data
+                .filter(x => x > 0)
+                .map(x => x * 2)
+                .reduce((a, b) => a + b, 0);
+        }
+
+        name(): string {
+            return "TsProcessor";
+        }
+    }
+
+    @implements(Filter)
+    class TsFilter {
+        filter(data: number[], threshold: number): number[] {
+            return data.filter(x => x >= threshold);
+        }
+
+        description(): string {
+            return "TypeScript array filter";
+        }
+    }
+
+    // Single-language inheritance within TS block
+    class AdvancedTsFilter extends TsFilter {
+        filter(data: number[], threshold: number): number[] {
+            console.log(`TS filtering ${data.length} items`);
+            return super.filter(data, threshold);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JAVASCRIPT IMPLEMENTATION (untyped - for legacy/quick scripts)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[javascript] {
+    @implements(Processor)
+    class JsProcessor {
+        process(data) {
+            // JS reduce for aggregation
+            return data
+                .filter(x => x > 0)
+                .map(x => x * 2)
+                .reduce((a, b) => a + b, 0);
+        }
+
+        name() {
+            return "JsProcessor";
+        }
+    }
+
+    @implements(Filter)
+    class JsFilter {
+        filter(data, threshold) {
+            return data.filter(x => x >= threshold);
+        }
+
+        description() {
+            return "JavaScript array filter";
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN - POLYMORPHIC DISPATCH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[main] {
+    pub fn main() {
+        let test_data = vec![1, -2, 3, -4, 5, 6, -7, 8, 9, 10];
+
+        // Create implementations from different languages
+        // Using Box<dyn Trait> for polymorphic dispatch
+        let processors: Vec<Box<dyn Processor>> = vec![
+            Box::new(PyProcessor),      // Python stub
+            Box::new(RustProcessor),    // Native Rust
+            Box::new(TsProcessor),      // TypeScript stub
+            Box::new(JsProcessor),      // JavaScript stub
+        ];
+
+        // Polymorphic processing - same interface, different implementations
+        println!("=== Processing ===");
+        for proc in &processors {
+            println!("{}: {}", proc.name(), proc.process(test_data.clone()));
+        }
+
+        // Filters from multiple languages
+        let filters: Vec<Box<dyn Filter>> = vec![
+            Box::new(PyFilter),
+            Box::new(RustFilter),
+            Box::new(TsFilter),
+        ];
+
+        println!("\n=== Filtering (threshold=5) ===");
+        for filter in &filters {
+            println!("{}: {:?}", filter.description(), filter.filter(test_data.clone(), 5));
+        }
+
+        // Stateful viewer (Rust only - uses interior mutability)
+        let viewer = RustViewer::new();
+        println!("\n=== Viewer ===");
+        println!("{}", viewer.render(vec![1, 2, 3]));
+        viewer.set_state("active".to_string());
+        println!("{}", viewer.render(vec![4, 5, 6]));
+
+        println!("\n✓ 4 languages, 1 interface contract!");
+    }
+}

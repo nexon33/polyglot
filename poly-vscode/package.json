@@ -35,11 +35,45 @@
                 "scopeName": "source.polyglot",
                 "path": "./syntaxes/polyglot.tmLanguage.json",
                 "embeddedLanguages": {
-                    "meta.embedded.rust": "rust",
-                    "meta.embedded.python": "python"
+                    "meta.embedded.block.rust.polyglot": "rust",
+                    "meta.embedded.block.python.polyglot": "python",
+                    "meta.embedded.block.javascript.polyglot": "javascript",
+                    "meta.embedded.block.typescript.polyglot": "typescript",
+                    "meta.embedded.block.main.polyglot": "rust",
+                    "meta.embedded.block.interface.polyglot": "rust"
                 }
             }
         ],
+        "configurationDefaults": {
+            "editor.tokenColorCustomizations": {
+                "textMateRules": [
+                    {
+                        "scope": "keyword.control.rust.polyglot",
+                        "settings": { "foreground": "#FF6B35" }
+                    },
+                    {
+                        "scope": "keyword.control.python.polyglot",
+                        "settings": { "foreground": "#3776AB" }
+                    },
+                    {
+                        "scope": "keyword.control.typescript.polyglot",
+                        "settings": { "foreground": "#3178C6" }
+                    },
+                    {
+                        "scope": "keyword.control.javascript.polyglot",
+                        "settings": { "foreground": "#F7DF1E" }
+                    },
+                    {
+                        "scope": "keyword.control.interface.polyglot",
+                        "settings": { "foreground": "#9B59B6", "fontStyle": "bold" }
+                    },
+                    {
+                        "scope": "keyword.control.main.polyglot",
+                        "settings": { "foreground": "#2ECC71", "fontStyle": "bold" }
+                    }
+                ]
+            }
+        },
         "configuration": {
             "title": "Polyglot",
             "properties": {

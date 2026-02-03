@@ -1,10 +1,10 @@
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_while1},
+    bytes::complete::tag,
     character::complete::{alpha1, alphanumeric1, char, multispace0, multispace1},
     combinator::{map, opt, recognize},
     multi::{many0, separated_list0},
-    sequence::{delimited, pair, preceded, terminated, tuple},
+    sequence::{delimited, pair, preceded, terminated},
     IResult, Parser,
 };
 
@@ -15,6 +15,21 @@ pub enum InterfaceItem {
     TypeAlias(String, Type),
     TypeDecl(TypeDeclDef),  // Type with explicit language mappings
     Function(FunctionDecl),
+    Trait(TraitDef),        // Phase 26: Cross-language interface contract
+}
+
+/// Trait definition - compiles to WIT interface
+/// ```
+/// trait Processor {
+///     fn process(data: list<i32>) -> i32;
+///     fn name() -> string;
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitDef {
+    pub name: String,
+    pub doc: Option<String>,
+    pub methods: Vec<FunctionDecl>,
 }
 
 /// Type declaration with explicit language mappings
@@ -96,9 +111,10 @@ pub enum PrimitiveType {
 }
 
 pub fn parse_interface(input: &str) -> Result<Vec<InterfaceItem>, String> {
-    let (remaining, items) = many0(preceded(
+    let (_remaining, items) = many0(preceded(
         skip_ws_and_comments,
         alt((
+            map(parse_trait_def, InterfaceItem::Trait),  // Phase 26: Try trait first
             map(parse_function_decl, InterfaceItem::Function),
             map(parse_enum, InterfaceItem::Enum),
             map(parse_type_decl, InterfaceItem::TypeDecl),  // Try TypeDecl FIRST (handles = lang:path)
@@ -109,6 +125,83 @@ pub fn parse_interface(input: &str) -> Result<Vec<InterfaceItem>, String> {
     .map_err(|e| format!("Parse error: {:?}", e))?;
 
     Ok(items)
+}
+
+/// Parse a trait definition
+/// ```
+/// trait Processor {
+///     fn process(data: list<i32>) -> i32;
+///     fn name() -> string;
+/// }
+/// ```
+fn parse_trait_def(input: &str) -> IResult<&str, TraitDef> {
+    // Optional doc comment (/// ...)
+    let (input, doc) = opt(parse_doc_comment).parse(input)?;
+    let (input, _) = multispace0(input)?;
+
+    let (input, _) = tag("trait")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, name) = parse_ident(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char('{')(input)?;
+
+    // Parse methods inside the trait
+    let (input, methods) = many0(preceded(
+        skip_ws_and_comments,
+        parse_trait_method,
+    )).parse(input)?;
+
+    let (input, _) = skip_ws_and_comments(input)?;
+    let (input, _) = char('}')(input)?;
+
+    Ok((input, TraitDef {
+        name: name.to_string(),
+        doc,
+        methods,
+    }))
+}
+
+/// Parse a method inside a trait (no body, just signature)
+fn parse_trait_method(input: &str) -> IResult<&str, FunctionDecl> {
+    // Optional doc comment
+    let (input, _doc) = opt(parse_doc_comment).parse(input)?;
+    let (input, _) = multispace0(input)?;
+
+    let (input, _) = tag("fn")(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, name) = parse_ident(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, params) = delimited(
+        char('('),
+        separated_list0(
+            preceded(multispace0, char(',')),
+            preceded(multispace0, parse_param),
+        ),
+        preceded(multispace0, char(')')),
+    ).parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, return_type) = opt(preceded(
+        pair(tag("->"), multispace0),
+        parse_type,
+    )).parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = opt(char(';')).parse(input)?;  // Optional semicolon
+
+    Ok((input, FunctionDecl {
+        name: name.to_string(),
+        params,
+        return_type,
+        visibility: Visibility::Export,  // Trait methods are always exported
+    }))
+}
+
+/// Parse a doc comment (/// ...)
+fn parse_doc_comment(input: &str) -> IResult<&str, String> {
+    let (input, _) = tag("///")(input)?;
+    let end = input.find('\n').unwrap_or(input.len());
+    let comment = input[..end].trim().to_string();
+    let input = if end < input.len() { &input[end + 1..] } else { "" };
+    Ok((input, comment))
 }
 
 /// Skip whitespace and // comments
@@ -177,6 +270,7 @@ fn parse_param(input: &str) -> IResult<&str, (String, Type)> {
     Ok((input, (name.to_string(), ty)))
 }
 
+#[allow(dead_code)]
 fn parse_struct(input: &str) -> IResult<&str, StructDef> {
     let (input, _) = tag("struct")(input)?;
     let (input, _) = multispace0(input)?;
@@ -198,6 +292,7 @@ fn parse_struct(input: &str) -> IResult<&str, StructDef> {
     ))
 }
 
+#[allow(dead_code)]
 fn parse_field(input: &str) -> IResult<&str, Field> {
     let (input, name) = parse_ident(input)?;
     let (input, _) = multispace0(input)?;

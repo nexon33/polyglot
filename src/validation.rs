@@ -7,7 +7,7 @@
 
 use crate::interface::parser::{FunctionDecl, InterfaceItem};
 use crate::parser::{CodeBlock, ParsedFile};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct ValidationError {
@@ -164,6 +164,7 @@ mod tests {
             .to_string(),
             options: Default::default(),
             start_line: 0,
+            code_start_line: 0,
         };
 
         let funcs = extract_implemented_functions(&block);
@@ -185,6 +186,7 @@ def validate(t: Tensor) -> bool:
             .to_string(),
             options: Default::default(),
             start_line: 0,
+            code_start_line: 0,
         };
 
         let funcs = extract_implemented_functions(&block);

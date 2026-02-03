@@ -1,5 +1,6 @@
 # Rust
 /target
+**/target/
 **/*.rs.bk
 Cargo.lock
 
@@ -30,3 +31,35 @@ wheels/
 errors.txt
 .poly-tmp/
 interface.wit
+
+# Build outputs
+*.wasm
+*.virtual.rs
+*.virtual.py
+*.virtual.txt
+
+# Generated HTML bundles
+demo.html
+
+# Debug / temp files
+*.log
+build_check_*.txt
+build_errors*.txt
+check_err.txt
+lsp_*_errors.txt
+lsp_errors.txt
+lsp_test_err*.txt
+panic.log
+
+# Stray source files (generated)
+/lib.rs
+/module.rs
+
+# Node / misc
+node_modules/
+
+# Old LSP binaries (keep only poly-lsp.exe)
+poly-vscode/bin/poly-lsp-*.exe
+
+# VS Code extension build artifacts
+*.vsix
