@@ -1,0 +1,105 @@
+#[rust]
+//! Test file for Polyglot Host imports
+//! 
+//! This demonstrates filesystem, environment, and process access
+//! via the custom WASM-to-Node.js bridge.
+
+// Import the host bridge functions
+mod host_imports;
+use host_imports::{fs, env, console, process};
+
+fn main() {
+    console::log("=== Polyglot Host Test ===");
+    console::log("");
+    
+    // Test environment
+    console::log("📁 Environment:");
+    match env::cwd() {
+        Ok(cwd) => console::log(&format!("  Current dir: {}", cwd)),
+        Err(e) => console::error(&format!("  CWD error: {}", e)),
+    }
+    
+    if let Some(home) = env::get("HOME").or_else(|| env::get("USERPROFILE")) {
+        console::log(&format!("  Home: {}", home));
+    }
+    
+    if let Some(path) = env::get("PATH") {
+        console::log(&format!("  PATH entries: {}", path.split(';').count()));
+    }
+    
+    console::log("");
+    
+    // Test filesystem
+    console::log("📄 Filesystem:");
+    
+    // Write a test file
+    let test_path = "polyglot_test.txt";
+    let test_content = "Hello from Polyglot!\nThis file was created by WASM running in Node.js.";
+    
+    match fs::write_str(test_path, test_content) {
+        Ok(()) => console::log(&format!("  Created: {}", test_path)),
+        Err(e) => console::error(&format!("  Write error: {}", e)),
+    }
+    
+    // Check it exists
+    if fs::exists(test_path) {
+        console::log(&format!("  Exists: {} ✓", test_path));
+    }
+    
+    // Read it back
+    match fs::read_to_string(test_path) {
+        Ok(content) => {
+            console::log(&format!("  Read {} bytes", content.len()));
+            console::log(&format!("  Content: {}", content.lines().next().unwrap_or("")));
+        },
+        Err(e) => console::error(&format!("  Read error: {}", e)),
+    }
+    
+    // List current directory
+    console::log("");
+    console::log("📂 Directory listing:");
+    match fs::read_dir(".") {
+        Ok(entries) => {
+            for (i, entry) in entries.iter().take(10).enumerate() {
+                let prefix = if fs::is_dir(entry) { "📁" } else { "📄" };
+                console::log(&format!("  {} {}", prefix, entry));
+            }
+            if entries.len() > 10 {
+                console::log(&format!("  ... and {} more", entries.len() - 10));
+            }
+        },
+        Err(e) => console::error(&format!("  Readdir error: {}", e)),
+    }
+    
+    // Clean up test file
+    match fs::remove(test_path) {
+        Ok(()) => console::log(&format!("\n🗑️ Cleaned up: {}", test_path)),
+        Err(e) => console::error(&format!("  Remove error: {}", e)),
+    }
+    
+    console::log("");
+    
+    // Test process execution
+    console::log("⚙️ Process execution:");
+    
+    #[cfg(target_os = "windows")]
+    let cmd = "echo Hello from subprocess!";
+    #[cfg(not(target_os = "windows"))]
+    let cmd = "echo 'Hello from subprocess!'";
+    
+    match process::exec("echo Hello from subprocess!") {
+        Ok((code, stdout, stderr)) => {
+            console::log(&format!("  Exit code: {}", code));
+            if !stdout.is_empty() {
+                console::log(&format!("  Stdout: {}", stdout.trim()));
+            }
+            if !stderr.is_empty() {
+                console::error(&format!("  Stderr: {}", stderr.trim()));
+            }
+        },
+        Err(e) => console::error(&format!("  Exec error: {}", e)),
+    }
+    
+    console::log("");
+    console::log("=== Test Complete ===");
+}

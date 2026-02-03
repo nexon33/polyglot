@@ -4,6 +4,7 @@ pub mod compiler;
 pub mod component_builder;
 pub mod component_linker;
 pub mod diagnostic;
+pub mod host_imports;
 pub mod implements_verify;
 pub mod interface;
 pub mod languages;
