@@ -1,0 +1,76 @@
+// host_basic_test.poly — Test basic host imports
+// Tests: filesystem, console, environment
+
+#[rust]
+use crate::host_imports::{fs, console, env, process};
+
+export fn main() -> i32 {
+    console::log("=== Polyglot Host Basic Test ===");
+    
+    // Test console
+    console::log("Hello from Polyglot WASM!");
+    console::error("This is stderr output");
+    
+    // Test environment
+    match env::cwd() {
+        Ok(cwd) => console::log(&format!("Current dir: {}", cwd)),
+        Err(e) => console::error(&format!("cwd failed: {}", e)),
+    }
+    
+    if let Some(path) = env::get("PATH") {
+        let preview = if path.len() > 50 { &path[..50] } else { &path };
+        console::log(&format!("PATH: {}...", preview));
+    }
+    
+    // Test filesystem write/read
+    console::log("\n--- Filesystem Test ---");
+    
+    let test_content = "Hello from Polyglot!\nLine 2\nLine 3";
+    console::log("Writing test file...");
+    
+    match fs::write_str("test_output.txt", test_content) {
+        Ok(_) => {
+            console::log("Write successful!");
+            
+            // Verify with read
+            match fs::read_to_string("test_output.txt") {
+                Ok(content) => {
+                    if content == test_content {
+                        console::log("Read verified: content matches!");
+                    } else {
+                        console::error(&format!("Content mismatch! Got: {}", content));
+                    }
+                }
+                Err(e) => console::error(&format!("Read failed: {}", e)),
+            }
+            
+            // Test exists
+            if fs::exists("test_output.txt") {
+                console::log("File exists: OK");
+            }
+            
+            // Cleanup
+            let _ = fs::remove("test_output.txt");
+            if !fs::exists("test_output.txt") {
+                console::log("Cleanup: OK");
+            }
+        }
+        Err(e) => console::error(&format!("Write failed: {}", e)),
+    }
+    
+    // Test process exec
+    console::log("\n--- Process Test ---");
+    match process::exec("echo Hello from child process") {
+        Ok((code, stdout, stderr)) => {
+            console::log(&format!("Exit code: {}", code));
+            console::log(&format!("stdout: {}", stdout.trim()));
+            if !stderr.is_empty() {
+                console::log(&format!("stderr: {}", stderr.trim()));
+            }
+        }
+        Err(e) => console::error(&format!("exec failed: {}", e)),
+    }
+    
+    console::log("\n=== All Tests Complete ===");
+    0
+}

@@ -1,103 +1,119 @@
-#[rust]
-// Test file for Polyglot Host imports
-// 
-// This demonstrates filesystem, environment, and process access
-// via the custom WASM-to-Node.js bridge.
-//
-// Note: fs, env, console, process modules are auto-injected by --target host
+// host_test.poly — Test host imports with --target host
 
-fn main() {
-    console::log("=== Polyglot Host Test ===");
-    console::log("");
-    
-    // Test environment
-    console::log("📁 Environment:");
+#[rust]
+fn test_console() {
+    console::log("=== Console Test ===");
+    console::log("Hello from Polyglot WASM on Node.js!");
+    console::error("This goes to stderr");
+}
+
+fn test_env() {
+    console::log("\n=== Environment Test ===");
     match env::cwd() {
-        Ok(cwd) => console::log(&format!("  Current dir: {}", cwd)),
-        Err(e) => console::error(&format!("  CWD error: {}", e)),
+        Ok(cwd) => console::log(&format!("Working directory: {}", cwd)),
+        Err(e) => console::error(&format!("cwd error: {}", e)),
     }
-    
-    if let Some(home) = env::get("HOME").or_else(|| env::get("USERPROFILE")) {
-        console::log(&format!("  Home: {}", home));
-    }
-    
     if let Some(path) = env::get("PATH") {
-        console::log(&format!("  PATH entries: {}", path.split(';').count()));
+        let preview = if path.len() > 60 { &path[..60] } else { &path };
+        console::log(&format!("PATH: {}...", preview));
     }
+}
+
+fn test_fs() {
+    console::log("\n=== Filesystem Test ===");
     
-    console::log("");
-    
-    // Test filesystem
-    console::log("📄 Filesystem:");
-    
-    // Write a test file
-    let test_path = "polyglot_test.txt";
-    let test_content = "Hello from Polyglot!\nThis file was created by WASM running in Node.js.";
-    
-    match fs::write_str(test_path, test_content) {
-        Ok(()) => console::log(&format!("  Created: {}", test_path)),
-        Err(e) => console::error(&format!("  Write error: {}", e)),
-    }
-    
-    // Check it exists
-    if fs::exists(test_path) {
-        console::log(&format!("  Exists: {} ✓", test_path));
+    // Write a file
+    let content = "Hello from Polyglot!\nLine 2\nLine 3";
+    console::log("Writing test_output.txt...");
+    match fs::write_str("test_output.txt", content) {
+        Ok(_) => console::log("  Write: OK"),
+        Err(e) => { console::error(&format!("  Write failed: {}", e)); return; }
     }
     
     // Read it back
-    match fs::read_to_string(test_path) {
-        Ok(content) => {
-            console::log(&format!("  Read {} bytes", content.len()));
-            console::log(&format!("  Content: {}", content.lines().next().unwrap_or("")));
-        },
-        Err(e) => console::error(&format!("  Read error: {}", e)),
-    }
-    
-    // List current directory
-    console::log("");
-    console::log("📂 Directory listing:");
-    match fs::read_dir(".") {
-        Ok(entries) => {
-            for (i, entry) in entries.iter().take(10).enumerate() {
-                let prefix = if fs::is_dir(entry) { "📁" } else { "📄" };
-                console::log(&format!("  {} {}", prefix, entry));
+    match fs::read_to_string("test_output.txt") {
+        Ok(read_content) => {
+            if read_content == content {
+                console::log("  Read verified: matches!");
+            } else {
+                console::error("  Read mismatch!");
             }
-            if entries.len() > 10 {
-                console::log(&format!("  ... and {} more", entries.len() - 10));
-            }
-        },
-        Err(e) => console::error(&format!("  Readdir error: {}", e)),
+        }
+        Err(e) => console::error(&format!("  Read failed: {}", e)),
     }
     
-    // Clean up test file
-    match fs::remove(test_path) {
-        Ok(()) => console::log(&format!("\n🗑️ Cleaned up: {}", test_path)),
-        Err(e) => console::error(&format!("  Remove error: {}", e)),
+    // Test stat
+    match fs::stat("test_output.txt") {
+        Ok(stat) => console::log(&format!("  Stat: size={}, is_file={}", stat.size, stat.is_file)),
+        Err(e) => console::error(&format!("  Stat failed: {}", e)),
     }
     
-    console::log("");
-    
-    // Test process execution
-    console::log("⚙️ Process execution:");
-    
-    #[cfg(target_os = "windows")]
-    let cmd = "echo Hello from subprocess!";
-    #[cfg(not(target_os = "windows"))]
-    let cmd = "echo 'Hello from subprocess!'";
-    
-    match process::exec("echo Hello from subprocess!") {
+    // Cleanup
+    let _ = fs::remove("test_output.txt");
+    console::log("  Cleanup: OK");
+}
+
+fn test_process() {
+    console::log("\n=== Process Test ===");
+    match process::exec("echo Hello from child process") {
         Ok((code, stdout, stderr)) => {
             console::log(&format!("  Exit code: {}", code));
-            if !stdout.is_empty() {
-                console::log(&format!("  Stdout: {}", stdout.trim()));
-            }
+            console::log(&format!("  stdout: {}", stdout.trim()));
             if !stderr.is_empty() {
-                console::error(&format!("  Stderr: {}", stderr.trim()));
+                console::log(&format!("  stderr: {}", stderr.trim()));
             }
-        },
-        Err(e) => console::error(&format!("  Exec error: {}", e)),
+        }
+        Err(e) => console::error(&format!("  exec failed: {}", e)),
     }
+}
+
+fn test_http() {
+    console::log("\n=== HTTP Test ===");
+    console::log("GET https://httpbin.org/get...");
+    match http::get("https://httpbin.org/get") {
+        Ok(resp) => {
+            console::log(&format!("  Status: {}", resp.status()));
+            match resp.text() {
+                Ok(body) => {
+                    let preview = if body.len() > 100 { &body[..100] } else { &body };
+                    console::log(&format!("  Body: {}...", preview));
+                }
+                Err(e) => console::error(&format!("  Body read error: {}", e)),
+            }
+        }
+        Err(e) => console::error(&format!("  HTTP failed: {}", e)),
+    }
+}
+
+fn test_async() {
+    console::log("\n=== Async/Timer Test ===");
+    let start = async_io::now();
+    console::log(&format!("Current time: {} ms", start));
     
-    console::log("");
-    console::log("=== Test Complete ===");
+    console::log("Sleeping 50ms...");
+    async_io::sleep(50);
+    let elapsed = async_io::now() - start;
+    console::log(&format!("Elapsed: {} ms (expected ~50)", elapsed));
+    
+    // Timer test
+    console::log("Setting 30ms timer...");
+    let _timer = async_io::timer(30);
+    let ready = async_io::wait(100);
+    console::log(&format!("Events ready: {}", ready));
+}
+
+export fn main() -> i32 {
+    console::log("╔════════════════════════════════════════════╗");
+    console::log("║  Polyglot Host Imports Test                ║");
+    console::log("╚════════════════════════════════════════════╝");
+    
+    test_console();
+    test_env();
+    test_fs();
+    test_process();
+    test_http();
+    test_async();
+    
+    console::log("\n=== All Tests Complete ===");
+    0
 }

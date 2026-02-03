@@ -44,7 +44,7 @@ pub struct ParseError {
 
 /// Find the matching closing brace for an opening brace at position `open_pos`.
 /// Returns the content between braces and the position after the closing brace.
-/// Handles nested braces, strings (including triple-quoted), and character literals.
+/// Handles nested braces, strings, comments, template literals, and character literals.
 fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)> {
     let bytes = source.as_bytes();
     if open_pos >= bytes.len() || bytes[open_pos] != b'{' {
@@ -53,13 +53,41 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
 
     let mut depth = 1;
     let mut pos = open_pos + 1;
-    let mut in_string = false;         // Inside "..."
+    let mut in_double_string = false;  // Inside "..."
+    let mut in_single_string = false;  // Inside '...'
+    let mut in_template = false;       // Inside `...` (JS template literal)
+    let mut template_depth = 0;        // For nested ${} in templates
     let mut escape_next = false;
     let mut in_triple_double = false;  // Inside """..."""
     let mut in_triple_single = false;  // Inside '''...'''
+    let mut in_line_comment = false;   // Inside // comment
+    let mut in_block_comment = false;  // Inside /* comment */
+    let mut brace_stack: Vec<usize> = vec![open_pos]; // Track position of unmatched open braces
+    let mut open_count: usize = 0;
+    let mut close_count: usize = 0;
 
     while pos < bytes.len() && depth > 0 {
         let c = bytes[pos];
+
+        // Handle line comments - skip until newline
+        if in_line_comment {
+            if c == b'\n' {
+                in_line_comment = false;
+            }
+            pos += 1;
+            continue;
+        }
+
+        // Handle block comments - skip until */
+        if in_block_comment {
+            if c == b'*' && pos + 1 < bytes.len() && bytes[pos + 1] == b'/' {
+                in_block_comment = false;
+                pos += 2;
+                continue;
+            }
+            pos += 1;
+            continue;
+        }
 
         if escape_next {
             escape_next = false;
@@ -67,18 +95,75 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
             continue;
         }
 
+        // Check for comments and regex literals (only when not in any string)
+        if !in_double_string && !in_single_string && !in_template && !in_triple_double && !in_triple_single {
+            if c == b'/' && pos + 1 < bytes.len() {
+                if bytes[pos + 1] == b'/' {
+                    in_line_comment = true;
+                    pos += 2;
+                    continue;
+                }
+                if bytes[pos + 1] == b'*' {
+                    in_block_comment = true;
+                    pos += 2;
+                    continue;
+                }
+                // Check for regex literal: / not followed by / or *
+                // Only detect obvious cases: after = ( , : [ or at line start
+                let prev_non_ws = {
+                    let mut p = pos;
+                    while p > open_pos + 1 {
+                        p -= 1;
+                        let pc = bytes[p];
+                        if pc != b' ' && pc != b'\t' {
+                            break;
+                        }
+                    }
+                    if p > open_pos { bytes[p] } else { b'\n' }
+                };
+                // Very conservative: only after = ( , : [ or newline
+                let is_regex_context = matches!(prev_non_ws, b'=' | b'(' | b',' | b':' | b'[' | b'\n' | b'\r');
+                if is_regex_context {
+                    // Skip regex literal: find closing / (handling escapes and char classes)
+                    pos += 1; // skip opening /
+                    let mut in_char_class = false;
+                    while pos < bytes.len() {
+                        let rc = bytes[pos];
+                        if rc == b'\\' && pos + 1 < bytes.len() {
+                            pos += 2; // skip escape
+                            continue;
+                        }
+                        if rc == b'[' && !in_char_class {
+                            in_char_class = true;
+                        } else if rc == b']' && in_char_class {
+                            in_char_class = false;
+                        } else if rc == b'/' && !in_char_class {
+                            pos += 1; // skip closing /
+                            // Skip regex flags (g, i, m, s, u, y)
+                            while pos < bytes.len() && matches!(bytes[pos], b'g' | b'i' | b'm' | b's' | b'u' | b'y') {
+                                pos += 1;
+                            }
+                            break;
+                        } else if rc == b'\n' {
+                            // Regex can't span lines without escape - probably not a regex
+                            break;
+                        }
+                        pos += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+
         // Check for triple quotes (Python docstrings/multiline strings)
-        // Only when not already inside a regular string
-        if !in_string {
+        if !in_double_string && !in_single_string && !in_template {
             if pos + 2 < bytes.len() {
                 if bytes[pos] == b'"' && bytes[pos + 1] == b'"' && bytes[pos + 2] == b'"' {
                     if in_triple_double {
-                        // Closing triple double quote
                         in_triple_double = false;
                         pos += 3;
                         continue;
                     } else if !in_triple_single {
-                        // Opening triple double quote
                         in_triple_double = true;
                         pos += 3;
                         continue;
@@ -86,12 +171,10 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
                 }
                 if bytes[pos] == b'\'' && bytes[pos + 1] == b'\'' && bytes[pos + 2] == b'\'' {
                     if in_triple_single {
-                        // Closing triple single quote
                         in_triple_single = false;
                         pos += 3;
                         continue;
                     } else if !in_triple_double {
-                        // Opening triple single quote
                         in_triple_single = true;
                         pos += 3;
                         continue;
@@ -106,27 +189,83 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
             continue;
         }
 
-        // Handle escape sequences inside strings
-        if c == b'\\' && in_string {
+        // Handle escape sequences inside strings and templates
+        if c == b'\\' && (in_double_string || in_single_string || in_template) {
             escape_next = true;
             pos += 1;
             continue;
         }
 
-        // Track double-quoted strings only
-        // Note: We intentionally ignore single quotes for brace matching because:
-        // 1. Apostrophes in comments (e.g., "Python's") would break parsing
-        // 2. Single-quoted strings rarely contain unescaped braces
-        // 3. Triple-single-quotes are handled separately above
-        if c == b'"' {
-            in_string = !in_string;
+        // Handle JS template literals (backticks)
+        if c == b'`' && !in_double_string && !in_single_string {
+            in_template = !in_template;
+            if !in_template {
+                template_depth = 0;
+            }
+            pos += 1;
+            continue;
         }
+
+        // Handle ${} inside template literals
+        if in_template && c == b'$' && pos + 1 < bytes.len() && bytes[pos + 1] == b'{' {
+            template_depth += 1;
+            pos += 2;
+            continue;
+        }
+
+        // Track braces inside template ${} expressions
+        // Braces inside ${} are real code braces and should affect main depth
+        if in_template && template_depth > 0 {
+            if c == b'{' {
+                template_depth += 1;  // Track for ${} nesting
+                depth += 1;           // Also track main depth
+                open_count += 1;
+                brace_stack.push(pos);
+            } else if c == b'}' {
+                template_depth -= 1;
+                if template_depth > 0 {
+                    // This closes a nested brace inside ${}, not the ${} itself
+                    depth -= 1;
+                    close_count += 1;
+                    brace_stack.pop();
+                }
+                // When template_depth hits 0, we just closed the ${}, no depth change
+            }
+            pos += 1;
+            continue;
+        }
+
+        // Skip non-brace content inside templates (outside ${})
+        if in_template {
+            pos += 1;
+            continue;
+        }
+
+        // Track double-quoted strings
+        if c == b'"' && !in_single_string {
+            in_double_string = !in_double_string;
+            pos += 1;
+            continue;
+        }
+
+        // Track single-quoted strings (JS/Python)
+        // Note: This may cause issues with Rust char literals, but JS needs it
+        if c == b'\'' && !in_double_string && !in_template {
+            in_single_string = !in_single_string;
+            pos += 1;
+            continue;
+        }
+
         // Track braces only when outside strings
-        else if !in_string {
+        if !in_double_string && !in_single_string {
             if c == b'{' {
                 depth += 1;
+                open_count += 1;
+                brace_stack.push(pos);
             } else if c == b'}' {
                 depth -= 1;
+                close_count += 1;
+                brace_stack.pop();
             }
         }
 
@@ -137,6 +276,27 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
         let content = &source[open_pos + 1..pos - 1];
         Some((content.to_string(), pos))
     } else {
+        eprintln!("  → depth={}, opens={}, closes={} (diff={})",
+            depth, open_count, close_count, open_count as i64 - close_count as i64);
+        eprintln!("  → in_double={}, in_template={}, in_line_comment={}", 
+            in_double_string, in_template, in_line_comment);
+        // Show unmatched brace positions
+        for brace_pos in brace_stack.iter().take(5) {
+            let line = source[..=*brace_pos].matches('\n').count() + 1;
+            let start = brace_pos.saturating_sub(20);
+            // Find valid UTF-8 boundary
+            let mut safe_start = start;
+            while safe_start > 0 && !source.is_char_boundary(safe_start) {
+                safe_start -= 1;
+            }
+            let end = (*brace_pos + 40).min(source.len());
+            let mut safe_end = end;
+            while safe_end < source.len() && !source.is_char_boundary(safe_end) {
+                safe_end += 1;
+            }
+            let context = &source[safe_start..safe_end];
+            eprintln!("  → Unmatched {{ at line {}: {:?}", line, context.replace('\n', "↵"));
+        }
         None
     }
 }
@@ -290,6 +450,7 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
 
         // Find matching closing brace
         if let Some((content, _end_pos)) = find_matching_brace(source, m.end() - 1) {
+            eprintln!("📦 Block [{}] found: {} bytes", lang, content.len());
             let start_line = source[..m.start()].lines().count();
 
             // Normalize language tag
@@ -325,6 +486,8 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
                 start_line,
                 code_start_line,
             });
+        } else {
+            eprintln!("⚠️  Block [{}] FAILED brace matching at position {}", lang, m.end() - 1);
         }
     }
 

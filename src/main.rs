@@ -253,11 +253,8 @@ fn main() -> MietteResult<()> {
             // Read WASM bytes
             let wasm_bytes = fs::read(&wasm_path).into_diagnostic()?;
 
-            // Get temp dir from the file's parent
-            let temp_dir = file
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("target/polyglot_tmp");
+            // Use the same temp dir as CompileOptions::default() (relative to cwd)
+            let temp_dir = PathBuf::from("target/polyglot_tmp");
 
             // Generate bundle
             let bundle = polyglot::compiler::bundle_to_single_file(&temp_dir, &wasm_bytes, &title).into_diagnostic()?;
@@ -1662,11 +1659,8 @@ fn rebuild_for_watch(
 
     let wasm = compile(&parsed, &opts).into_diagnostic()?;
 
-    // Bundle to HTML
-    let temp_dir = file
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("target/polyglot_tmp");
+    // Bundle to HTML - use same temp_dir as CompileOptions::default()
+    let temp_dir = PathBuf::from("target/polyglot_tmp");
     let bundle = polyglot::compiler::bundle_to_single_file(&temp_dir, &wasm, "Polyglot Dev").into_diagnostic()?;
 
     fs::write(html_path, &bundle).into_diagnostic()?;

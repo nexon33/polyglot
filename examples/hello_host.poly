@@ -1,0 +1,21 @@
+// hello_host.poly — Minimal test for host target
+// This file compiles to WASM that imports from the host
+
+#[rust]
+// Direct extern declarations for host imports
+// These get linked when running via polyglot-host.mjs
+
+#[link(wasm_import_module = "host")]
+extern "C" {
+    fn host_console_log(ptr: *const u8, len: usize);
+}
+
+fn log(msg: &str) {
+    unsafe { host_console_log(msg.as_ptr(), msg.len()); }
+}
+
+export fn main() -> i32 {
+    log("Hello from Polyglot WASM!");
+    log("Running on Node.js host!");
+    0
+}

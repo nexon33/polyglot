@@ -1,0 +1,167 @@
+// host_extended_test.poly — Test extended host imports
+// Tests: HTTP, async/timers, streams, extended fs
+
+#[rust]
+// Import host APIs (available when targeting Node.js host)
+use crate::host_imports::{fs, http, async_io, stream, console};
+
+fn test_fs_extended() {
+    console::log("=== Testing Extended Filesystem ===");
+    
+    // Test stat
+    match fs::stat("examples/host_extended_test.poly") {
+        Ok(s) => {
+            console::log(&format!("  stat: size={}, isFile={}", s.size, s.is_file));
+        }
+        Err(e) => console::error(&format!("  stat failed: {}", e)),
+    }
+    
+    // Test copy
+    let _ = fs::write_str("test_copy_src.txt", "Copy test content");
+    match fs::copy("test_copy_src.txt", "test_copy_dst.txt") {
+        Ok(_) => console::log("  copy: OK"),
+        Err(e) => console::error(&format!("  copy failed: {}", e)),
+    }
+    
+    // Verify copy
+    match fs::read_to_string("test_copy_dst.txt") {
+        Ok(content) => console::log(&format!("  copy verify: '{}'", content)),
+        Err(e) => console::error(&format!("  copy verify failed: {}", e)),
+    }
+    
+    // Test rename
+    match fs::rename("test_copy_dst.txt", "test_renamed.txt") {
+        Ok(_) => console::log("  rename: OK"),
+        Err(e) => console::error(&format!("  rename failed: {}", e)),
+    }
+    
+    // Cleanup
+    let _ = fs::remove("test_copy_src.txt");
+    let _ = fs::remove("test_renamed.txt");
+    
+    console::log("  Extended FS tests complete");
+}
+
+fn test_http() {
+    console::log("\n=== Testing HTTP ===");
+    
+    // Simple GET request
+    console::log("  GET https://httpbin.org/get...");
+    match http::get("https://httpbin.org/get") {
+        Ok(resp) => {
+            console::log(&format!("  Status: {}", resp.status()));
+            let body = resp.text().unwrap_or_default();
+            let preview = if body.len() > 100 { &body[..100] } else { &body };
+            console::log(&format!("  Body preview: {}...", preview));
+        }
+        Err(e) => console::error(&format!("  GET failed: {}", e)),
+    }
+    
+    // POST request with JSON
+    console::log("  POST https://httpbin.org/post...");
+    match http::Request::post("https://httpbin.org/post")
+        .json(r#"{"test": "hello from polyglot"}"#)
+        .send() 
+    {
+        Ok(resp) => {
+            console::log(&format!("  Status: {}", resp.status()));
+        }
+        Err(e) => console::error(&format!("  POST failed: {}", e)),
+    }
+    
+    console::log("  HTTP tests complete");
+}
+
+fn test_async() {
+    console::log("\n=== Testing Async/Timers ===");
+    
+    // Get current time
+    let start = async_io::now();
+    console::log(&format!("  Current time: {} ms", start));
+    
+    // Sleep test
+    console::log("  Sleeping 100ms...");
+    async_io::sleep(100);
+    let elapsed = async_io::now() - start;
+    console::log(&format!("  Elapsed: {} ms", elapsed));
+    
+    // Timer test
+    console::log("  Setting timer for 50ms...");
+    let timer = async_io::timer(50);
+    console::log(&format!("  Timer handle: {}", timer));
+    
+    // Wait for timer
+    let ready = async_io::wait(200);
+    console::log(&format!("  Events ready: {}", ready));
+    
+    if ready > 0 {
+        if let Some(event) = async_io::poll() {
+            console::log(&format!("  Event: type={}, handle={}", event.kind, event.handle));
+        }
+    }
+    
+    console::log("  Async tests complete");
+}
+
+fn test_streams() {
+    console::log("\n=== Testing Streams ===");
+    
+    // Write stream
+    console::log("  Opening write stream...");
+    match stream::FileStream::open("test_stream.txt", stream::WRITE) {
+        Ok(s) => {
+            let data = b"Line 1\nLine 2\nLine 3\n";
+            match s.write_all(data) {
+                Ok(_) => console::log("  Write: OK"),
+                Err(e) => console::error(&format!("  Write failed: {}", e)),
+            }
+            let _ = s.flush();
+        }
+        Err(e) => console::error(&format!("  Open write failed: {}", e)),
+    }
+    
+    // Read stream with seek
+    console::log("  Opening read stream...");
+    match stream::FileStream::open("test_stream.txt", stream::READ) {
+        Ok(s) => {
+            // Read first chunk
+            let mut buf = [0u8; 10];
+            match s.read(&mut buf) {
+                Ok(n) => {
+                    let text = std::str::from_utf8(&buf[..n]).unwrap_or("?");
+                    console::log(&format!("  Read {} bytes: '{}'", n, text));
+                }
+                Err(e) => console::error(&format!("  Read failed: {}", e)),
+            }
+            
+            // Seek to beginning and read all
+            let _ = s.seek(0, stream::SEEK_SET);
+            match s.read_to_end() {
+                Ok(data) => {
+                    console::log(&format!("  Read all: {} bytes", data.len()));
+                }
+                Err(e) => console::error(&format!("  Read all failed: {}", e)),
+            }
+        }
+        Err(e) => console::error(&format!("  Open read failed: {}", e)),
+    }
+    
+    // Cleanup
+    let _ = fs::remove("test_stream.txt");
+    
+    console::log("  Stream tests complete");
+}
+
+export fn main() -> i32 {
+    console::log("╔════════════════════════════════════════════╗");
+    console::log("║  Polyglot Extended Host Imports Test       ║");
+    console::log("╚════════════════════════════════════════════╝");
+    
+    test_fs_extended();
+    test_http();
+    test_async();
+    test_streams();
+    
+    console::log("\n=== All Tests Complete ===");
+    0
+}

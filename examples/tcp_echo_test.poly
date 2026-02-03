@@ -1,0 +1,68 @@
+// tcp_echo_test.poly — Test TCP networking
+// Simple TCP client that connects to a test server
+
+```rust
+fn main() {
+    console::log("=== TCP Echo Test ===");
+    
+    // Connect to httpbin TCP (or a local echo server)
+    // Using a simple HTTP request over raw TCP as test
+    
+    console::log("Connecting to httpbin.org:80...");
+    
+    match tcp::TcpStream::connect("httpbin.org", 80) {
+        Ok(stream) => {
+            console::log(&format!("Connected! Local: {:?}", stream.local_addr()));
+            console::log(&format!("Remote: {:?}", stream.peer_addr()));
+            
+            // Send HTTP request
+            let request = "GET /get HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n";
+            console::log("Sending HTTP request...");
+            
+            match stream.write_all(request.as_bytes()) {
+                Ok(_) => console::log("Request sent!"),
+                Err(e) => {
+                    console::error(&format!("Write error: {}", e));
+                    return;
+                }
+            }
+            
+            // Read response
+            console::log("Reading response...");
+            let mut total = 0;
+            let mut response = String::new();
+            
+            loop {
+                match stream.read_to_vec(4096) {
+                    Ok(data) => {
+                        if data.is_empty() {
+                            break; // Connection closed
+                        }
+                        total += data.len();
+                        if let Ok(s) = std::str::from_utf8(&data) {
+                            response.push_str(s);
+                        }
+                        console::log(&format!("  Received {} bytes (total: {})", data.len(), total));
+                    }
+                    Err(e) => {
+                        console::log(&format!("Read done or error: {}", e));
+                        break;
+                    }
+                }
+            }
+            
+            // Show response preview
+            let preview_len = response.len().min(500);
+            console::log(&format!("\nResponse ({} bytes):\n{}", total, &response[..preview_len]));
+            
+            stream.close();
+            console::log("\nConnection closed.");
+        }
+        Err(e) => {
+            console::error(&format!("Connection failed: {}", e));
+        }
+    }
+    
+    console::log("\n=== TCP Test Complete ===");
+}
+```

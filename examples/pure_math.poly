@@ -1,0 +1,19 @@
+// pure_math.poly — Pure computation, no I/O
+
+#[rust]
+export fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+export fn multiply(a: i32, b: i32) -> i32 {
+    a * b
+}
+
+export fn factorial(n: i32) -> i32 {
+    if n <= 1 { 1 } else { n * factorial(n - 1) }
+}
+
+// Main just returns 42 as success
+export fn main() -> i32 {
+    42
+}

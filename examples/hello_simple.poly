@@ -1,0 +1,16 @@
+// hello_simple.poly — Simplest possible test
+
+#[rust]
+fn greet(name: &str) -> String {
+    format!("Hello, {}!", name)
+}
+
+export fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+fn main() {
+    let msg = greet("World");
+    println!("{}", msg);
+    println!("2 + 3 = {}", add(2, 3));
+}

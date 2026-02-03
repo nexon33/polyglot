@@ -1,0 +1,56 @@
+// tcp_test.poly — Test TCP networking
+
+#[rust]
+fn main() {
+    console::log("=== TCP Networking Test ===\n");
+    
+    // Test 1: Connect to httpbin.org over raw TCP and send HTTP
+    console::log("Test 1: Raw TCP HTTP request to httpbin.org:80");
+    
+    match tcp::TcpStream::connect("httpbin.org", 80) {
+        Ok(stream) => {
+            console::log(&format!("  Connected! Local: {:?}", stream.local_addr()));
+            console::log(&format!("  Remote: {:?}", stream.peer_addr()));
+            
+            // Send HTTP request
+            let request = "GET /ip HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n";
+            
+            match stream.write_all(request.as_bytes()) {
+                Ok(_) => {
+                    console::log("  Request sent!");
+                    
+                    // Read response
+                    let mut total = 0;
+                    let mut response = Vec::new();
+                    
+                    loop {
+                        match stream.read_to_vec(4096) {
+                            Ok(data) => {
+                                if data.is_empty() { break; }
+                                total += data.len();
+                                response.extend_from_slice(&data);
+                                console::log(&format!("  Received {} bytes (total: {})", data.len(), total));
+                            }
+                            Err(e) => {
+                                console::log(&format!("  Read done: {}", e));
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Show response
+                    if let Ok(text) = String::from_utf8(response) {
+                        let preview = if text.len() > 300 { &text[..300] } else { &text };
+                        console::log(&format!("\n  Response:\n{}", preview));
+                    }
+                }
+                Err(e) => console::error(&format!("  Write failed: {}", e)),
+            }
+        }
+        Err(e) => {
+            console::error(&format!("  Connection failed: {}", e));
+        }
+    }
+    
+    console::log("\n=== TCP Test Complete ===");
+}
