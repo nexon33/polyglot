@@ -1,3 +1,4 @@
+pub mod apk_builder;
 pub mod ast_parser;
 pub mod capability;
 pub mod compiler;

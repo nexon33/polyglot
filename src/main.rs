@@ -45,8 +45,8 @@ enum Commands {
         #[arg(long, value_parser = ["wit", "ir"])]
         emit: Option<String>,
 
-        /// Target: browser (default), host, android, linux, windows
-        #[arg(long, short, value_parser = ["browser", "host", "android", "linux", "windows"], default_value = "browser")]
+        /// Target: browser (default), host, android, linux, windows, apk
+        #[arg(long, short, value_parser = ["browser", "host", "android", "linux", "windows", "apk"], default_value = "browser")]
         target: String,
     },
     /// Generate WIT interface from a poly file
@@ -625,6 +625,11 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) 
         ));
     }
 
+    // Handle APK target specially
+    if target_str == "apk" {
+        return build_apk(file, &parsed);
+    }
+    
     // Parse target string to CompileTarget enum
     let target = match target_str {
         "host" => polyglot::types::CompileTarget::Host,
@@ -777,6 +782,71 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) 
             }
         }
     }
+}
+
+/// Build an APK from a .poly file
+fn build_apk(file: &PathBuf, parsed: &polyglot::parser::ParsedFile) -> MietteResult<PathBuf> {
+    use polyglot::apk_builder::{ApkBuilder, ApkConfig};
+    
+    println!("🎯 Target: apk (Android application package)");
+    
+    // First, compile for Android target
+    let opts = CompileOptions {
+        release: true,
+        test_mode: false,
+        target: polyglot::types::CompileTarget::Aarch64Android,
+        ..Default::default()
+    };
+    
+    println!("📦 Step 1: Compiling native binary for aarch64...");
+    let output = compile(parsed, &opts).into_diagnostic()?;
+    
+    if output.binary.is_empty() {
+        return Err(miette::miette!("No binary output from compilation"));
+    }
+    println!("   ✓ Native binary: {} bytes", output.binary.len());
+    
+    // Collect web assets
+    let mut web_assets = Vec::new();
+    let temp_dir = PathBuf::from("target/polyglot_tmp");
+    
+    for asset_name in &output.web_assets {
+        let asset_path = temp_dir.join(asset_name);
+        if asset_path.exists() {
+            let content = fs::read(&asset_path).into_diagnostic()?;
+            web_assets.push((asset_name.clone(), content));
+            println!("   ✓ Web asset: {}", asset_name);
+        }
+    }
+    
+    // Build APK
+    println!("📦 Step 2: Building APK...");
+    
+    let apk_work_dir = temp_dir.join("apk_build");
+    let builder = ApkBuilder::new(apk_work_dir)
+        .map_err(|e| miette::miette!("APK builder error: {}", e))?;
+    
+    // Get app name from file stem
+    let app_name = file.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or("Poly App".to_string());
+    
+    let config = ApkConfig {
+        app_name: app_name.clone(),
+        package_name: format!("com.poly.{}", app_name.to_lowercase().replace(" ", "_")),
+        ..Default::default()
+    };
+    
+    let apk_bytes = builder.build(&output.binary, &web_assets, &config)
+        .map_err(|e| miette::miette!("APK build failed: {}", e))?;
+    
+    // Write APK
+    let out_path = file.with_extension("apk");
+    fs::write(&out_path, &apk_bytes).into_diagnostic()?;
+    
+    println!("✅ APK built: {} ({} KB)", out_path.display(), apk_bytes.len() / 1024);
+    
+    Ok(out_path)
 }
 
 fn run_wasm(wasm_path: &PathBuf, args: &[String]) -> MietteResult<()> {
