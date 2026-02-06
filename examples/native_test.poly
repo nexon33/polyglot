@@ -1,0 +1,11 @@
+# Simple native compilation test
+
+#[rs]
+fn main() {
+    println!("Hello from Poly native binary!");
+    println!("Args: {:?}", std::env::args().collect::<Vec<_>>());
+    
+    // Simple computation
+    let sum: i32 = (1..=10).sum();
+    println!("Sum of 1-10: {}", sum);
+}
