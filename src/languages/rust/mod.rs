@@ -116,9 +116,18 @@ strip = true
             } else {
                 "linux-x86_64"
             };
+            
+            // On Windows, the linker wrapper has .cmd extension
+            let linker_name = if cfg!(windows) {
+                "aarch64-linux-android21-clang.cmd"
+            } else {
+                "aarch64-linux-android21-clang"
+            };
+            
             let linker = toolchain_dir
                 .join(host_dir)
-                .join("bin/aarch64-linux-android21-clang");
+                .join("bin")
+                .join(linker_name);
             
             format!(
                 r#"[target.aarch64-linux-android]
