@@ -51,7 +51,7 @@ pub struct Param {
 #[derive(Clone)]
 pub struct CompileOptions {
     pub release: bool,
-    pub target: WasmTarget,
+    pub target: CompileTarget,
     pub temp_dir: PathBuf,
     /// Which language contains the main entry point: "rust" or "python"
     pub main_lang: Option<String>,
@@ -62,7 +62,7 @@ impl Default for CompileOptions {
     fn default() -> Self {
         Self {
             release: false,
-            target: WasmTarget::default(),
+            target: CompileTarget::default(),
             temp_dir: PathBuf::from("target/polyglot_tmp"),
             main_lang: None,
             test_mode: false,
@@ -70,11 +70,48 @@ impl Default for CompileOptions {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
-pub enum WasmTarget {
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub enum CompileTarget {
     #[default]
     Wasm32Wasi,
     Wasm32Unknown,
     /// Host target: WASM with custom imports for Node.js host
     Host,
+    /// Native Android/Termux binary (aarch64-linux-android)
+    Aarch64Android,
+    /// Native Linux binary (x86_64-unknown-linux-gnu)
+    X86_64Linux,
+    /// Native Windows binary (x86_64-pc-windows-msvc)
+    X86_64Windows,
 }
+
+impl CompileTarget {
+    /// Returns true if this is a native (non-WASM) target
+    pub fn is_native(&self) -> bool {
+        matches!(self, Self::Aarch64Android | Self::X86_64Linux | Self::X86_64Windows)
+    }
+    
+    /// Returns the Rust target triple for this target
+    pub fn target_triple(&self) -> &'static str {
+        match self {
+            Self::Wasm32Wasi => "wasm32-wasip1",
+            Self::Wasm32Unknown => "wasm32-unknown-unknown",
+            Self::Host => "wasm32-wasip1",
+            Self::Aarch64Android => "aarch64-linux-android",
+            Self::X86_64Linux => "x86_64-unknown-linux-gnu",
+            Self::X86_64Windows => "x86_64-pc-windows-msvc",
+        }
+    }
+    
+    /// Returns the output file extension for this target
+    pub fn output_extension(&self) -> &'static str {
+        match self {
+            Self::Wasm32Wasi | Self::Wasm32Unknown | Self::Host => "wasm",
+            Self::X86_64Windows => "exe",
+            _ => "", // Linux/Android binaries have no extension
+        }
+    }
+}
+
+// Keep WasmTarget as alias for backward compatibility
+pub type WasmTarget = CompileTarget;

@@ -1,15 +1,182 @@
 use crate::languages::Language;
 use crate::parser::{ParseError, parse_rust_params, parse_rust_type};
-use crate::types::{CompileOptions, FunctionSig, WitType};
+use crate::types::{CompileOptions, CompileTarget, FunctionSig, WitType};
 use anyhow::Result;
 use std::fs;
 use std::process::Command;
+use std::path::PathBuf;
 
 pub struct Rust;
 
 impl Rust {
     pub fn new() -> Self {
         Self
+    }
+    
+    /// Compile to native binary (for Android, Linux, Windows targets)
+    fn compile_native(&self, source: &str, opts: &CompileOptions) -> Result<Vec<u8>> {
+        let target_triple = opts.target.target_triple();
+        eprintln!("🔧 Native compilation target: {}", target_triple);
+        
+        // For native targets, we build a binary (not a cdylib)
+        let cargo_toml = format!(
+            r#"
+[workspace]
+
+[package]
+name = "poly_native"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "poly_native"
+path = "main.rs"
+
+[dependencies]
+anyhow = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+"#
+        );
+
+        fs::write(opts.temp_dir.join("Cargo.toml"), &cargo_toml)?;
+        
+        // For Android target, we may need to configure the linker
+        if opts.target == CompileTarget::Aarch64Android {
+            self.setup_android_config(&opts.temp_dir)?;
+        }
+
+        // Write the source directly (no WASM wrappers needed)
+        let main_rs = opts.temp_dir.join("main.rs");
+        fs::write(&main_rs, source)?;
+
+        // Build
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(&opts.temp_dir);
+        cmd.arg("build")
+            .arg("--release")
+            .arg(format!("--target={}", target_triple));
+
+        let output = cmd.output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!(
+                "Native compilation failed for target {}:\n{}",
+                target_triple,
+                stderr.lines().take(30).collect::<Vec<_>>().join("\n")
+            ));
+        }
+
+        // Find output binary
+        let ext = opts.target.output_extension();
+        let binary_name = if ext.is_empty() {
+            "poly_native".to_string()
+        } else {
+            format!("poly_native.{}", ext)
+        };
+        
+        let binary_path = opts.temp_dir
+            .join("target")
+            .join(target_triple)
+            .join("release")
+            .join(&binary_name);
+
+        if !binary_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Expected binary not found at: {}",
+                binary_path.display()
+            ));
+        }
+
+        let binary_bytes = fs::read(&binary_path)?;
+        eprintln!("✅ Native binary: {} bytes", binary_bytes.len());
+        
+        Ok(binary_bytes)
+    }
+    
+    /// Setup .cargo/config.toml for Android NDK
+    fn setup_android_config(&self, temp_dir: &PathBuf) -> Result<()> {
+        // Try to find Android NDK
+        let ndk_path = self.find_android_ndk();
+        
+        let cargo_dir = temp_dir.join(".cargo");
+        fs::create_dir_all(&cargo_dir)?;
+        
+        let config = if let Some(ndk) = ndk_path {
+            // Find the linker in NDK
+            let toolchain_dir = ndk.join("toolchains/llvm/prebuilt");
+            let host_dir = if cfg!(windows) {
+                "windows-x86_64"
+            } else if cfg!(target_os = "macos") {
+                "darwin-x86_64"
+            } else {
+                "linux-x86_64"
+            };
+            let linker = toolchain_dir
+                .join(host_dir)
+                .join("bin/aarch64-linux-android21-clang");
+            
+            format!(
+                r#"[target.aarch64-linux-android]
+linker = "{}"
+"#,
+                linker.display().to_string().replace("\\", "/")
+            )
+        } else {
+            // No NDK found - user needs to configure manually
+            eprintln!("⚠️  Android NDK not found. You may need to configure the linker manually.");
+            eprintln!("   Set ANDROID_NDK_HOME or install NDK via Android Studio.");
+            r#"# Android NDK not found - configure linker manually:
+# [target.aarch64-linux-android]
+# linker = "/path/to/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+"#.to_string()
+        };
+        
+        fs::write(cargo_dir.join("config.toml"), config)?;
+        Ok(())
+    }
+    
+    /// Try to find Android NDK installation
+    fn find_android_ndk(&self) -> Option<PathBuf> {
+        // Check ANDROID_NDK_HOME first
+        if let Ok(ndk) = std::env::var("ANDROID_NDK_HOME") {
+            let path = PathBuf::from(&ndk);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        
+        // Check common locations
+        let home = dirs::home_dir()?;
+        let common_paths = [
+            home.join("Android/Sdk/ndk").join("*"), // Linux/Mac
+            PathBuf::from("C:/Android/ndk"),
+            PathBuf::from("C:/Users").join(whoami::username()).join("AppData/Local/Android/Sdk/ndk"),
+        ];
+        
+        for pattern in &common_paths {
+            // For glob patterns, find newest version
+            if let Some(parent) = pattern.parent() {
+                if parent.exists() {
+                    if let Ok(entries) = fs::read_dir(parent) {
+                        let mut versions: Vec<_> = entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.path().is_dir())
+                            .collect();
+                        versions.sort_by(|a, b| b.path().cmp(&a.path()));
+                        if let Some(latest) = versions.first() {
+                            return Some(latest.path());
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
     }
 }
 
@@ -23,6 +190,13 @@ impl Language for Rust {
     }
 
     fn compile(&self, source: &str, opts: &CompileOptions) -> Result<Vec<u8>> {
+        // Check if this is a native target
+        if opts.target.is_native() {
+            return self.compile_native(source, opts);
+        }
+        
+        // === WASM compilation (original logic) ===
+        
         // Create a temporary Cargo project to handle dependencies correctly
         let _package_name = "poly_cell";
 

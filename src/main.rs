@@ -45,8 +45,8 @@ enum Commands {
         #[arg(long, value_parser = ["wit", "ir"])]
         emit: Option<String>,
 
-        /// Target: browser (default), host (Node.js with native access)
-        #[arg(long, short, value_parser = ["browser", "host"], default_value = "browser")]
+        /// Target: browser (default), host, android, linux, windows
+        #[arg(long, short, value_parser = ["browser", "host", "android", "linux", "windows"], default_value = "browser")]
         target: String,
     },
     /// Generate WIT interface from a poly file
@@ -206,8 +206,7 @@ fn main() -> MietteResult<()> {
             if emit.as_deref() == Some("wit") {
                 generate_wit_file(&file)?;
             }
-            let is_host = target == "host";
-            build_poly(&file, release, false, is_host)?;
+            build_poly(&file, release, false, &target)?;
         }
         Commands::Wit { file, output } => {
             generate_wit_file_to(&file, output)?;
@@ -217,7 +216,7 @@ fn main() -> MietteResult<()> {
             release,
             args,
         } => {
-            let wasm_path = build_poly(&file, release, false, false)?;
+            let wasm_path = build_poly(&file, release, false, "browser")?;
             run_wasm(&wasm_path, &args)?;
         }
         Commands::Init { name } => {
@@ -228,7 +227,7 @@ fn main() -> MietteResult<()> {
         }
         Commands::Test { file } => {
             eprintln!("🧪 Running inline tests for {}", file.display());
-            build_poly(&file, false, true, false)?; // release=false, test_mode=true, host=false
+            build_poly(&file, false, true, "browser")?; // release=false, test_mode=true
         }
         Commands::Verify { file } => {
             verify_poly(&file)?;
@@ -247,8 +246,8 @@ fn main() -> MietteResult<()> {
             output,
             title,
         } => {
-            // Build first
-            let wasm_path = build_poly(&file, true, false, false)?;
+            // Build first (always browser target for bundle)
+            let wasm_path = build_poly(&file, true, false, "browser")?;
 
             // Read WASM bytes
             let wasm_bytes = fs::read(&wasm_path).into_diagnostic()?;
@@ -574,7 +573,7 @@ fn generate_wit_file_to(file: &PathBuf, output: Option<PathBuf>) -> MietteResult
     Ok(())
 }
 
-fn build_poly(file: &PathBuf, release: bool, test_mode: bool, host_target: bool) -> MietteResult<PathBuf> {
+fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) -> MietteResult<PathBuf> {
     println!("🔨 Compiling {}", file.display());
     let source = fs::read_to_string(file).into_diagnostic()?;
     let filename = file.display().to_string();
@@ -626,14 +625,22 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, host_target: bool)
         ));
     }
 
-    let target = if host_target {
-        polyglot::types::WasmTarget::Host
-    } else {
-        polyglot::types::WasmTarget::default()
+    // Parse target string to CompileTarget enum
+    let target = match target_str {
+        "host" => polyglot::types::CompileTarget::Host,
+        "android" => polyglot::types::CompileTarget::Aarch64Android,
+        "linux" => polyglot::types::CompileTarget::X86_64Linux,
+        "windows" => polyglot::types::CompileTarget::X86_64Windows,
+        _ => polyglot::types::CompileTarget::default(), // "browser" or default
     };
 
-    if host_target {
-        println!("🎯 Target: host (Node.js with native access)");
+    // Print target info
+    match target_str {
+        "host" => println!("🎯 Target: host (Node.js with native access)"),
+        "android" => println!("🎯 Target: android (aarch64-linux-android native binary)"),
+        "linux" => println!("🎯 Target: linux (x86_64-unknown-linux-gnu native binary)"),
+        "windows" => println!("🎯 Target: windows (x86_64-pc-windows-msvc native binary)"),
+        _ => {}
     }
 
     let opts = CompileOptions {
@@ -644,14 +651,23 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, host_target: bool)
     };
 
     match compile(&parsed, &opts) {
-        Ok(wasm) => {
+        Ok(binary) => {
             if test_mode {
                 // Tests already ran and printed output, just return dummy path
                 return Ok(file.with_extension("test"));
             }
-            println!("✅ Successfully compiled {} bytes", wasm.len());
-            let out_path = file.with_extension("wasm");
-            fs::write(&out_path, wasm).into_diagnostic()?;
+            println!("✅ Successfully compiled {} bytes", binary.len());
+            
+            // Determine output extension based on target
+            let out_ext = target.output_extension();
+            let out_path = if out_ext.is_empty() {
+                // Native binaries on Linux/Android have no extension
+                file.with_extension("")
+            } else {
+                file.with_extension(out_ext)
+            };
+            
+            fs::write(&out_path, binary).into_diagnostic()?;
             println!("📦 Wrote to {}", out_path.display());
             Ok(out_path)
         }
