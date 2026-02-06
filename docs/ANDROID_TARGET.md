@@ -261,9 +261,27 @@ adb push target/android/web/ /sdcard/lora-chat/
 
 ## Status
 
-- [ ] Phase 1: Target types
-- [ ] Phase 2: CLI updates
-- [ ] Phase 3: Native compilation
-- [ ] Phase 4: Split output
-- [ ] Phase 5: Android NDK integration
-- [ ] Phase 6: Testing on actual Android device
+- [x] Phase 1: Target types (`CompileTarget` enum in `src/types.rs`)
+- [x] Phase 2: CLI updates (`--target android|linux|windows` in `src/main.rs`)
+- [x] Phase 3: Native compilation (`compile_native()` in `src/languages/rust/mod.rs`)
+- [x] Phase 4: Split output (`CompileOutput` struct, web assets to `web/` subdirectory)
+- [x] Phase 5: Android NDK integration (auto-detect, `.cargo/config.toml` setup, Windows `.cmd` wrapper fix)
+- [x] Phase 6: Testing on actual Android device ✅
+
+## Implementation Notes
+
+### Windows NDK Quirk
+On Windows, the NDK clang wrappers are `.cmd` files, not executables. The compiler auto-detects Windows and appends `.cmd` to the linker path.
+
+### Polyglot Import Handling
+For native targets, the compiler skips polyglot-specific interface codegen and passes raw Rust code directly. The `#[interface]` blocks and JS/HTML interop are only processed for WASM targets.
+
+### Output Structure
+```
+poly build app.poly --target android
+├── app              # Native aarch64 binary
+└── web/
+    ├── index.html
+    ├── app.js
+    └── styles.css
+```
