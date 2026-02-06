@@ -663,6 +663,28 @@ pub mod env {
             Ok(path)
         }
     }
+    
+    /// Get command line arguments
+    pub fn args() -> Vec<String> {
+        unsafe {
+            let mut len: usize = 0;
+            let ptr = host_env_args(&mut len);
+            if ptr.is_null() || len == 0 {
+                return Vec::new();
+            }
+            let json = std::str::from_utf8(std::slice::from_raw_parts(ptr, len))
+                .unwrap_or("[]");
+            // Parse JSON array: ["arg1","arg2",...]
+            let result: Vec<String> = json
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .collect();
+            host_free(ptr, len);
+            result
+        }
+    }
 }
 
 pub mod console {
@@ -1399,6 +1421,7 @@ mod host_imports {
         pub fn get(_: &str) -> Option<String> { None }
         pub fn set(_: &str, _: &str) -> HostResult<()> { unimplemented!() }
         pub fn cwd() -> HostResult<String> { unimplemented!() }
+        pub fn args() -> Vec<String> { std::env::args().collect() }
     }
     
     pub mod console {

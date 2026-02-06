@@ -390,6 +390,27 @@ pub mod env {
             Ok(())
         }
     }
+
+    pub fn args() -> Vec<String> {
+        unsafe {
+            let mut len: usize = 0;
+            let ptr = host_env_args(&mut len);
+            if ptr.is_null() || len == 0 { return vec!["program".to_string()]; }
+            let json = std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).unwrap_or("[]");
+            // Parse JSON array: ["arg1","arg2",...]
+            let host_args: Vec<String> = json
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .collect();
+            host_free(ptr, len);
+            // Prepend program name for std::env::args() compatibility
+            let mut result = vec!["program".to_string()];
+            result.extend(host_args);
+            result
+        }
+    }
 }
 
 // ============================================================================
