@@ -1,10 +1,11 @@
-// Compile Python and Rust blocks to WASM
+// Compile Python and Rust blocks to WASM or native binaries
 
 use crate::languages::find_language;
 use crate::parser::ParsedFile;
 use crate::types::CompileOptions;
 use anyhow::Result;
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 // We need a local error type or just use anyhow
@@ -20,7 +21,18 @@ pub enum CompileError {
     Other(#[from] anyhow::Error),
 }
 
-pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, CompileError> {
+/// Result of compilation, may include binary and/or web assets
+#[derive(Debug, Default)]
+pub struct CompileOutput {
+    /// The compiled binary (WASM or native)
+    pub binary: Vec<u8>,
+    /// Whether this includes web assets (JS/HTML/CSS)
+    pub has_web_assets: bool,
+    /// Paths to generated web assets (relative to temp_dir)
+    pub web_assets: Vec<String>,
+}
+
+pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<CompileOutput, CompileError> {
     fs::create_dir_all(&opts.temp_dir)?;
 
     let mut wasm_modules = Vec::new();
@@ -338,7 +350,7 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
 
     // In test mode, we're done after running tests - skip artifact generation
     if opts.test_mode {
-        return Ok(Vec::new());
+        return Ok(CompileOutput::default());
     }
 
     // Note: Python is now embedded in Rust via RustPython bridge
@@ -429,8 +441,31 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<Vec<u8>, Co
         eprintln!("📄 Generated: {} ({} bytes)", filename, content.len());
     }
 
+    // Track which web assets were generated
+    let mut web_assets = Vec::new();
+    if opts.temp_dir.join("index.html").exists() {
+        web_assets.push("index.html".to_string());
+    }
+    if opts.temp_dir.join("app.js").exists() {
+        web_assets.push("app.js".to_string());
+    }
+    if opts.temp_dir.join("styles.css").exists() {
+        web_assets.push("styles.css".to_string());
+    }
+    if opts.temp_dir.join("shaders.wgsl").exists() {
+        web_assets.push("shaders.wgsl".to_string());
+    }
+    
+    let has_web_assets = !web_assets.is_empty();
+
     // Link all modules together
-    link_modules(&wasm_modules, opts)
+    let binary = link_modules(&wasm_modules, opts)?;
+    
+    Ok(CompileOutput {
+        binary,
+        has_web_assets,
+        web_assets,
+    })
 }
 
 /// Extract pub const NAME: &str = "VALUE"; from Rust code

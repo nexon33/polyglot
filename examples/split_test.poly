@@ -1,0 +1,59 @@
+# Test split output: native binary + web UI
+
+#[rs]
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
+fn main() {
+    println!("Starting web server on http://localhost:8080");
+    
+    let listener = TcpListener::bind("127.0.0.1:8080").expect("Failed to bind");
+    
+    for stream in listener.incoming() {
+        if let Ok(mut stream) = stream {
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>Hello from Poly native server!</h1>";
+            let _ = stream.write_all(response.as_bytes());
+        }
+    }
+}
+
+#[js]
+// Simple React-style component
+export const App = () => {
+    const [count, setCount] = React.useState(0);
+    
+    return (
+        <div className="app">
+            <h1>Poly Split Output Test</h1>
+            <p>Count: {count}</p>
+            <button onClick={() => setCount(c => c + 1)}>Increment</button>
+        </div>
+    );
+};
+
+#[html]
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Poly Split Test</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script src="app.js"></script>
+</body>
+</html>
+
+#[css]
+.app {
+    font-family: sans-serif;
+    padding: 20px;
+    text-align: center;
+}
+
+button {
+    padding: 10px 20px;
+    font-size: 16px;
+    cursor: pointer;
+}

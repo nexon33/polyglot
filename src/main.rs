@@ -651,12 +651,12 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) 
     };
 
     match compile(&parsed, &opts) {
-        Ok(binary) => {
+        Ok(output) => {
             if test_mode {
                 // Tests already ran and printed output, just return dummy path
                 return Ok(file.with_extension("test"));
             }
-            println!("✅ Successfully compiled {} bytes", binary.len());
+            println!("✅ Successfully compiled {} bytes", output.binary.len());
             
             // Determine output extension based on target
             let out_ext = target.output_extension();
@@ -667,8 +667,26 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) 
                 file.with_extension(out_ext)
             };
             
-            fs::write(&out_path, binary).into_diagnostic()?;
+            fs::write(&out_path, &output.binary).into_diagnostic()?;
             println!("📦 Wrote to {}", out_path.display());
+            
+            // For native targets with web assets, copy them to a web/ subdirectory
+            if target.is_native() && output.has_web_assets {
+                let web_dir = out_path.parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("web");
+                fs::create_dir_all(&web_dir).into_diagnostic()?;
+                
+                for asset in &output.web_assets {
+                    let src = opts.temp_dir.join(asset);
+                    let dst = web_dir.join(asset);
+                    if src.exists() {
+                        fs::copy(&src, &dst).into_diagnostic()?;
+                    }
+                }
+                println!("🌐 Web assets copied to {}/", web_dir.display());
+            }
+            
             Ok(out_path)
         }
         Err(e) => {
@@ -1673,11 +1691,11 @@ fn rebuild_for_watch(
         ..Default::default()
     };
 
-    let wasm = compile(&parsed, &opts).into_diagnostic()?;
+    let output = compile(&parsed, &opts).into_diagnostic()?;
 
     // Bundle to HTML - use same temp_dir as CompileOptions::default()
     let temp_dir = PathBuf::from("target/polyglot_tmp");
-    let bundle = polyglot::compiler::bundle_to_single_file(&temp_dir, &wasm, "Polyglot Dev").into_diagnostic()?;
+    let bundle = polyglot::compiler::bundle_to_single_file(&temp_dir, &output.binary, "Polyglot Dev").into_diagnostic()?;
 
     fs::write(html_path, &bundle).into_diagnostic()?;
 
