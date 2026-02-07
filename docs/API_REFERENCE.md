@@ -364,6 +364,69 @@ polyglot verify <FILE>
 
 ---
 
+## Project Manifest (poly.toml)
+
+Place a `poly.toml` file alongside your `.poly` files to declare dependencies and project metadata.
+
+### Format
+
+```toml
+[package]
+name = "myapp"
+version = "0.1.0"
+description = "My polyglot application"
+
+[rust]
+# Cargo.toml format - flows to [dependencies]
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+
+[npm]
+# package.json format - flows to dependencies
+react = "^18.0.0"
+lodash = "^4.17.0"
+
+[pip]
+# requirements.txt format
+numpy = ">=1.20"
+requests = { version = ">=2.25", extras = ["security"] }
+
+[build]
+# Build configuration
+target = "browser"  # Default target
+release = false     # Default to debug builds
+```
+
+### Dependency Formats
+
+**Rust:**
+```toml
+[rust]
+simple = "1.0"                           # version only
+complex = { version = "1.0", features = ["derive"] }
+```
+
+**NPM:**
+```toml
+[npm]
+react = "^18.0.0"
+lodash = "~4.17.0"
+```
+
+**Python:**
+```toml
+[pip]
+numpy = ">=1.20"
+requests = { version = ">=2.25", extras = ["security"] }
+```
+
+### Fallback
+
+If no `poly.toml` exists, dependencies are auto-detected from `use` statements in your code.
+
+---
+
 ## Environment Variables
 
 | Variable | Description |

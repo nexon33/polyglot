@@ -275,6 +275,36 @@ polyglot compose a.wasm b.wasm      # Compose components
 | `apk` | `.apk` | Android apps |
 | `host` | Native binary | Current platform |
 
+## Dependencies (poly.toml)
+
+Create a `poly.toml` next to your `.poly` file to declare dependencies:
+
+```toml
+[package]
+name = "myapp"
+version = "0.1.0"
+
+[rust]
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = "0.11"
+
+[npm]
+react = "^18.0.0"
+lodash = "^4.17.0"
+
+[pip]
+numpy = ">=1.20"
+requests = ">=2.25"
+```
+
+Dependencies flow into the appropriate package manager:
+- `[rust]` → Cargo.toml
+- `[npm]` → package.json
+- `[pip]` → requirements.txt
+
+If no `poly.toml` exists, common dependencies are auto-detected from `use` statements.
+
 ## Examples
 
 See the `examples/` directory:
