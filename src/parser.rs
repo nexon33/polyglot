@@ -448,11 +448,12 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
         parsed.imports.push(Import { items, path });
     }
 
-    // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[types], #[main], #[cargo], etc.
+    // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[types], #[main], etc.
     // Only matches known polyglot tags, not Rust attributes like #[no_mangle]
-    // Supported: rust/rs, python/py, typescript/ts, javascript/js, interface, types, main, gpu, wgsl, jsx, html, rscss, css, test, doc, cargo
+    // Supported: rust/rs, python/py, typescript/ts, javascript/js, interface, types, main, gpu, wgsl, jsx, html, rscss, css, test, doc
     // Static/config blocks (not compiled): md, toml, json, yaml, txt, cfg, ini, xml, env, dockerfile, makefile, sh, bat, ps1, sql
-    let re = Regex::new(r"(?m)^#\[(interface|types|cargo|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::[a-zA-Z0-9_:/\.\-]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
+    // Note: Dependencies are declared in poly.toml, not inline blocks
+    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::[a-zA-Z0-9_:/\.\-]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
         .unwrap();
 
     let matches: Vec<_> = re.find_iter(source).collect();

@@ -70,33 +70,6 @@ impl Rust {
         deps.join("\n")
     }
     
-    /// Extract #[cargo] block content from source (TOML dependency declarations)
-    fn extract_cargo_block(source: &str) -> Option<String> {
-        // Look for #[cargo] { ... } pattern
-        let cargo_start = source.find("#[cargo]")?;
-        let brace_start = source[cargo_start..].find('{')? + cargo_start;
-        
-        // Find matching closing brace
-        let mut depth = 0;
-        let mut end_pos = None;
-        for (i, c) in source[brace_start..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end_pos = Some(brace_start + i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        
-        let end = end_pos?;
-        Some(source[brace_start + 1..end].trim().to_string())
-    }
-    
     /// Compile to native binary (for Android, Linux, Windows targets)
     fn compile_native(&self, source: &str, opts: &CompileOptions) -> Result<Vec<u8>> {
         let target_triple = opts.target.target_triple();
@@ -118,34 +91,26 @@ impl Rust {
             .map(|m| m.rust_dependencies_toml())
             .unwrap_or_default();
         
-        // Auto-detect dependencies from use statements (fallback)
+        // Auto-detect dependencies from use statements (fallback if no manifest)
         let auto_deps = if manifest_deps.is_empty() {
             Self::detect_dependencies(source)
         } else {
             String::new() // Skip auto-detection if manifest provides deps
         };
         
-        // Extract explicit #[cargo] block if present (inline override)
-        let cargo_block_deps = Self::extract_cargo_block(source).unwrap_or_default();
-        
-        // Combine all dependencies (manifest > cargo block > auto-detect)
+        // Combine all dependencies (manifest > auto-detect)
         let all_deps = format!(
-            "{serial_dep}{manifest_deps}\n{auto_deps}\n{cargo_block_deps}",
+            "{serial_dep}{manifest_deps}\n{auto_deps}",
             serial_dep = serial_dep,
             manifest_deps = manifest_deps,
-            auto_deps = auto_deps,
-            cargo_block_deps = cargo_block_deps
+            auto_deps = auto_deps
         );
         
         // Log dependency sources
         if !manifest_deps.is_empty() {
             eprintln!("📦 Using dependencies from poly.toml [rust]");
-        }
-        if !auto_deps.is_empty() {
+        } else if !auto_deps.is_empty() {
             eprintln!("📦 Auto-detected dependencies from use statements");
-        }
-        if !cargo_block_deps.is_empty() {
-            eprintln!("📦 Using explicit #[cargo] block dependencies");
         }
         
         // For Android, build as shared library with JNI
