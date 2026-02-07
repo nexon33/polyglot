@@ -448,11 +448,11 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
         parsed.imports.push(Import { items, path });
     }
 
-    // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[types], #[main], etc.
+    // Regex to find polyglot block headers: #[rust], #[python], #[interface], #[types], #[main], #[cargo], etc.
     // Only matches known polyglot tags, not Rust attributes like #[no_mangle]
-    // Supported: rust/rs, python/py, typescript/ts, javascript/js, interface, types, main, gpu, wgsl, jsx, html, rscss, css, test, doc
+    // Supported: rust/rs, python/py, typescript/ts, javascript/js, interface, types, main, gpu, wgsl, jsx, html, rscss, css, test, doc, cargo
     // Static/config blocks (not compiled): md, toml, json, yaml, txt, cfg, ini, xml, env, dockerfile, makefile, sh, bat, ps1, sql
-    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::[a-zA-Z0-9_:/\.\-]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
+    let re = Regex::new(r"(?m)^#\[(interface|types|cargo|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::[a-zA-Z0-9_:/\.\-]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
         .unwrap();
 
     let matches: Vec<_> = re.find_iter(source).collect();
@@ -639,13 +639,15 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     // ═══════════════════════════════════════════════════════════════════════
     // Phase 24b: Per-block syntax normalization
     // ═══════════════════════════════════════════════════════════════════════
-    // Only normalize Rust and Python blocks. JS/HTML/CSS/GPU blocks keep
-    // their native syntax untouched.
+    // Only normalize Python blocks. Rust blocks are already valid Rust.
+    // JS/HTML/CSS/GPU blocks keep their native syntax untouched.
     for block in &mut parsed.blocks {
         match block.lang_tag.as_str() {
-            "rust" | "python" | "main" => {
+            // Python blocks need full normalization (def→fn, indent→braces, etc.)
+            "python" | "py" => {
                 block.code = crate::syntax_aliases::normalize_all(&block.code);
             }
+            // Rust/main blocks are already valid Rust - no normalization needed
             // JS, HTML, CSS, GPU, JSX, WGSL, test, doc, etc. → no normalization
             _ => {}
         }

@@ -13,6 +13,89 @@ impl Rust {
         Self
     }
     
+    /// Auto-detect crate dependencies from `use` statements
+    fn detect_dependencies(source: &str) -> String {
+        let mut deps = Vec::new();
+        
+        // Common crates and their default versions/features
+        let crate_patterns: Vec<(&str, &str)> = vec![
+            ("serde", r#"serde = { version = "1.0", features = ["derive"] }"#),
+            ("serde_json", r#"serde_json = "1.0""#),
+            ("tokio", r#"tokio = { version = "1", features = ["full"] }"#),
+            ("futures", r#"futures = "0.3""#),
+            ("futures_util", r#"futures-util = "0.3""#),
+            ("async_tungstenite", r#"async-tungstenite = { version = "0.25", features = ["tokio-runtime"] }"#),
+            ("tungstenite", r#"tungstenite = "0.21""#),
+            ("reqwest", r#"reqwest = { version = "0.11", features = ["json", "stream"] }"#),
+            ("hyper", r#"hyper = { version = "1", features = ["full"] }"#),
+            ("axum", r#"axum = "0.7""#),
+            ("tracing", r#"tracing = "0.1""#),
+            ("tracing_subscriber", r#"tracing-subscriber = { version = "0.3", features = ["env-filter"] }"#),
+            ("thiserror", r#"thiserror = "1.0""#),
+            ("uuid", r#"uuid = { version = "1", features = ["v4"] }"#),
+            ("chrono", r#"chrono = { version = "0.4", features = ["serde"] }"#),
+            ("regex", r#"regex = "1""#),
+            ("once_cell", r#"once_cell = "1""#),
+            ("lazy_static", r#"lazy_static = "1""#),
+            ("parking_lot", r#"parking_lot = "0.12""#),
+            ("dashmap", r#"dashmap = "5""#),
+            ("rand", r#"rand = "0.8""#),
+            ("base64", r#"base64 = "0.21""#),
+            ("sha2", r#"sha2 = "0.10""#),
+            ("hmac", r#"hmac = "0.12""#),
+            ("aes", r#"aes = "0.8""#),
+            ("bytes", r#"bytes = "1""#),
+            ("http", r#"http = "1""#),
+            ("url", r#"url = "2""#),
+            ("mime", r#"mime = "0.3""#),
+            ("tokio_tungstenite", r#"tokio-tungstenite = "0.21""#),
+            ("async_std", r#"async-std = "1""#),
+            ("smol", r#"smol = "2""#),
+            ("crossbeam", r#"crossbeam = "0.8""#),
+            ("flume", r#"flume = "0.11""#),
+            ("pin_project", r#"pin-project = "1""#),
+            ("async_trait", r#"async-trait = "0.1""#),
+        ];
+        
+        for (crate_name, dep_line) in crate_patterns {
+            // Check for `use crate_name::` or `crate_name::` usage
+            let use_pattern = format!("use {}::", crate_name);
+            let direct_pattern = format!("{}::", crate_name);
+            if source.contains(&use_pattern) || source.contains(&direct_pattern) {
+                deps.push(dep_line.to_string());
+            }
+        }
+        
+        deps.join("\n")
+    }
+    
+    /// Extract #[cargo] block content from source (TOML dependency declarations)
+    fn extract_cargo_block(source: &str) -> Option<String> {
+        // Look for #[cargo] { ... } pattern
+        let cargo_start = source.find("#[cargo]")?;
+        let brace_start = source[cargo_start..].find('{')? + cargo_start;
+        
+        // Find matching closing brace
+        let mut depth = 0;
+        let mut end_pos = None;
+        for (i, c) in source[brace_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_pos = Some(brace_start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        let end = end_pos?;
+        Some(source[brace_start + 1..end].trim().to_string())
+    }
+    
     /// Compile to native binary (for Android, Linux, Windows targets)
     fn compile_native(&self, source: &str, opts: &CompileOptions) -> Result<Vec<u8>> {
         let target_triple = opts.target.target_triple();
@@ -27,6 +110,28 @@ impl Rust {
         } else {
             ""
         };
+        
+        // Auto-detect dependencies from use statements
+        let auto_deps = Self::detect_dependencies(source);
+        
+        // Extract explicit #[cargo] block if present
+        let cargo_block_deps = Self::extract_cargo_block(source).unwrap_or_default();
+        
+        // Combine all dependencies
+        let all_deps = format!(
+            "{serial_dep}{auto_deps}\n{cargo_block_deps}",
+            serial_dep = serial_dep,
+            auto_deps = auto_deps,
+            cargo_block_deps = cargo_block_deps
+        );
+        
+        // Log detected dependencies
+        if !auto_deps.is_empty() {
+            eprintln!("📦 Auto-detected dependencies from use statements");
+        }
+        if !cargo_block_deps.is_empty() {
+            eprintln!("📦 Using explicit #[cargo] block dependencies");
+        }
         
         // For Android, build as shared library with JNI
         let cargo_toml = if is_android {
@@ -47,12 +152,14 @@ path = "lib.rs"
 [dependencies]
 anyhow = "1.0"
 jni = "0.21"
+{all_deps}
 
 [profile.release]
 opt-level = "s"
 lto = false
 strip = "none"
-"#
+"#,
+                all_deps = all_deps
             )
         } else {
             format!(
@@ -70,12 +177,14 @@ path = "main.rs"
 
 [dependencies]
 anyhow = "1.0"
-{serial_dep}
+{all_deps}
+
 [profile.release]
 opt-level = "z"
 lto = true
 strip = true
-"#
+"#,
+                all_deps = all_deps
             )
         };
 
