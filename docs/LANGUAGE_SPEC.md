@@ -1,251 +1,497 @@
 # Poly Language Specification
 
-> **One language. Every runtime.**
+> Version 1.0 — February 2026
 
-Poly is a polyglot macro system that enables type-safe cross-language programming in Rust.
+## Overview
 
-## Table of Contents
+Poly is a polyglot source format that combines multiple languages in a single `.poly` file. The compiler parses language-tagged blocks and compiles them to the appropriate target.
 
-1. [Quick Start](#quick-start)
-2. [Expression Macros](#expression-macros)
-3. [Type Bridge](#type-bridge)
-4. [Marshaling](#marshaling)
-5. [Ownership Model](#ownership-model)
-6. [Error Handling](#error-handling)
+## File Structure
 
----
+A `.poly` file consists of:
+1. **Comments** — Single-line `//` comments
+2. **Imports** — `use` statements for other `.poly` files
+3. **Language blocks** — `#[lang] { code }` sections
 
-## Quick Start
+```poly
+// Comments at top level
+use * from "./utils.poly"
 
-```rust
-use polyglot_macros::{js, py, ts, poly_bridge};
+#[rust] {
+    // Rust code here
+}
 
-fn main() {
-    // JavaScript - Boa engine (pure Rust)
-    let sum: i32 = js!{ [1,2,3].reduce((a,b) => a+b, 0) };
-    
-    // TypeScript - SWC + Boa (pure Rust)
-    let typed: i32 = ts!{ const x: number = 5; x * 2 };
-    
-    // Scripting - Rhai engine (pure Rust)
-    let script: i32 = py!{ let x = 10; x * 2 };
-    
-    println!("{sum}, {typed}, {script}");  // 6, 10, 20
+#[js] {
+    // JavaScript code here
 }
 ```
 
-**Zero external dependencies** - all interpreters are embedded in pure Rust.
+## Two Paradigms
 
----
+Poly supports two complementary ways to mix languages:
 
-## Expression Macros
+| Paradigm | Syntax | Use Case |
+|----------|--------|----------|
+| **Blocks** | `#[rust] { ... }` | Organize code by language |
+| **Macros** | `js!{ ... }` | Inline cross-language calls |
+
+## Language Blocks
+
+### Syntax
+
+```
+#[language_tag] {
+    code
+}
+```
+
+Or with options:
+
+```
+#[language_tag, option="value"] {
+    code
+}
+```
+
+### Supported Languages
+
+| Tag | Aliases | Description |
+|-----|---------|-------------|
+| `rust` | `rs` | Rust code (primary) |
+| `javascript` | `js` | JavaScript code |
+| `python` | `py` | Python code |
+| `html` | — | HTML markup |
+| `css` | — | CSS styles |
+| `main` | — | Entry point marker |
+
+### Rust Blocks
+
+Rust is the primary language. Most compilation happens through Rust.
+
+```poly
+#[rust] {
+    use std::collections::HashMap;
+    
+    pub fn main() {
+        println!("Hello!");
+    }
+}
+
+// Short form
+#[rs] {
+    fn helper() -> i32 { 42 }
+}
+```
+
+**Features supported:**
+- Full Rust syntax including generics, lifetimes, macros
+- `use` statements for crates
+- `async`/`await` (with tokio for native builds)
+- All standard library types
+
+### JavaScript Blocks
+
+For frontend logic and browser APIs.
+
+```poly
+#[js] {
+    const greet = (name) => `Hello, ${name}!`;
+    
+    document.querySelector('#btn').onclick = () => {
+        console.log(greet('World'));
+    };
+}
+
+// Short form
+#[javascript] {
+    // Same as #[js]
+}
+```
+
+**Features supported:**
+- ES6+ syntax (arrow functions, template literals, destructuring)
+- DOM manipulation
+- `async`/`await`, Promises
+- Module imports (when using `npm` command)
+
+### Python Blocks
+
+For scripting and data processing.
+
+```poly
+#[python] {
+    def process(items):
+        return [x * 2 for x in items]
+    
+    result = process([1, 2, 3])
+    print(f"Result: {result}")
+}
+
+// Short form
+#[py] {
+    # Same as #[python]
+}
+```
+
+**Note:** Python blocks are transpiled or interpreted depending on target.
+
+### HTML Blocks
+
+For document structure.
+
+```poly
+#[html] {
+    <div id="app">
+        <h1>Title</h1>
+        <p>Content here.</p>
+    </div>
+}
+```
+
+HTML is extracted and inlined into the bundle's `<body>`.
+
+### CSS Blocks
+
+For styling.
+
+```poly
+#[css] {
+    #app {
+        max-width: 800px;
+        margin: 0 auto;
+    }
+    
+    h1 {
+        color: #333;
+    }
+}
+```
+
+CSS is extracted and inlined into a `<style>` tag.
+
+### Main Block
+
+Marks the entry point for WASM targets.
+
+```poly
+#[main] {
+    // Called when WASM module loads
+}
+```
+
+For native targets, use `fn main()` in a Rust block.
+
+## Inline Macros
+
+Within Rust blocks, you can embed other languages inline using macros.
 
 ### `js!{ expr }`
 
-Evaluates JavaScript using the Boa engine.
+Evaluate JavaScript and return the result to Rust.
 
-```rust
-// Arithmetic
-let n: i32 = js!{ 1 + 2 + 3 };
-
-// ES6 arrow functions
-let doubled: Vec<i32> = js!{ [1,2,3].map(x => x * 2) };
-
-// Template literals
-let msg: String = js!{ `Hello ${name}!` };
-
-// Math operations
-let pi: f64 = js!{ Math.PI };
-```
-
-### `ts!{ expr }`
-
-Evaluates TypeScript using SWC (transpile) + Boa (execute).
-
-```rust
-// Type annotations
-let result: i32 = ts!{ const x: number = 5; x * 2 };
-
-// Interfaces (compile-time only)
-let obj: String = ts!{
-    interface Point { x: number; y: number }
-    const p: Point = { x: 10, y: 20 };
-    `${p.x},${p.y}`
-};
+```poly
+#[rust] {
+    fn main() {
+        // Simple expression
+        let sum: i32 = js!{ 1 + 2 + 3 };
+        
+        // Array operations
+        let doubled: Vec<i32> = js!{ [1,2,3].map(x => x * 2) };
+        
+        // Template literals
+        let msg: String = js!{ `Hello, ${"World"}!` };
+        
+        // Complex logic
+        let result: f64 = js!{
+            const data = [1, 2, 3, 4, 5];
+            data.reduce((a, b) => a + b) / data.length
+        };
+        
+        println!("{}, {:?}, {}, {}", sum, doubled, msg, result);
+    }
+}
 ```
 
 ### `py!{ expr }`
 
-Evaluates Rhai scripting language (Python-like syntax).
+Evaluate Python/Rhai scripting inline.
 
-```rust
-// Variables and loops
-let sum: i32 = py!{
-    let total = 0;
-    for i in 1..=10 { total += i; }
-    total
-};
-
-// Arrays
-let arr: Vec<i32> = py!{ [1, 2, 3, 4, 5] };
-
-// String operations
-let hello: String = py!{ "Hello" + " " + "World" };
-```
-
----
-
-## Type Bridge
-
-The `#[poly_bridge]` attribute generates type-safe FFI wrappers.
-
-### Basic Usage
-
-```rust
-#[poly_bridge(javascript)]
-trait Calculator {
-    fn add(&self, a: i32, b: i32) -> i32;
-    fn multiply(&self, a: i32, b: i32) -> i32;
+```poly
+#[rust] {
+    fn main() {
+        // Arithmetic
+        let factorial: i32 = py!{
+            let n = 5;
+            let result = 1;
+            for i in 1..=n { result *= i; }
+            result
+        };
+        
+        // List comprehension style
+        let squares: Vec<i32> = py!{ [1, 4, 9, 16, 25] };
+        
+        println!("5! = {}, squares = {:?}", factorial, squares);
+    }
 }
-
-// Generates: JsCalculator struct
-let calc: JsCalculator = js!{ ({ 
-    add: (a, b) => a + b,
-    multiply: (a, b) => a * b 
-}) };
-
-// Type-safe method calls!
-let sum = calc.add(2, 3);       // Compile-time type checking
-let prod = calc.multiply(4, 5); // Returns i32
 ```
 
-### Runtime Selection
+### `ts!{ expr }`
 
-```rust
-#[poly_bridge(python)]      // → PyDataFrame
-#[poly_bridge(javascript)]  // → JsDataFrame  
-#[poly_bridge(typescript)]  // → TsDataFrame
+Evaluate TypeScript (transpiled via SWC, then executed).
+
+```poly
+#[rust] {
+    fn main() {
+        let typed: i32 = ts!{
+            const x: number = 10;
+            const y: number = 20;
+            x + y
+        };
+        println!("TypeScript result: {}", typed);
+    }
+}
 ```
 
-### Generated Code
+### Type Marshaling
 
-For `#[poly_bridge(javascript)] trait Foo { ... }`:
-
-1. **Wrapper struct**: `JsFoo` with `ForeignHandle`
-2. **Trait impl**: Methods marshal args, call runtime, unmarshal result
-3. **From impl**: `JsFoo::from_foreign(value)`
-
----
-
-## Marshaling
-
-### ToForeign Trait
-
-Converts Rust types to foreign values:
+Macros automatically convert between Rust and foreign types:
 
 | Rust Type | Foreign Value |
 |-----------|---------------|
-| `i32`, `i64` | `Int(i64)` |
-| `f64` | `Float(f64)` |
-| `bool` | `Bool(bool)` |
-| `String`, `&str` | `String(String)` |
-| `Vec<T>` | `Array(Vec<ForeignValue>)` |
-| `Option<T>` | `T` or `Null` |
+| `i32`, `i64` | Integer |
+| `f64` | Float |
+| `bool` | Boolean |
+| `String` | String |
+| `Vec<T>` | Array |
+| `Option<T>` | Value or null |
 
-### FromForeign Trait
+### When to Use Each
 
-Converts foreign values to Rust types. Returns `Result<T, PolyglotError>`.
+| Use Case | Approach |
+|----------|----------|
+| Organizing a multi-language app | Language blocks |
+| Quick inline calculation | Macros |
+| DOM manipulation (browser) | `#[js]` block |
+| Data processing in Rust | `py!{}` macro for helpers |
+| Type definitions | `#[rust]` block |
 
-### Custom Types
+---
 
-```rust
-use polyglot_runtime::bridge::{ToForeign, FromForeign, ForeignValue};
+## Imports
 
-struct Point { x: i32, y: i32 }
+Import definitions from other `.poly` files:
 
-impl ToForeign for Point {
-    fn to_foreign(&self) -> ForeignValue {
-        ForeignValue::Object(HashMap::from([
-            ("x".into(), self.x.to_foreign()),
-            ("y".into(), self.y.to_foreign()),
-        ]))
+```poly
+// Import everything
+use * from "./utils.poly"
+
+// Import specific items
+use { helper, Config } from "./lib.poly"
+
+// Relative paths
+use * from "../shared/types.poly"
+```
+
+**Resolution:**
+- Paths are relative to the importing file
+- `.poly` extension is required
+- Imported blocks are merged into the compilation
+
+## Comments
+
+```poly
+// This is a single-line comment
+
+#[rust] {
+    // Comments inside blocks follow that language's rules
+    /* Block comments work in Rust/JS */
+}
+
+#[python] {
+    # Python uses hash comments
+    """
+    And docstrings
+    """
+}
+```
+
+## Block Options
+
+Blocks can have options:
+
+```poly
+#[rust, feature="async"] {
+    async fn fetch() { }
+}
+```
+
+Currently recognized options:
+- Reserved for future use
+
+## Strings and Escaping
+
+Each language block follows its own string rules:
+
+```poly
+#[rust] {
+    let s = "double quotes";
+    let r = r#"raw string"#;
+    let c = 'c';  // char
+}
+
+#[js] {
+    const s = "double quotes";
+    const t = `template ${literal}`;
+    const r = /regex/gi;
+}
+
+#[python] {
+    s = "double quotes"
+    s2 = 'single quotes'
+    ml = """multiline
+    string"""
+    f = f"formatted {value}"
+}
+```
+
+The parser correctly handles:
+- Nested braces inside strings
+- Escape sequences (`\"`, `\'`, `\\`)
+- Template literals with `${}` interpolation
+- Raw strings (`r"..."`, `r#"..."#`)
+- Triple-quoted strings
+- Rust lifetimes (`'a`, `'static`)
+
+## Entry Points
+
+### Native Builds
+
+Use `fn main()` in a Rust block:
+
+```poly
+#[rust] {
+    fn main() {
+        println!("Native app!");
     }
 }
 ```
 
----
+Or `export fn main()`:
 
-## Ownership Model
-
-### ForeignHandle
-
-References to foreign objects are tracked with `ForeignHandle`:
-
-```rust
-pub struct ForeignHandle {
-    id: u64,                      // Unique identifier
-    value: ForeignValue,          // Cached value
-    runtime: Option<RuntimeRef>,  // For cleanup
-}
-```
-
-### Automatic Cleanup
-
-When a `ForeignHandle` is dropped, it notifies the foreign runtime:
-
-```rust
-impl Drop for ForeignHandle {
-    fn drop(&mut self) {
-        if let Some(runtime) = &self.runtime {
-            runtime.release(self.id);  // Release foreign reference
-        }
+```poly
+#[rust] {
+    export fn main() {
+        // Exported main
     }
 }
 ```
 
-### Clone Semantics
+### WASM/Browser Builds
 
-Cloning a handle creates a new Rust reference to the same foreign object. The foreign runtime's reference count is not automatically incremented - this is by design for runtimes like JavaScript that use GC.
+Use `#[main]` block:
 
----
+```poly
+#[main] {
+    console.log("WASM loaded!");
+}
+```
+
+Or call into Rust from JS.
+
+## Type Exports
+
+Export types for use across blocks (planned):
+
+```poly
+#[rust] {
+    #[derive(Debug)]
+    pub struct User {
+        pub name: String,
+        pub age: u32,
+    }
+}
+
+#[js] {
+    // User type available here
+}
+```
+
+## Inline Tests
+
+```poly
+#[rust] {
+    pub fn add(a: i32, b: i32) -> i32 {
+        a + b
+    }
+    
+    #[test]
+    fn test_add() {
+        assert_eq!(add(2, 3), 5);
+    }
+}
+```
+
+Run with:
+```bash
+polyglot test file.poly
+```
+
+## WIT Interface Generation
+
+The compiler can generate WebAssembly Interface Types (WIT):
+
+```poly
+#[rust] {
+    export fn greet(name: String) -> String {
+        format!("Hello, {}!", name)
+    }
+}
+```
+
+Generates:
+```wit
+package poly:component;
+
+interface exports {
+    greet: func(name: string) -> string;
+}
+```
 
 ## Error Handling
 
-### PolyglotError
+Parse errors report the source location:
 
-```rust
-pub enum PolyglotError {
-    Python(String),         // Scripting engine error
-    JavaScript(String),     // JS engine error
-    TypeScript(String),     // TS compilation error
-    TypeConversion(String), // Marshaling error
-    NotInitialized(String), // Runtime not ready
-}
+```
+error[E0001]: Unmatched brace
+  --> file.poly:15:10
+   |
+15 |     fn broken( {
+   |              ^ unclosed brace
 ```
 
-### Error Propagation
+## Reserved Keywords
 
-```rust
-// Panics on error (immediate feedback)
-let x: i32 = js!{ invalid syntax here };  // panic!
+These are reserved for future use:
+- `cuda!{}` — GPU compute
+- `sql!{}` — Database queries
+- `wgsl!{}` — WebGPU shaders
 
-// Explicit Result handling (future)
-let result: Result<i32, PolyglotError> = js_try!{ 1 + 2 };
+## Grammar (Simplified)
+
+```ebnf
+file        = { comment | import | block } ;
+comment     = "//" { any } newline ;
+import      = "use" import_items "from" string ;
+import_items = "*" | "{" ident { "," ident } "}" ;
+block       = "#[" tag { "," option } "]" "{" code "}" ;
+tag         = "rust" | "rs" | "js" | "javascript" | "python" | "py" | "html" | "css" | "main" ;
+option      = ident "=" string ;
+code        = { any except unmatched-brace } ;
 ```
 
----
+## Compatibility
 
-## Future: Expression Strings for Closures
-
-For predicates and transformations, MVP uses expression strings:
-
-```rust
-// Instead of closures (complex to marshal)
-df.filter(|r| r.price > 100)
-
-// Use expression strings (safe, simple)
-df.filter("price > 100")
-df.select("name, price * 1.1 as adjusted_price")
-```
-
-This avoids the complexity of marshaling Rust closures across language boundaries while maintaining type safety for inputs and outputs.
+- Rust: 1.70+
+- JavaScript: ES6+
+- Python: 3.8+ (syntax)
+- Targets: Windows, Linux, macOS, WASM, Android

@@ -1,120 +1,301 @@
 # Poly
 
-> **One language. Every runtime.**
+> **One language. Every platform.**
 
-Poly is a polyglot macro system that enables type-safe cross-language programming in Rust with **zero external dependencies**.
+Poly is a polyglot compiler that lets you write multi-language programs and compile them to **native executables**, **WASM**, **browser apps**, or **Android APKs** from a single `.poly` file.
 
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+## Two Ways to Mix Languages
 
-## Quick Start
+### 1. Language Blocks — Organize by Language
 
-```rust
-use polyglot_macros::{js, py, ts};
+```poly
+// Separate sections for each language
+#[rust] {
+    fn main() {
+        println!("Hello from Poly!");
+    }
+}
 
-fn main() {
-    // JavaScript (Boa engine - pure Rust)
-    let sum: i32 = js!{ [1,2,3].reduce((a,b) => a+b, 0) };
-    
-    // TypeScript (SWC + Boa - pure Rust)
-    let typed: i32 = ts!{ const x: number = 5; x * 2 };
-    
-    // Scripting (Rhai - pure Rust)
-    let result: i32 = py!{ let x = 10; x * 2 };
-    
-    println!("{sum}, {typed}, {result}");  // 6, 10, 20
+#[js] {
+    const greet = (name) => `Hello, ${name}!`;
+}
+
+#[python] {
+    def add(a, b):
+        return a + b
 }
 ```
 
-**All interpreters are embedded. No Python, Node.js, or external runtimes required.**
+### 2. Inline Macros — Embed in Rust
+
+```poly
+#[rust] {
+    fn main() {
+        // Call JavaScript inline
+        let doubled: Vec<i32> = js!{ [1,2,3].map(x => x * 2) };
+        
+        // Call Python inline  
+        let sum: i32 = py!{ sum([1, 2, 3, 4, 5]) };
+        
+        println!("Doubled: {:?}, Sum: {}", doubled, sum);
+    }
+}
+```
+
+Both approaches work together — use blocks to organize code, macros to call across languages inline.
+
+Build for any target:
+```bash
+polyglot build hello.poly --target windows  # → hello.exe
+polyglot build hello.poly --target linux    # → hello (ELF)
+polyglot build hello.poly --target browser  # → hello.wasm + HTML
+polyglot build hello.poly --target apk      # → hello.apk
+```
 
 ## Features
 
-| Macro | Engine | Status |
-|-------|--------|--------|
-| `js!{}` | Boa | ✅ Working |
-| `ts!{}` | SWC + Boa | ✅ Working |
-| `py!{}` | Rhai | ✅ Working |
-| `cuda!{}` | - | 🚧 Reserved |
-| `sql!{}` | - | 🚧 Reserved |
-| `#[poly_bridge]` | - | ✅ Designed |
+| Feature | Status |
+|---------|--------|
+| Rust blocks | ✅ Full support |
+| JavaScript blocks | ✅ Full support |
+| Python blocks | ✅ Full support |
+| HTML/CSS blocks | ✅ Full support |
+| Native executables (Windows/Linux) | ✅ Working |
+| WASM compilation | ✅ Working |
+| Browser bundling | ✅ Working |
+| Android APK | ✅ Working |
+| Hot reload (`watch`) | ✅ Working |
+| Inline tests | ✅ Working |
+| WASM Components | 🚧 Experimental |
 
 ## Installation
 
-```toml
-[dependencies]
-polyglot-macros = { path = "./polyglot-macros" }
-polyglot-runtime = { path = "./polyglot-runtime" }
+```bash
+# Clone and build
+git clone https://github.com/user/poly.git
+cd poly
+cargo build --release
+
+# Add to PATH
+export PATH="$PATH:$(pwd)/target/release"
 ```
 
-## Type-Safe FFI Bridge
+## Quick Start
 
-```rust
-use polyglot_macros::poly_bridge;
-
-#[poly_bridge(javascript)]
-trait Calculator {
-    fn add(&self, a: i32, b: i32) -> i32;
-}
-
-// Generates JsCalculator with type-safe methods
-```
-
-## The `.poly` Format
-
-Poly also supports `.poly` files - multi-language source files:
+### Hello World
 
 ```poly
-// main.poly
-
-import numpy as np  // Python imports
-
-rust {
-    // Macros are auto-imported in .poly files!
-    let data = vec![1, 2, 3, 4, 5];
-    let doubled = py!{ (np.array(data) * 2).tolist() };
-}
-
-python {
-    def process(data):
-        return [x * 2 for x in data]
-}
-
-javascript {
-    const render = (data) => console.log(data);
+// hello.poly
+#[rust] {
+    fn main() {
+        println!("Hello, Poly!");
+    }
 }
 ```
 
-Compile with:
 ```bash
-polyglot compile main.poly --target wasm
-polyglot watch main.poly  # Hot reload
+polyglot run hello.poly
 ```
+
+### Browser App
+
+```poly
+// app.poly
+#[html] {
+    <div id="app">
+        <h1>My Poly App</h1>
+        <button onclick="greet()">Click me</button>
+    </div>
+}
+
+#[css] {
+    #app {
+        font-family: system-ui;
+        padding: 2rem;
+    }
+    button {
+        padding: 0.5rem 1rem;
+        cursor: pointer;
+    }
+}
+
+#[js] {
+    function greet() {
+        alert("Hello from Poly!");
+    }
+}
+
+#[main] {
+    // Entry point for WASM
+}
+```
+
+```bash
+polyglot bundle app.poly -o app.html
+# Open app.html in browser
+```
+
+### Native App with GUI
+
+```poly
+// gui.poly
+#[rust] {
+    use eframe::egui;
+    
+    fn main() -> eframe::Result<()> {
+        eframe::run_simple_native("Poly App", Default::default(), |ctx, _| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Hello from Poly!");
+            });
+        })
+    }
+}
+```
+
+```bash
+polyglot build gui.poly --target windows
+./gui.exe
+```
+
+## Language Blocks
+
+### Rust `#[rust]` or `#[rs]`
+The primary language. Compiles to native code or WASM.
+
+```poly
+#[rust] {
+    use std::collections::HashMap;
+    
+    pub fn main() {
+        let mut map = HashMap::new();
+        map.insert("key", "value");
+        println!("{:?}", map);
+    }
+}
+```
+
+### JavaScript `#[js]` or `#[javascript]`
+For frontend logic and browser APIs.
+
+```poly
+#[js] {
+    const fetchData = async (url) => {
+        const res = await fetch(url);
+        return res.json();
+    };
+    
+    document.getElementById("btn").onclick = () => {
+        console.log("Clicked!");
+    };
+}
+```
+
+### Python `#[python]` or `#[py]`
+For scripting, data processing, ML.
+
+```poly
+#[python] {
+    def process_data(items):
+        return [x * 2 for x in items if x > 0]
+    
+    result = process_data([1, -2, 3, 4])
+    print(f"Result: {result}")
+}
+```
+
+### HTML `#[html]`
+For document structure. Inlined into the bundle.
+
+```poly
+#[html] {
+    <div class="container">
+        <h1>Welcome</h1>
+        <p>This is a Poly app.</p>
+    </div>
+}
+```
+
+### CSS `#[css]`
+For styling. Inlined into the bundle.
+
+```poly
+#[css] {
+    .container {
+        max-width: 800px;
+        margin: 0 auto;
+    }
+}
+```
+
+## Imports
+
+Import from other `.poly` files:
+
+```poly
+use * from "./utils.poly"
+use { helper, Config } from "./lib.poly"
+```
+
+## Commands
+
+```bash
+# Build
+polyglot build file.poly --target <browser|windows|linux|apk>
+polyglot build file.poly --release  # Optimized build
+
+# Run
+polyglot run file.poly              # Build and run with wasmtime
+polyglot run file.poly -- arg1 arg2 # Pass arguments
+
+# Development
+polyglot watch file.poly            # Hot reload on changes
+polyglot check file.poly            # Parse and validate
+polyglot test file.poly             # Run inline tests
+
+# Bundle
+polyglot bundle file.poly -o out.html  # Self-contained HTML
+
+# Project
+polyglot init                       # Initialize project
+polyglot new --template basic       # Create from template
+
+# Advanced
+polyglot wit file.poly              # Generate WIT interface
+polyglot component file.poly        # Build WASM component
+polyglot compose a.wasm b.wasm      # Compose components
+```
+
+## Build Targets
+
+| Target | Output | Use Case |
+|--------|--------|----------|
+| `browser` | `.wasm` + `.html` | Web apps |
+| `windows` | `.exe` | Windows desktop |
+| `linux` | ELF binary | Linux desktop/server |
+| `apk` | `.apk` | Android apps |
+| `host` | Native binary | Current platform |
+
+## Examples
+
+See the `examples/` directory:
+
+- `hello.poly` - Basic hello world
+- `web_app.poly` - Full-stack web app
+- `calculator.poly` - Interactive calculator
+- `native_test.poly` - Native binary test
 
 ## Documentation
 
-- [Language Spec](docs/LANGUAGE_SPEC.md) - Full specification
-- [API Reference](docs/API_REFERENCE.md) - Complete API docs
-- [Architecture](docs/ARCHITECTURE.md) - System design
-
-## Running Examples
-
-```bash
-cargo run --example poly_runtime_demo
-```
-
-## Building
-
-```bash
-cargo build -p polyglot-macros -p polyglot-runtime
-```
+- [Language Specification](docs/LANGUAGE_SPEC.md) - Full syntax reference
+- [Architecture](docs/ARCHITECTURE.md) - Compiler internals
+- [Android Builds](docs/APK_GENERATION.md) - APK generation guide
 
 ## Philosophy
 
-- **Simple things simple**: `let x: i32 = js!{ 1 + 2 };`
-- **Complex things possible**: `#[poly_bridge(javascript)]`
-- **Zero dependencies**: All interpreters are pure Rust
-- **Type safety**: Compile-time checking across language boundaries
+- **One file, many languages** - Write Rust, JS, Python together
+- **One command, any target** - Same source → exe, wasm, apk
+- **Zero config** - Sensible defaults, no boilerplate
+- **Native performance** - Compiles to real machine code
 
 ## License
 

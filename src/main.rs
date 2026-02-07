@@ -833,7 +833,7 @@ fn build_apk(file: &PathBuf, parsed: &polyglot::parser::ParsedFile) -> MietteRes
     
     let config = ApkConfig {
         app_name: app_name.clone(),
-        package_name: format!("com.poly.{}", app_name.to_lowercase().replace(" ", "_")),
+        package_name: "com.poly.app".to_string(),  // Static package - matches JNI bindings
         ..Default::default()
     };
     

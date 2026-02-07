@@ -116,6 +116,9 @@ impl ApkBuilder {
     
     <uses-permission android:name="android.permission.INTERNET" />
     
+    <!-- USB Host permissions for serial communication -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    
     <application
         android:label="{app_name}"
         android:usesCleartextTraffic="true">
@@ -128,6 +131,12 @@ impl ApkBuilder {
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- USB device attached intent -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
         </activity>
         
     </application>
@@ -163,6 +172,31 @@ impl ApkBuilder {
     android:layout_width="match_parent"
     android:layout_height="match_parent" />"#;
         fs::write(layout_dir.join("activity_main.xml"), layout).map_err(|e| e.to_string())?;
+        
+        // USB device filter for serial adapters
+        let xml_dir = res_dir.join("xml");
+        fs::create_dir_all(&xml_dir).map_err(|e| e.to_string())?;
+        
+        let device_filter = r#"<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- FTDI -->
+    <usb-device vendor-id="1027" />
+    <!-- CH340/CH341 -->
+    <usb-device vendor-id="6790" />
+    <!-- Silicon Labs CP210x -->
+    <usb-device vendor-id="4292" />
+    <!-- Prolific PL2303 -->
+    <usb-device vendor-id="1659" />
+    <!-- Arduino -->
+    <usb-device vendor-id="9025" />
+    <!-- SparkFun -->
+    <usb-device vendor-id="6975" />
+    <!-- Adafruit -->
+    <usb-device vendor-id="9114" />
+    <!-- Generic CDC -->
+    <usb-device vendor-id="0" />
+</resources>"#;
+        fs::write(xml_dir.join("device_filter.xml"), device_filter).map_err(|e| e.to_string())?;
         
         Ok(())
     }
@@ -234,33 +268,94 @@ impl ApkBuilder {
         let main_activity = format!(r#"package {package};
 
 import android.app.Activity;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
+import android.hardware.usb.UsbManager;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.webkit.WebSettings;
-import java.io.*;
+import android.webkit.JavascriptInterface;
+import android.widget.Toast;
+import android.util.Log;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 public class MainActivity extends Activity {{
-    private Process nativeProcess;
+    private static final String TAG = "LoRaChat";
+    private static final String ACTION_USB_PERMISSION = "{package}.USB_PERMISSION";
+    
+    // USB Serial state
+    private static UsbManager usbManager;
+    private static UsbDevice connectedDevice;
+    private static UsbDeviceConnection connection;
+    private static UsbInterface usbInterface;
+    private static UsbEndpoint endpointIn;
+    private static UsbEndpoint endpointOut;
+    private static boolean isConnected = false;
+    private static Thread readThread;
+    private static volatile boolean keepReading = false;
+    
+    // Message buffer
+    private static final CopyOnWriteArrayList<String> messages = new CopyOnWriteArrayList<>();
+    private static String username = "User";
+    private static String lastError = "";
+    
+    static {{
+        System.loadLibrary("poly_native");
+    }}
+    
+    // Native methods (for compatibility, but we handle USB in Java)
+    public static native String native_refresh_ports();
+    public static native String native_connect_port(String port);
+    public static native boolean native_send_message(String msg);
+    
+    // USB Permission receiver
+    private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {{
+        @Override
+        public void onReceive(Context context, Intent intent) {{
+            String action = intent.getAction();
+            if (ACTION_USB_PERMISSION.equals(action)) {{
+                synchronized (this) {{
+                    UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {{
+                        if (device != null) {{
+                            Log.d(TAG, "USB permission granted for " + device.getDeviceName());
+                            openDevice(device);
+                        }}
+                    }} else {{
+                        Log.d(TAG, "USB permission denied");
+                        lastError = "USB permission denied";
+                    }}
+                }}
+            }}
+        }}
+    }};
     
     @Override
     protected void onCreate(Bundle savedInstanceState) {{
         super.onCreate(savedInstanceState);
         
-        // Extract and run native binary
-        try {{
-            File binary = extractAsset("native_binary");
-            binary.setExecutable(true);
-            ProcessBuilder pb = new ProcessBuilder(binary.getAbsolutePath());
-            pb.directory(getFilesDir());
-            pb.redirectErrorStream(true);
-            nativeProcess = pb.start();
-            
-            // Give the server time to start
-            Thread.sleep(500);
-        }} catch (Exception e) {{
-            e.printStackTrace();
-        }}
+        usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+        
+        // Register USB permission receiver
+        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        
+        Toast.makeText(this, "LoRa Chat - USB Serial", Toast.LENGTH_SHORT).show();
         
         // Setup WebView
         WebView webView = new WebView(this);
@@ -270,34 +365,273 @@ public class MainActivity extends Activity {{
         settings.setAllowFileAccess(true);
         
         webView.setWebViewClient(new WebViewClient());
-        
-        // Load web UI from assets or localhost
+        webView.addJavascriptInterface(new NativeBridge(), "polyglot");
         webView.loadUrl("file:///android_asset/web/index.html");
         
         setContentView(webView);
     }}
     
-    private File extractAsset(String name) throws IOException {{
-        File outFile = new File(getFilesDir(), name);
-        if (!outFile.exists()) {{
-            InputStream in = getAssets().open(name);
-            FileOutputStream out = new FileOutputStream(outFile);
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = in.read(buffer)) != -1) {{
-                out.write(buffer, 0, read);
-            }}
-            in.close();
-            out.close();
-        }}
-        return outFile;
-    }}
-    
     @Override
     protected void onDestroy() {{
         super.onDestroy();
-        if (nativeProcess != null) {{
-            nativeProcess.destroy();
+        disconnect();
+        unregisterReceiver(usbReceiver);
+    }}
+    
+    // Get list of USB serial devices
+    public static String getUsbDevices() {{
+        if (usbManager == null) return "[]";
+        
+        HashMap<String, UsbDevice> deviceList = usbManager.getDeviceList();
+        List<String> ports = new ArrayList<>();
+        
+        for (UsbDevice device : deviceList.values()) {{
+            // Filter for common USB-Serial chips (FTDI, CH340, CP210x, PL2303)
+            int vid = device.getVendorId();
+            int pid = device.getProductId();
+            
+            // Accept common USB-Serial adapters
+            boolean isSerial = 
+                vid == 0x0403 || // FTDI
+                vid == 0x1A86 || // CH340/CH341
+                vid == 0x10C4 || // Silicon Labs CP210x
+                vid == 0x067B || // Prolific PL2303
+                vid == 0x2341 || // Arduino
+                vid == 0x1B4F || // SparkFun
+                vid == 0x239A;   // Adafruit
+            
+            if (isSerial || deviceList.size() <= 3) {{ // Show all if few devices
+                ports.add(String.format("\"%s (VID:%04X PID:%04X)\"", 
+                    device.getDeviceName(), vid, pid));
+            }}
+        }}
+        
+        if (ports.isEmpty()) {{
+            return "[\"No USB devices found\"]";
+        }}
+        
+        return "[" + String.join(",", ports) + "]";
+    }}
+    
+    // Connect to USB device
+    public String connectToDevice(String portName) {{
+        if (usbManager == null) {{
+            lastError = "USB not available";
+            return "{{\"ok\":false,\"error\":\"USB not available\"}}";
+        }}
+        
+        // Find the device
+        HashMap<String, UsbDevice> deviceList = usbManager.getDeviceList();
+        UsbDevice targetDevice = null;
+        
+        for (UsbDevice device : deviceList.values()) {{
+            if (portName.contains(device.getDeviceName())) {{
+                targetDevice = device;
+                break;
+            }}
+        }}
+        
+        if (targetDevice == null) {{
+            lastError = "Device not found: " + portName;
+            return "{{\"ok\":false,\"error\":\"Device not found\"}}";
+        }}
+        
+        // Request permission if needed
+        if (!usbManager.hasPermission(targetDevice)) {{
+            PendingIntent permissionIntent = PendingIntent.getBroadcast(
+                this, 0, new Intent(ACTION_USB_PERMISSION), 
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
+            usbManager.requestPermission(targetDevice, permissionIntent);
+            return "{{\"ok\":false,\"error\":\"Requesting USB permission...\"}}";
+        }}
+        
+        return openDevice(targetDevice);
+    }}
+    
+    private static String openDevice(UsbDevice device) {{
+        try {{
+            disconnect(); // Close any existing connection
+            
+            connection = usbManager.openDevice(device);
+            if (connection == null) {{
+                lastError = "Could not open device";
+                return "{{\"ok\":false,\"error\":\"Could not open device\"}}";
+            }}
+            
+            // Find bulk transfer endpoints (typical for USB-CDC serial)
+            for (int i = 0; i < device.getInterfaceCount(); i++) {{
+                UsbInterface iface = device.getInterface(i);
+                
+                // Claim the interface
+                if (!connection.claimInterface(iface, true)) {{
+                    continue;
+                }}
+                
+                usbInterface = iface;
+                
+                for (int j = 0; j < iface.getEndpointCount(); j++) {{
+                    UsbEndpoint endpoint = iface.getEndpoint(j);
+                    if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK) {{
+                        if (endpoint.getDirection() == UsbConstants.USB_DIR_IN) {{
+                            endpointIn = endpoint;
+                        }} else {{
+                            endpointOut = endpoint;
+                        }}
+                    }}
+                }}
+                
+                if (endpointIn != null && endpointOut != null) {{
+                    break;
+                }}
+            }}
+            
+            if (endpointOut == null) {{
+                disconnect();
+                lastError = "No output endpoint found";
+                return "{{\"ok\":false,\"error\":\"No output endpoint found\"}}";
+            }}
+            
+            connectedDevice = device;
+            isConnected = true;
+            
+            // Start read thread
+            startReadThread();
+            
+            Log.d(TAG, "Connected to " + device.getDeviceName());
+            return "{{\"ok\":true,\"port\":\"" + device.getDeviceName() + "\"}}";
+            
+        }} catch (Exception e) {{
+            lastError = e.getMessage();
+            Log.e(TAG, "Connection error", e);
+            return "{{\"ok\":false,\"error\":\"" + e.getMessage() + "\"}}";
+        }}
+    }}
+    
+    private static void startReadThread() {{
+        keepReading = true;
+        readThread = new Thread(new Runnable() {{
+            @Override
+            public void run() {{
+                byte[] buffer = new byte[256];
+                StringBuilder lineBuffer = new StringBuilder();
+                
+                while (keepReading && connection != null && endpointIn != null) {{
+                    int bytesRead = connection.bulkTransfer(endpointIn, buffer, buffer.length, 100);
+                    if (bytesRead > 0) {{
+                        String data = new String(buffer, 0, bytesRead);
+                        lineBuffer.append(data);
+                        
+                        // Process complete lines
+                        int newlineIdx;
+                        while ((newlineIdx = lineBuffer.indexOf("\n")) >= 0) {{
+                            String line = lineBuffer.substring(0, newlineIdx).trim();
+                            if (!line.isEmpty()) {{
+                                messages.add("LoRa: " + line);
+                                Log.d(TAG, "RX: " + line);
+                            }}
+                            lineBuffer.delete(0, newlineIdx + 1);
+                        }}
+                    }}
+                    
+                    try {{ Thread.sleep(50); }} catch (InterruptedException e) {{ break; }}
+                }}
+            }}
+        }});
+        readThread.start();
+    }}
+    
+    public static void disconnect() {{
+        keepReading = false;
+        isConnected = false;
+        
+        if (readThread != null) {{
+            readThread.interrupt();
+            readThread = null;
+        }}
+        
+        if (connection != null) {{
+            if (usbInterface != null) {{
+                connection.releaseInterface(usbInterface);
+            }}
+            connection.close();
+            connection = null;
+        }}
+        
+        usbInterface = null;
+        endpointIn = null;
+        endpointOut = null;
+        connectedDevice = null;
+    }}
+    
+    public static boolean sendData(String msg) {{
+        if (!isConnected || connection == null || endpointOut == null) {{
+            return false;
+        }}
+        
+        try {{
+            byte[] data = (msg + "\n").getBytes();
+            int sent = connection.bulkTransfer(endpointOut, data, data.length, 1000);
+            if (sent >= 0) {{
+                messages.add(msg);
+                Log.d(TAG, "TX: " + msg);
+                return true;
+            }}
+        }} catch (Exception e) {{
+            Log.e(TAG, "Send error", e);
+            lastError = e.getMessage();
+        }}
+        return false;
+    }}
+    
+    public static String getNewMessages(int since) {{
+        List<String> newMsgs = new ArrayList<>();
+        for (int i = since; i < messages.size(); i++) {{
+            String m = messages.get(i).replace("\\", "\\\\").replace("\"", "\\\"");
+            newMsgs.add("\"" + m + "\"");
+        }}
+        return "{{\"messages\":[" + String.join(",", newMsgs) + "],\"total\":" + messages.size() + "}}";
+    }}
+    
+    // JavaScript interface
+    public class NativeBridge {{
+        @JavascriptInterface
+        public String refresh_ports() {{
+            return getUsbDevices();
+        }}
+        
+        @JavascriptInterface
+        public String connect_port(String port) {{
+            try {{
+                return MainActivity.this.connectToDevice(port);
+            }} catch (Throwable e) {{
+                Log.e(TAG, "connect_port error", e);
+                return "{{\"ok\":false,\"error\":\"" + e.getClass().getSimpleName() + ": " + e.getMessage() + "\"}}";
+            }}
+        }}
+        
+        @JavascriptInterface
+        public boolean send_message(String msg) {{
+            return sendData(msg);
+        }}
+        
+        @JavascriptInterface
+        public void set_username(String name) {{
+            username = name;
+        }}
+        
+        @JavascriptInterface
+        public boolean is_connected() {{
+            return isConnected;
+        }}
+        
+        @JavascriptInterface
+        public String get_messages(int since) {{
+            return getNewMessages(since);
+        }}
+        
+        @JavascriptInterface
+        public String get_error() {{
+            return lastError;
         }}
     }}
 }}"#, package = config.package_name);
@@ -382,8 +716,10 @@ public class MainActivity extends Activity {{
         let web_dir = assets_dir.join("web");
         fs::create_dir_all(&web_dir).map_err(|e| e.to_string())?;
         
-        // Write native binary
-        fs::write(assets_dir.join("native_binary"), native_binary)
+        // Write native library to lib/arm64-v8a/ (proper JNI location)
+        let lib_dir = self.work_dir.join("lib").join("arm64-v8a");
+        fs::create_dir_all(&lib_dir).map_err(|e| e.to_string())?;
+        fs::write(lib_dir.join("libpoly_native.so"), native_binary)
             .map_err(|e| e.to_string())?;
         
         // Write web assets
@@ -434,8 +770,18 @@ public class MainActivity extends Activity {{
         }
         
         // Add native library for aarch64
-        let lib_dir = format!("lib/arm64-v8a");
-        zip.add_directory(&lib_dir, options).map_err(|e| e.to_string())?;
+        let lib_path = self.work_dir.join("lib").join("arm64-v8a");
+        if lib_path.exists() {
+            for entry in walkdir(&lib_path) {
+                if entry.is_file() {
+                    let relative = entry.strip_prefix(&self.work_dir).unwrap();
+                    let name = relative.to_string_lossy().replace("\\", "/");
+                    zip.start_file(&name, options).map_err(|e| e.to_string())?;
+                    let content = fs::read(&entry).map_err(|e| e.to_string())?;
+                    zip.write_all(&content).map_err(|e| e.to_string())?;
+                }
+            }
+        }
         
         zip.finish().map_err(|e| e.to_string())?;
         

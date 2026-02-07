@@ -241,6 +241,57 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
             continue;
         }
 
+        // Handle Rust raw strings: r"...", r#"..."#, br"...", etc.
+        // These can contain quotes and should be skipped as a unit
+        if (c == b'r' || c == b'b') && !in_double_string && !in_single_string && !in_template {
+            let mut raw_start = pos;
+            
+            // Skip optional 'b' prefix
+            if bytes[raw_start] == b'b' && raw_start + 1 < bytes.len() && bytes[raw_start + 1] == b'r' {
+                raw_start += 1;
+            }
+            
+            // Check for 'r' followed by optional '#'s and '"'
+            if raw_start < bytes.len() && bytes[raw_start] == b'r' {
+                let mut hash_count = 0;
+                let mut scan = raw_start + 1;
+                
+                // Count leading '#'s
+                while scan < bytes.len() && bytes[scan] == b'#' {
+                    hash_count += 1;
+                    scan += 1;
+                }
+                
+                // Must be followed by '"'
+                if scan < bytes.len() && bytes[scan] == b'"' {
+                    scan += 1; // Skip opening quote
+                    
+                    // Scan for closing: "###...### (same number of #'s)
+                    'raw_scan: while scan < bytes.len() {
+                        if bytes[scan] == b'"' {
+                            // Check for matching trailing #'s
+                            let mut trailing = 0;
+                            while scan + 1 + trailing < bytes.len() && 
+                                  bytes[scan + 1 + trailing] == b'#' && 
+                                  trailing < hash_count {
+                                trailing += 1;
+                            }
+                            if trailing == hash_count {
+                                // Found closing sequence
+                                pos = scan + 1 + hash_count;
+                                break 'raw_scan;
+                            }
+                        }
+                        scan += 1;
+                    }
+                    if scan >= bytes.len() {
+                        pos = scan; // Unclosed raw string, move to end
+                    }
+                    continue;
+                }
+            }
+        }
+
         // Track double-quoted strings
         if c == b'"' && !in_single_string {
             in_double_string = !in_double_string;
@@ -248,10 +299,58 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
             continue;
         }
 
-        // Track single-quoted strings (JS/Python)
-        // Note: This may cause issues with Rust char literals, but JS needs it
+        // Track single-quoted strings (JS/Python) and Rust char literals
+        // IMPORTANT: Distinguish from Rust lifetimes like 'a, 'static, '_
         if c == b'\'' && !in_double_string && !in_template {
-            in_single_string = !in_single_string;
+            if in_single_string {
+                // Closing a single-quoted string
+                in_single_string = false;
+                pos += 1;
+                continue;
+            }
+            
+            // Check if this is a Rust lifetime (not a char literal or string)
+            // Lifetimes: 'a, 'static, '_ followed by non-quote
+            // Char literals: 'x', '\n', '\''
+            if pos + 1 < bytes.len() {
+                let next = bytes[pos + 1];
+                
+                // Check for Rust lifetime pattern: 'identifier or '_
+                if next.is_ascii_lowercase() || next == b'_' {
+                    // Look ahead to see if this is 'x' (char) or 'ident (lifetime)
+                    let lookahead = pos + 2;
+                    
+                    // If immediately followed by ', it's a char literal like 'a'
+                    if lookahead < bytes.len() && bytes[lookahead] == b'\'' {
+                        // It's a char literal: 'x'
+                        pos = lookahead + 1; // Skip past closing quote
+                        continue;
+                    }
+                    
+                    // NOT followed by ' means it's a lifetime (even single-letter like 'a in <'a>)
+                    // Just skip the ' and let the identifier be scanned normally
+                    // This handles: 'a, 'b, 'static, '_, 'lifetime, etc.
+                    pos += 1;
+                    continue;
+                }
+                
+                // Check for escaped char literal: '\n', '\t', '\\'
+                if next == b'\\' && pos + 3 < bytes.len() && bytes[pos + 3] == b'\'' {
+                    // Escaped char literal like '\n' - skip the whole thing
+                    pos += 4;
+                    continue;
+                }
+                
+                // Check for '\'' (escaped quote char)
+                if next == b'\\' && pos + 4 < bytes.len() && bytes[pos + 2] == b'\'' && bytes[pos + 3] == b'\'' {
+                    // This is '\'' - escaped quote character
+                    pos += 4;
+                    continue;
+                }
+            }
+            
+            // Default: treat as start of single-quoted string (JS/Python style)
+            in_single_string = true;
             pos += 1;
             continue;
         }

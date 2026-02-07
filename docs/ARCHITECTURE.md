@@ -1,164 +1,342 @@
-# Poly Architecture
+# Poly Compiler Architecture
+
+> How the Polyglot compiler transforms `.poly` files into executables.
 
 ## Overview
 
+Poly supports two complementary paradigms:
+- **Language Blocks** — `#[rust] { }`, `#[js] { }` for organizing code by language
+- **Inline Macros** — `js!{}`, `py!{}` for cross-language calls within Rust
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         USER CODE                                │
-│   let result = js!{ [1,2,3].map(x => x*2) };                    │
+│                         SOURCE FILE                              │
+│   #[rust] { fn main() { let x = js!{ 1+2 }; } }                 │
+│   #[js] { const render = (d) => console.log(d); }               │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    POLYGLOT-MACROS                               │
-│   Proc macros that generate runtime calls at compile time       │
-│                                                                  │
-│   js!{} → JsRuntime::get().eval_i32("...")                      │
-│   py!{} → ScriptRuntime::get().eval_i32("...")                  │
-│   #[poly_bridge] → Wrapper struct + trait impl                  │
+│                         PARSER                                   │
+│   Extracts language blocks, imports, signatures                  │
+│   → ParsedFile { blocks, signatures, interfaces, imports }      │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    POLYGLOT-RUNTIME                              │
-│   Embedded interpreters (all pure Rust, zero external deps)     │
-│                                                                  │
-│   ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐     │
-│   │   Rhai      │  │   Boa       │  │   SWC + Boa         │     │
-│   │  Scripting  │  │ JavaScript  │  │   TypeScript        │     │
-│   └─────────────┘  └─────────────┘  └─────────────────────┘     │
-│                                                                  │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                    BRIDGE                                │   │
-│   │   ForeignHandle, ForeignValue, ToForeign, FromForeign   │   │
-│   └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+│                    SYNTAX NORMALIZATION                          │
+│   Converts language-specific syntax to Rust equivalents         │
+│   → Python f-strings → format!()                                │
+│   → JS template literals → format!()                            │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      CODE MERGER                                 │
+│   Combines all Rust blocks into single main.rs                  │
+│   → Inserts runtime imports, host bindings                      │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+               ┌────────────┴────────────┐
+               ▼                         ▼
+┌──────────────────────────┐  ┌──────────────────────────┐
+│     WASM BACKEND         │  │    NATIVE BACKEND        │
+│   cargo build --target   │  │  cargo build --target    │
+│   wasm32-unknown-unknown │  │  x86_64-pc-windows-msvc  │
+└──────────────────────────┘  └──────────────────────────┘
+               │                         │
+               ▼                         ▼
+┌──────────────────────────┐  ┌──────────────────────────┐
+│  BUNDLER (browser)       │  │  OUTPUT                  │
+│  → Embed WASM in HTML    │  │  → .exe / ELF / .apk     │
+│  → Inline JS/CSS         │  │                          │
+└──────────────────────────┘  └──────────────────────────┘
 ```
 
-## Crate Structure
+## Source Files
 
 ```
-polyglot/
-├── polyglot-macros/          # Proc macro crate
-│   └── src/
-│       ├── lib.rs            # Macro exports
-│       ├── js_macro.rs       # js!{} implementation
-│       ├── py_macro.rs       # py!{} implementation  
-│       ├── ts_macro.rs       # ts!{} implementation
-│       ├── bridge_macro.rs   # #[poly_bridge] implementation
-│       ├── capture.rs        # Variable capture analysis
-│       └── gpu_macro.rs      # cuda!/gpu! stubs
-│
-├── polyglot-runtime/         # Runtime crate
-│   └── src/
-│       ├── lib.rs            # Runtime exports
-│       ├── javascript.rs     # Boa JS engine wrapper
-│       ├── typescript.rs     # SWC + Boa TS wrapper
-│       ├── python.rs         # Rhai scripting wrapper
-│       ├── bridge.rs         # FFI bridge infrastructure
-│       └── marshal.rs        # Type conversion traits
-│
-└── docs/                     # Documentation
-    ├── LANGUAGE_SPEC.md      # Language specification
-    ├── API_REFERENCE.md      # API documentation
-    └── ARCHITECTURE.md       # This file
+polyglot/src/
+├── main.rs               # CLI entry point (clap-based)
+├── lib.rs                # Library exports
+├── parser.rs             # .poly file parser
+├── syntax_aliases.rs     # Cross-language syntax normalization
+├── compiler.rs           # Rust compilation orchestration
+├── types.rs              # Core type definitions
+├── validation.rs         # Semantic validation
+├── diagnostic.rs         # Error reporting (miette-based)
+├── source_map.rs         # Source location tracking
+├── wit_gen.rs            # WIT interface generation
+├── host_imports.rs       # Host function bindings
+├── host_imports_injectable.rs  # Injectable host imports
+├── capability.rs         # Capability checking
+├── apk_builder.rs        # Android APK generation
+├── component_builder.rs  # WASM Component Model builder
+├── component_linker.rs   # WASM component linking
+├── implements_verify.rs  # @implements verification
+└── ast_parser.rs         # AST-level parsing utilities
 ```
 
-## Data Flow
+## Key Modules
 
-### Expression Macro Flow
+### parser.rs
 
-```
-1. User writes:     let x: i32 = js!{ 1 + 2 };
+Parses `.poly` files into structured data.
 
-2. Macro expands to:
-   {
-       use polyglot_runtime::prelude::JsRuntime;
-       let __js = JsRuntime::get();
-       __js.eval_i32("1 + 2").expect("JS error")
-   }
+```rust
+pub struct ParsedFile {
+    pub blocks: Vec<CodeBlock>,      // Language-tagged code
+    pub signatures: Vec<FunctionSig>, // Export signatures
+    pub interfaces: Vec<InterfaceItem>, // Interface definitions
+    pub imports: Vec<Import>,         // File imports
+}
 
-3. At runtime:
-   - Boa parses "1 + 2"
-   - Boa evaluates → JsValue
-   - JsValue converted to i32
-   - Result returned to user
-```
-
-### Type Bridge Flow
-
-```
-1. User writes:
-   #[poly_bridge(javascript)]
-   trait Calc { fn add(&self, a: i32, b: i32) -> i32; }
-
-2. Macro expands to:
-   trait Calc { fn add(&self, a: i32, b: i32) -> i32; }
-   
-   struct JsCalc { handle: ForeignHandle }
-   
-   impl Calc for JsCalc {
-       fn add(&self, a: i32, b: i32) -> i32 {
-           let args = vec![a.to_foreign(), b.to_foreign()];
-           let result = self.handle.call_method("add", &args);
-           i32::from_foreign(result).unwrap()
-       }
-   }
-
-3. At runtime:
-   - Args marshaled to ForeignValue
-   - Method called on foreign object
-   - Result unmarshaled to i32
+pub struct CodeBlock {
+    pub lang_tag: String,    // "rust", "js", "python", etc.
+    pub code: String,        // Block content
+    pub options: HashMap<String, String>,
+    pub start_line: usize,
+    pub code_start_line: usize,
+}
 ```
 
-## Ownership Semantics
+**Key algorithm: `find_matching_brace()`**
 
-### ForeignHandle Lifecycle
+Handles nested braces while respecting:
+- String literals (`"..."`, `'...'`, `` `...` ``)
+- Raw strings (`r"..."`, `r#"..."#`)
+- Triple-quoted strings (`"""..."""`)
+- Comments (`//`, `/* */`)
+- Template literal interpolation (`${...}`)
+- Regex literals (`/pattern/flags`)
+- Rust lifetimes (`'a`, `'static`) — NOT char literals
+
+### syntax_aliases.rs
+
+Normalizes non-Rust syntax to Rust equivalents.
+
+| Source | Target |
+|--------|--------|
+| `print(x)` | `println!("{}", x)` |
+| `f"hello {name}"` | `format!("hello {}", name)` |
+| `` `template ${x}` `` | `format!("template {}", x)` |
+| `console.log(x)` | `println!("{:?}", x)` |
+| `this.field` | `self.field` |
+
+**Selective application:** Only runs on non-Rust blocks to preserve Rust semantics.
+
+### compiler.rs
+
+Orchestrates the Rust compilation pipeline.
+
+```rust
+pub fn compile(source: &str, options: &CompileOptions) -> Result<PathBuf, CompileError>
+```
+
+**Steps:**
+1. Parse `.poly` file
+2. Resolve imports recursively
+3. Merge blocks into single Rust source
+4. Write to temp directory
+5. Generate `Cargo.toml` with dependencies
+6. Invoke `cargo build` with target
+7. Copy output artifact
+
+### types.rs
+
+Core type definitions for the compiler.
+
+```rust
+pub struct CompileOptions {
+    pub target: Target,
+    pub release: bool,
+    pub emit_wit: bool,
+    pub emit_ir: bool,
+}
+
+pub enum Target {
+    Browser,   // WASM + HTML
+    Host,      // Native for current platform
+    Windows,   // x86_64-pc-windows-msvc
+    Linux,     // x86_64-unknown-linux-gnu
+    Android,   // aarch64-linux-android
+    Apk,       // Full APK package
+}
+
+pub struct FunctionSig {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_type: Option<WitType>,
+}
+```
+
+### wit_gen.rs
+
+Generates WebAssembly Interface Types (WIT) from export signatures.
+
+```rust
+pub fn generate_wit(parsed: &ParsedFile) -> String
+```
+
+Example output:
+```wit
+package poly:component;
+
+interface exports {
+    greet: func(name: string) -> string;
+    add: func(a: s32, b: s32) -> s32;
+}
+
+world poly-world {
+    export exports;
+}
+```
+
+### diagnostic.rs
+
+Error reporting with source locations using miette.
+
+```rust
+#[derive(Error, Diagnostic)]
+pub struct ParseDiagnostic {
+    #[source_code]
+    src: PolySource,
+    #[label("error occurred here")]
+    location: SourceSpan,
+    message: String,
+}
+```
+
+Produces errors like:
+```
+error[E0001]: Unmatched brace
+  --> file.poly:15:10
+   |
+15 |     fn broken( {
+   |              ^ unclosed brace
+```
+
+### apk_builder.rs
+
+Android APK generation pipeline.
+
+```rust
+pub struct ApkBuilder {
+    ndk_path: PathBuf,
+    sdk_path: PathBuf,
+}
+```
+
+**Steps:**
+1. Compile to `aarch64-linux-android` target
+2. Create APK structure
+3. Add native library to `lib/arm64-v8a/`
+4. Generate `AndroidManifest.xml`
+5. Sign with debug key
+6. Align with `zipalign`
+
+### component_builder.rs
+
+WASM Component Model support.
+
+```rust
+pub fn check_component_tools() -> Vec<ToolStatus>
+pub fn build_component(file: &Path) -> Result<PathBuf>
+```
+
+Requires external tools:
+- `jco` — JavaScript Component tools
+- `componentize-py` — Python component builder
+- `wasm-compose` — Component composer
+
+## Compilation Targets
+
+### Browser (WASM)
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│  Rust                           │  Foreign Runtime             │
-├────────────────────────────────────────────────────────────────┤
-│                                 │                              │
-│  let obj = js!{ ({...}) };      │  Object created, GC refs it  │
-│      ↓                          │                              │
-│  ForeignHandle::new()           │  ID assigned                 │
-│      ↓                          │                              │
-│  obj.method()                   │  Method called               │
-│      ↓                          │                              │
-│  drop(obj)                      │  runtime.release(id)         │
-│                                 │      ↓                       │
-│                                 │  Reference released          │
-│                                 │  GC can collect if no refs   │
-└────────────────────────────────────────────────────────────────┘
+.poly → Rust → wasm32-unknown-unknown → .wasm
+                    ↓
+         Bundle with HTML/JS/CSS → index.html
 ```
 
-### Clone Behavior
+The bundler:
+1. Base64-encodes WASM
+2. Inlines `#[html]` blocks into `<body>`
+3. Inlines `#[css]` blocks into `<style>`
+4. Inlines `#[js]` blocks into `<script>`
+5. Adds WASM loader glue code
 
-Cloning a `ForeignHandle` creates a new Rust reference to the same foreign object. The `id` is preserved, so both handles refer to the same object.
+### Native (Windows/Linux)
+
+```
+.poly → Rust → target-triple → .exe / ELF
+```
+
+Uses `cross` or native `cargo build` with appropriate target triple.
+
+### Android APK
+
+```
+.poly → Rust → aarch64-linux-android → libpoly.so
+                    ↓
+         APK packaging → app-debug.apk
+```
+
+## Import Resolution
+
+```poly
+use * from "./utils.poly"
+use { helper } from "../shared/lib.poly"
+```
+
+**Resolution algorithm:**
+1. Path is relative to importing file
+2. Recursively parse imported file
+3. Merge blocks from imported file
+4. Handle circular imports (detect and error)
+
+## Error Handling
+
+All errors flow through miette for rich diagnostics:
+
+```rust
+enum PolyError {
+    Parse(ParseDiagnostic),
+    Compile(RustCompileError),
+    NoMain(NoMainError),
+    MultipleMain(MultipleMainError),
+    Validation(ValidationError),
+}
+```
 
 ## Extension Points
 
-### Adding New Runtime
+### Adding a New Language Block
 
-1. Create `src/newlang.rs` in `polyglot-runtime`
-2. Implement `eval_i32()`, `eval_f64()`, `eval_string()`, `exec()`
-3. Add feature flag in `Cargo.toml`
-4. Create `src/newlang_macro.rs` in `polyglot-macros`
-5. Export macro in `lib.rs`
+1. Update `parser.rs` to recognize new tag
+2. Add syntax normalization in `syntax_aliases.rs` (if needed)
+3. Update bundler to handle the block type
+4. Add documentation
 
-### Adding New Marshaling Type
+### Adding a New Build Target
 
-```rust
-impl ToForeign for MyType {
-    fn to_foreign(&self) -> ForeignValue {
-        // Convert to ForeignValue variant
-    }
-}
+1. Add variant to `Target` enum in `types.rs`
+2. Implement compilation in `compiler.rs`
+3. Add target triple and dependencies
+4. Update CLI in `main.rs`
 
-impl FromForeign for MyType {
-    fn from_foreign(value: ForeignValue) -> Result<Self> {
-        // Convert from ForeignValue
-    }
-}
+## Dependencies
+
+```toml
+[dependencies]
+clap = { version = "4", features = ["derive"] }  # CLI
+miette = { version = "7", features = ["fancy"] }  # Errors
+regex = "1"                                       # Parsing
+notify = "6"                                      # File watching
+axum = "0.7"                                      # Dev server
 ```
+
+**Build-time dependencies:**
+- `cargo` — Rust compilation
+- `wasmtime` — WASM execution (for `run`)
+- Android NDK — APK builds

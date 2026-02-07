@@ -18,9 +18,45 @@ impl Rust {
         let target_triple = opts.target.target_triple();
         eprintln!("🔧 Native compilation target: {}", target_triple);
         
-        // For native targets, we build a binary (not a cdylib)
-        let cargo_toml = format!(
-            r#"
+        // Determine if we can use serialport crate (desktop only, not Android)
+        let is_android = opts.target == CompileTarget::Aarch64Android;
+        let needs_serial = source.contains("serialport::") || source.contains("SerialPort::open");
+        
+        let serial_dep = if needs_serial && !is_android {
+            "serialport = \"4.6\"\n"
+        } else {
+            ""
+        };
+        
+        // For Android, build as shared library with JNI
+        let cargo_toml = if is_android {
+            format!(
+                r#"
+[workspace]
+
+[package]
+name = "poly_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "poly_native"
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+jni = "0.21"
+
+[profile.release]
+opt-level = "s"
+lto = false
+strip = "none"
+"#
+            )
+        } else {
+            format!(
+                r#"
 [workspace]
 
 [package]
@@ -34,24 +70,33 @@ path = "main.rs"
 
 [dependencies]
 anyhow = "1.0"
-
+{serial_dep}
 [profile.release]
 opt-level = "z"
 lto = true
 strip = true
 "#
-        );
+            )
+        };
 
         fs::write(opts.temp_dir.join("Cargo.toml"), &cargo_toml)?;
         
         // For Android target, we may need to configure the linker
-        if opts.target == CompileTarget::Aarch64Android {
+        if is_android {
             self.setup_android_config(&opts.temp_dir)?;
+            
+            // Generate JNI wrapper library
+            let jni_source = self.generate_jni_lib(source);
+            fs::write(opts.temp_dir.join("lib.rs"), &jni_source)?;
+            
+            // Debug: save a copy for inspection
+            let debug_path = std::path::Path::new("C:/Users/adria/.openclaw/workspace/tmp/debug_lib.rs");
+            let _ = fs::write(debug_path, &jni_source);
+        } else {
+            // Write the source directly (no WASM wrappers needed)
+            let main_rs = opts.temp_dir.join("main.rs");
+            fs::write(&main_rs, source)?;
         }
-
-        // Write the source directly (no WASM wrappers needed)
-        let main_rs = opts.temp_dir.join("main.rs");
-        fs::write(&main_rs, source)?;
 
         // Build
         let mut cmd = Command::new("cargo");
@@ -71,19 +116,27 @@ strip = true
             ));
         }
 
-        // Find output binary
-        let ext = opts.target.output_extension();
-        let binary_name = if ext.is_empty() {
-            "poly_native".to_string()
+        // Find output binary/library
+        let binary_path = if is_android {
+            // Android: shared library
+            opts.temp_dir
+                .join("target")
+                .join(target_triple)
+                .join("release")
+                .join("libpoly_native.so")
         } else {
-            format!("poly_native.{}", ext)
+            let ext = opts.target.output_extension();
+            let binary_name = if ext.is_empty() {
+                "poly_native".to_string()
+            } else {
+                format!("poly_native.{}", ext)
+            };
+            opts.temp_dir
+                .join("target")
+                .join(target_triple)
+                .join("release")
+                .join(&binary_name)
         };
-        
-        let binary_path = opts.temp_dir
-            .join("target")
-            .join(target_triple)
-            .join("release")
-            .join(&binary_name);
 
         if !binary_path.exists() {
             return Err(anyhow::anyhow!(
@@ -93,7 +146,8 @@ strip = true
         }
 
         let binary_bytes = fs::read(&binary_path)?;
-        eprintln!("✅ Native binary: {} bytes", binary_bytes.len());
+        let kind = if is_android { "library (.so)" } else { "binary" };
+        eprintln!("✅ Native {}: {} bytes", kind, binary_bytes.len());
         
         Ok(binary_bytes)
     }
@@ -159,33 +213,182 @@ linker = "{}"
             }
         }
         
-        // Check common locations
+        // Check common NDK locations (these are directories containing version folders)
         let home = dirs::home_dir()?;
-        let common_paths = [
-            home.join("Android/Sdk/ndk").join("*"), // Linux/Mac
+        let ndk_dirs = [
+            home.join("Android/Sdk/ndk"), // Linux/Mac
             PathBuf::from("C:/Android/ndk"),
             PathBuf::from("C:/Users").join(whoami::username()).join("AppData/Local/Android/Sdk/ndk"),
         ];
         
-        for pattern in &common_paths {
-            // For glob patterns, find newest version
-            if let Some(parent) = pattern.parent() {
-                if parent.exists() {
-                    if let Ok(entries) = fs::read_dir(parent) {
-                        let mut versions: Vec<_> = entries
-                            .filter_map(|e| e.ok())
-                            .filter(|e| e.path().is_dir())
-                            .collect();
-                        versions.sort_by(|a, b| b.path().cmp(&a.path()));
-                        if let Some(latest) = versions.first() {
-                            return Some(latest.path());
-                        }
+        for ndk_dir in &ndk_dirs {
+            // Check if the ndk directory exists and contains version folders
+            if ndk_dir.exists() && ndk_dir.is_dir() {
+                if let Ok(entries) = fs::read_dir(ndk_dir) {
+                    let mut versions: Vec<_> = entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_dir())
+                        // Filter to only version-like directories (start with digit)
+                        .filter(|e| e.file_name().to_string_lossy().chars().next().map_or(false, |c| c.is_ascii_digit()))
+                        .collect();
+                    // Sort in descending order to get newest version first
+                    versions.sort_by(|a, b| b.path().cmp(&a.path()));
+                    if let Some(latest) = versions.first() {
+                        eprintln!("📱 Found Android NDK: {}", latest.path().display());
+                        return Some(latest.path());
                     }
                 }
             }
         }
         
         None
+    }
+    
+    /// Generate JNI wrapper library for Android
+    fn generate_jni_lib(&self, source: &str) -> String {
+        // Extract public functions from source (export fn becomes pub fn during preprocessing)
+        // Match top-level pub fn (at start of line or after newline)
+        let export_re = regex::Regex::new(r"(?m)^pub\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^\{]+))?").unwrap();
+        
+        let mut jni_functions = String::new();
+        for cap in export_re.captures_iter(source) {
+            let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let params_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let ret_type = cap.get(3).map(|m| m.as_str().trim());
+            
+            // Parse parameters: "port: String, count: i32" -> [("port", "String"), ...]
+            let params: Vec<(&str, &str)> = if params_str.trim().is_empty() {
+                vec![]
+            } else {
+                params_str.split(',')
+                    .filter_map(|p| {
+                        let parts: Vec<&str> = p.trim().split(':').collect();
+                        if parts.len() == 2 {
+                            Some((parts[0].trim(), parts[1].trim()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            
+            // Generate JNI parameter declarations
+            let jni_params: String = params.iter()
+                .map(|(pname, ptype)| {
+                    let jni_type = match *ptype {
+                        "String" => "jni::sys::jstring",
+                        "bool" => "jni::sys::jboolean",
+                        "i32" => "jni::sys::jint",
+                        "i64" => "jni::sys::jlong",
+                        "f32" => "jni::sys::jfloat",
+                        "f64" => "jni::sys::jdouble",
+                        _ => "jni::sys::jstring",
+                    };
+                    format!("{}: {}", pname, jni_type)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            
+            // Check if we need JNIEnv for String conversion
+            let has_string_params = params.iter().any(|(_, ptype)| *ptype == "String");
+            let needs_env = has_string_params || ret_type == Some("String");
+            
+            // Generate env wrapping if needed (mut for get_string calls)
+            let env_wrap = if needs_env {
+                "    let mut env = unsafe { JNIEnv::from_raw(env).unwrap() };\n"
+            } else {
+                ""
+            };
+            
+            // Generate parameter conversion code (after env is wrapped)
+            let param_conversions: String = params.iter()
+                .filter(|(_, ptype)| *ptype == "String")
+                .map(|(pname, _)| format!(
+                    "    let {pname}: String = env.get_string(&jni::objects::JString::from_raw({pname})).map(|s| s.into()).unwrap_or_default();",
+                    pname = pname
+                ))
+                .collect::<Vec<_>>()
+                .join("\n");
+            
+            // Generate function call arguments
+            let call_args: String = params.iter()
+                .map(|(pname, _)| *pname)
+                .collect::<Vec<_>>()
+                .join(", ");
+            
+            // Generate JNI return type
+            let (jni_ret, needs_return) = match ret_type {
+                Some("String") => ("jstring", true),
+                Some("bool") => ("jboolean", true),
+                Some("i32") => ("jint", true),
+                Some("i64") => ("jlong", true),
+                Some("f32") => ("jfloat", true),
+                Some("f64") => ("jdouble", true),
+                _ => ("()", false),  // void -> unit type
+            };
+            
+            // Generate the call and return
+            let jni_call = match ret_type {
+                Some("String") => format!(
+                    r#"{env_wrap}{conversions}
+    let result = {name}({args});
+    match env.new_string(&result) {{
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }}"#, env_wrap = env_wrap, conversions = param_conversions, name = name, args = call_args),
+                Some("bool") => format!(
+                    r#"{env_wrap}{conversions}
+    if {name}({args}) {{ 1 }} else {{ 0 }}"#, env_wrap = env_wrap, conversions = param_conversions, name = name, args = call_args),
+                _ => format!(r#"{env_wrap}{conversions}
+    {name}({args});"#, env_wrap = env_wrap, conversions = param_conversions, name = name, args = call_args),
+            };
+            
+            // JNI name mangling: underscores become _1
+            let jni_name = name.replace("_", "_1");
+            
+            // Build JNI parameter list (env, class, then user params)
+            let full_params = if jni_params.is_empty() {
+                "env: *mut jni::sys::JNIEnv, _class: jni::sys::jclass".to_string()
+            } else {
+                format!("env: *mut jni::sys::JNIEnv, _class: jni::sys::jclass, {}", jni_params)
+            };
+            
+            // Return type clause
+            let ret_clause = if needs_return {
+                format!(" -> {}", jni_ret)
+            } else {
+                String::new()
+            };
+            
+            jni_functions.push_str(&format!(r#"
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_poly_app_MainActivity_{jni_name}(
+    {params}
+){ret_clause} {{
+{jni_call}
+}}
+"#, jni_name = jni_name, params = full_params, ret_clause = ret_clause, jni_call = jni_call));
+        }
+        
+        // Build the full library source
+        let mut lib_source = String::from(r#"
+use jni::JNIEnv;
+use jni::objects::JClass;
+use jni::sys::*;
+
+"#);
+        
+        // Add the original source (with export fn -> pub fn)
+        let processed = source
+            .replace("export fn ", "pub fn ")
+            .replace("fn main()", "fn _main()");  // Rename main
+        lib_source.push_str(&processed);
+        
+        // Add JNI wrappers
+        lib_source.push_str("\n// JNI Wrappers\n");
+        lib_source.push_str(&jni_functions);
+        
+        lib_source
     }
 }
 
