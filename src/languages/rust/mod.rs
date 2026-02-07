@@ -1,4 +1,5 @@
 use crate::languages::Language;
+use crate::manifest::Manifest;
 use crate::parser::{ParseError, parse_rust_params, parse_rust_type};
 use crate::types::{CompileOptions, CompileTarget, FunctionSig, WitType};
 use anyhow::Result;
@@ -111,21 +112,35 @@ impl Rust {
             ""
         };
         
-        // Auto-detect dependencies from use statements
-        let auto_deps = Self::detect_dependencies(source);
+        // Load manifest dependencies from poly.toml (highest priority)
+        let manifest_deps = opts.source_path.as_ref()
+            .and_then(|p| Manifest::load_for_file(p))
+            .map(|m| m.rust_dependencies_toml())
+            .unwrap_or_default();
         
-        // Extract explicit #[cargo] block if present
+        // Auto-detect dependencies from use statements (fallback)
+        let auto_deps = if manifest_deps.is_empty() {
+            Self::detect_dependencies(source)
+        } else {
+            String::new() // Skip auto-detection if manifest provides deps
+        };
+        
+        // Extract explicit #[cargo] block if present (inline override)
         let cargo_block_deps = Self::extract_cargo_block(source).unwrap_or_default();
         
-        // Combine all dependencies
+        // Combine all dependencies (manifest > cargo block > auto-detect)
         let all_deps = format!(
-            "{serial_dep}{auto_deps}\n{cargo_block_deps}",
+            "{serial_dep}{manifest_deps}\n{auto_deps}\n{cargo_block_deps}",
             serial_dep = serial_dep,
+            manifest_deps = manifest_deps,
             auto_deps = auto_deps,
             cargo_block_deps = cargo_block_deps
         );
         
-        // Log detected dependencies
+        // Log dependency sources
+        if !manifest_deps.is_empty() {
+            eprintln!("📦 Using dependencies from poly.toml [rust]");
+        }
         if !auto_deps.is_empty() {
             eprintln!("📦 Auto-detected dependencies from use statements");
         }
@@ -135,6 +150,13 @@ impl Rust {
         
         // For Android, build as shared library with JNI
         let cargo_toml = if is_android {
+            // Only include base deps if no manifest deps provided
+            let base_deps = if manifest_deps.is_empty() {
+                "anyhow = \"1.0\"\n"
+            } else {
+                ""
+            };
+            
             format!(
                 r#"
 [workspace]
@@ -150,8 +172,7 @@ crate-type = ["cdylib"]
 path = "lib.rs"
 
 [dependencies]
-anyhow = "1.0"
-jni = "0.21"
+{base_deps}jni = "0.21"
 {all_deps}
 
 [profile.release]
@@ -159,9 +180,17 @@ opt-level = "s"
 lto = false
 strip = "none"
 "#,
+                base_deps = base_deps,
                 all_deps = all_deps
             )
         } else {
+            // Only include base deps if no manifest deps provided
+            let base_deps = if manifest_deps.is_empty() {
+                "anyhow = \"1.0\"\n"
+            } else {
+                "" // Manifest provides all deps
+            };
+            
             format!(
                 r#"
 [workspace]
@@ -176,8 +205,7 @@ name = "poly_native"
 path = "main.rs"
 
 [dependencies]
-anyhow = "1.0"
-{all_deps}
+{base_deps}{all_deps}
 
 [profile.release]
 opt-level = "z"

@@ -56,6 +56,8 @@ pub struct CompileOptions {
     /// Which language contains the main entry point: "rust" or "python"
     pub main_lang: Option<String>,
     pub test_mode: bool,
+    /// Path to the source .poly file (for locating poly.toml)
+    pub source_path: Option<PathBuf>,
 }
 
 impl Default for CompileOptions {
@@ -66,6 +68,7 @@ impl Default for CompileOptions {
             temp_dir: PathBuf::from("target/polyglot_tmp"),
             main_lang: None,
             test_mode: false,
+            source_path: None,
         }
     }
 }

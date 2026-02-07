@@ -9,6 +9,7 @@ pub mod host_imports;
 pub mod implements_verify;
 pub mod interface;
 pub mod languages;
+pub mod manifest;
 pub mod parser;
 pub mod source_map;
 pub mod syntax_aliases;

@@ -652,6 +652,7 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) 
         release,
         test_mode,
         target,
+        source_path: Some(file.clone()),
         ..Default::default()
     };
 
@@ -795,6 +796,7 @@ fn build_apk(file: &PathBuf, parsed: &polyglot::parser::ParsedFile) -> MietteRes
         release: true,
         test_mode: false,
         target: polyglot::types::CompileTarget::Aarch64Android,
+        source_path: Some(file.clone()),
         ..Default::default()
     };
     
