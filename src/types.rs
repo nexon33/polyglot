@@ -48,12 +48,12 @@ pub struct Param {
     pub default: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CompileOptions {
     pub release: bool,
     pub target: CompileTarget,
     pub temp_dir: PathBuf,
-    /// Which language contains the main entry point: "rust" or "python"
+    /// Which language contains the main entry point: "rust", "python", "javascript", or "typescript"
     pub main_lang: Option<String>,
     pub test_mode: bool,
     /// Path to the source .poly file (for locating poly.toml)

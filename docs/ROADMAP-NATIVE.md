@@ -293,6 +293,21 @@ Once all phases complete, OpenClaw migration can begin:
 
 ---
 
+## Current Reality (as of 2026-02-07)
+
+Native compilation (`--target windows/linux/android`) now works by delegating to `cargo build` with the appropriate `--target` triple. This is **not** the Cranelift-based approach described in Phase 3 above — instead, it uses the standard Rust toolchain. This is simpler and more robust for real-world use:
+
+- `polyglot build app.poly --target windows` builds via `cargo build --target=x86_64-pc-windows-msvc`
+- `polyglot build app.poly --target linux` builds via `cargo build --target=x86_64-unknown-linux-gnu`
+- `polyglot build app.poly --target android` builds via `cargo build --target=aarch64-linux-android`
+- `polyglot build app.poly --target apk` builds an Android APK with JNI bindings
+
+Dependencies are loaded from `poly.toml [rust]` section or auto-detected from `use` statements.
+
+The Cranelift/custom-backend approach (Phase 3) is deferred — the `rustc`-based approach covers all practical use cases.
+
+---
+
 ## Immediate Next Steps (This Week)
 
 1. **Create target abstraction layer**

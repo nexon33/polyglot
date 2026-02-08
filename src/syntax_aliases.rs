@@ -6,6 +6,7 @@
 //! Accepts ALL syntax variants and normalizes them for the parser.
 
 use regex::Regex;
+use std::sync::LazyLock;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Source Location Tracking
@@ -102,24 +103,22 @@ pub fn normalize_all_with_map(source: &str) -> (String, SourceLocationMap) {
 /// | False | false |
 /// | elif | else if |
 pub fn normalize_keywords(source: &str) -> String {
+    static REPLACEMENTS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| vec![
+        // JS/C# null → Rust None
+        (Regex::new(r"\bnull\b").unwrap(), "None"),
+        // Ruby/Lua nil → Rust None
+        (Regex::new(r"\bnil\b").unwrap(), "None"),
+        // Python booleans → lowercase (Rust uses lowercase)
+        (Regex::new(r"\bTrue\b").unwrap(), "true"),
+        (Regex::new(r"\bFalse\b").unwrap(), "false"),
+        // elif → else if
+        (Regex::new(r"\belif\b").unwrap(), "else if"),
+    ]);
+
     let mut result = source.to_string();
 
-    // Word boundary replacements to avoid replacing substrings
-    let replacements = [
-        // JS/C# null → Rust None
-        (r"\bnull\b", "None"),
-        // Ruby/Lua nil → Rust None
-        (r"\bnil\b", "None"),
-        // Python booleans → lowercase (Rust uses lowercase)
-        (r"\bTrue\b", "true"),
-        (r"\bFalse\b", "false"),
-        // elif → else if
-        (r"\belif\b", "else if"),
-    ];
-
-    for (pattern, replacement) in replacements {
-        let re = Regex::new(pattern).unwrap();
-        result = re.replace_all(&result, replacement).to_string();
+    for (re, replacement) in REPLACEMENTS.iter() {
+        result = re.replace_all(&result, *replacement).to_string();
     }
 
     result
@@ -135,26 +134,25 @@ pub fn normalize_keywords(source: &str) -> String {
 /// | is | == |
 /// | is not | != |
 pub fn normalize_operators(source: &str) -> String {
-    let mut result = source.to_string();
-
-    // Order matters: "is not" before "is", "not" careful placement
-    let replacements = [
+    static REPLACEMENTS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| vec![
+        // Order matters: "is not" before "is", "not" careful placement
         // "is not" → != (must be before "is")
-        (r"\bis\s+not\b", "!="),
+        (Regex::new(r"\bis\s+not\b").unwrap(), "!="),
         // "is" → == (identity check, simplified)
-        (r"\bis\b", "=="),
+        (Regex::new(r"\bis\b").unwrap(), "=="),
         // "and" → && (surrounded by spaces for safety)
-        (r"\band\b", "&&"),
+        (Regex::new(r"\band\b").unwrap(), "&&"),
         // "or" → ||
-        (r"\bor\b", "||"),
+        (Regex::new(r"\bor\b").unwrap(), "||"),
         // "not" → ! (careful: not as prefix)
         // Only replace "not " at word boundary, followed by space or (
-        (r"\bnot\s+", "!"),
-    ];
+        (Regex::new(r"\bnot\s+").unwrap(), "!"),
+    ]);
 
-    for (pattern, replacement) in replacements {
-        let re = Regex::new(pattern).unwrap();
-        result = re.replace_all(&result, replacement).to_string();
+    let mut result = source.to_string();
+
+    for (re, replacement) in REPLACEMENTS.iter() {
+        result = re.replace_all(&result, *replacement).to_string();
     }
 
     result
@@ -170,11 +168,14 @@ pub fn normalize_operators(source: &str) -> String {
 ///
 /// Note: Uses Rust 1.58+ captured identifiers syntax
 pub fn normalize_strings(source: &str) -> String {
+    static FSTRING_DOUBLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"f"([^"]*)""#).unwrap());
+    static FSTRING_SINGLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"f'([^']*)'").unwrap());
+    static TEMPLATE_LITERAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]*)`").unwrap());
+
     let mut result = source.to_string();
 
     // f-string with double quotes: f"...{expr}..." → format!("...{expr}...")
-    let fstring_double = Regex::new(r#"f"([^"]*)""#).unwrap();
-    result = fstring_double
+    result = FSTRING_DOUBLE
         .replace_all(&result, |caps: &regex::Captures| {
             let content = &caps[1];
             format!("format!(\"{}\")", content)
@@ -182,8 +183,7 @@ pub fn normalize_strings(source: &str) -> String {
         .to_string();
 
     // f-string with single quotes: f'...{expr}...' → format!("...{expr}...")
-    let fstring_single = Regex::new(r"f'([^']*)'").unwrap();
-    result = fstring_single
+    result = FSTRING_SINGLE
         .replace_all(&result, |caps: &regex::Captures| {
             let content = &caps[1];
             format!("format!(\"{}\")", content)
@@ -191,8 +191,7 @@ pub fn normalize_strings(source: &str) -> String {
         .to_string();
 
     // JavaScript template literals: `...${expr}...` → format!("...{expr}...")
-    let template_literal = Regex::new(r"`([^`]*)`").unwrap();
-    result = template_literal
+    result = TEMPLATE_LITERAL
         .replace_all(&result, |caps: &regex::Captures| {
             let content = &caps[1];
             // Convert ${expr} to {expr} for Rust format!
@@ -209,12 +208,14 @@ pub fn normalize_strings(source: &str) -> String {
 /// @decorator → #[decorator]
 /// @decorator(args) → #[decorator(args)]
 pub fn normalize_decorators(source: &str) -> String {
+    static DECORATOR_WITH_ARGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@(\w+)\(([^)]*)\)").unwrap());
+    static DECORATOR_SIMPLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@(\w+)").unwrap());
+
     let mut result = source.to_string();
 
     // @decorator(args) → #[decorator(args)]
     // Must be done first to avoid double-processing
-    let decorator_with_args = Regex::new(r"@(\w+)\(([^)]*)\)").unwrap();
-    result = decorator_with_args
+    result = DECORATOR_WITH_ARGS
         .replace_all(&result, "#[$1($2)]")
         .to_string();
 
@@ -222,8 +223,7 @@ pub fn normalize_decorators(source: &str) -> String {
     // Only match @ followed by word that's NOT already converted (not followed by opening paren)
     // Since we can't use look-ahead, we handle this differently:
     // Match @word at word boundary, then check if next char is NOT (
-    let decorator_simple = Regex::new(r"@(\w+)").unwrap();
-    result = decorator_simple
+    result = DECORATOR_SIMPLE
         .replace_all(&result, |caps: &regex::Captures| {
             let name = &caps[1];
             // Check if already converted (starts with #[)
@@ -263,23 +263,24 @@ pub fn normalize_class_syntax(source: &str) -> String {
 ///
 /// Also handles: `**kwargs` -> `__kwargs_name`
 pub fn normalize_function_syntax(source: &str) -> String {
+    static ASYNC_DEF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\basync\s+def\b").unwrap());
+    static DEF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bdef\b").unwrap());
+    static KWARGS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*(\w+)").unwrap());
+
     let mut result = source.to_string();
 
     // Only normalize `def` if this looks like Python-style code
     // (to avoid breaking legitimate uses of "def" in other contexts)
     if is_python_style_code(&result) {
         // async def -> async fn (must be before def -> fn)
-        let async_def = Regex::new(r"\basync\s+def\b").unwrap();
-        result = async_def.replace_all(&result, "async fn").to_string();
+        result = ASYNC_DEF.replace_all(&result, "async fn").to_string();
 
         // def -> fn
-        let def_re = Regex::new(r"\bdef\b").unwrap();
-        result = def_re.replace_all(&result, "fn").to_string();
+        result = DEF_RE.replace_all(&result, "fn").to_string();
     }
 
     // Handle **kwargs -> __kwargs_name (for any context)
-    let kwargs_re = Regex::new(r"\*\*(\w+)").unwrap();
-    result = kwargs_re
+    result = KWARGS_RE
         .replace_all(&result, "__kwargs_$1: std::collections::HashMap<String, serde_json::Value>")
         .to_string();
 
@@ -312,6 +313,8 @@ fn is_python_style_code(source: &str) -> bool {
 /// In JS/C# style code: `this.x` -> `self.x`
 /// Python `self` stays as-is (Rust native)
 pub fn normalize_self_this(source: &str) -> String {
+    static THIS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bthis\.").unwrap());
+
     let mut result = source.to_string();
 
     // If we see `this.` without `self.`, it's likely JS/C# style
@@ -320,12 +323,10 @@ pub fn normalize_self_this(source: &str) -> String {
 
     if has_this && !has_self {
         // Pure JS/C# style - normalize to Rust's self
-        let this_re = Regex::new(r"\bthis\.").unwrap();
-        result = this_re.replace_all(&result, "self.").to_string();
+        result = THIS_RE.replace_all(&result, "self.").to_string();
     } else if has_this && has_self {
         // Mixed style (like chaos.poly) - normalize this to self
-        let this_re = Regex::new(r"\bthis\.").unwrap();
-        result = this_re.replace_all(&result, "self.").to_string();
+        result = THIS_RE.replace_all(&result, "self.").to_string();
     }
 
     result
@@ -342,13 +343,17 @@ pub fn normalize_self_this(source: &str) -> String {
 /// IMPORTANT: Does NOT convert Rust match arm syntax like `Ok(l) => l`
 /// We detect this by checking if `(...)` is preceded by a word character.
 pub fn normalize_arrow_functions(source: &str) -> String {
+    static MULTI_ARROW_BLOCK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^|[^a-zA-Z0-9_])\(([^)]*)\)\s*=>\s*\{").unwrap());
+    static MULTI_ARROW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^|[^a-zA-Z0-9_])\(([^)]*)\)\s*=>\s*").unwrap());
+    static SINGLE_ARROW_BLOCK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\s)(\w+)\s*=>\s*\{").unwrap());
+    static SINGLE_ARROW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\s)(\w+)\s*=>\s*(\S)").unwrap());
+
     let mut result = source.to_string();
 
     // Multi-param arrow with parens and block: (a, b) => {
     // Must be done first to handle block case
     // Capture preceding char to check it's NOT a word char (would indicate Rust enum like Ok(l))
-    let multi_arrow_block = Regex::new(r"(^|[^a-zA-Z0-9_])\(([^)]*)\)\s*=>\s*\{").unwrap();
-    result = multi_arrow_block
+    result = MULTI_ARROW_BLOCK
         .replace_all(&result, |caps: &regex::Captures| {
             let prefix = &caps[1];
             let params = &caps[2];
@@ -358,8 +363,7 @@ pub fn normalize_arrow_functions(source: &str) -> String {
 
     // Multi-param arrow with parens: (a, b) => expr (no block)
     // Capture preceding char to exclude Rust enum patterns like Ok(l) => l
-    let multi_arrow = Regex::new(r"(^|[^a-zA-Z0-9_])\(([^)]*)\)\s*=>\s*").unwrap();
-    result = multi_arrow
+    result = MULTI_ARROW
         .replace_all(&result, |caps: &regex::Captures| {
             let prefix = &caps[1];
             let params = &caps[2];
@@ -377,8 +381,7 @@ pub fn normalize_arrow_functions(source: &str) -> String {
 
     // Single-param arrow with block: x => {
     // Only match when preceded by whitespace to avoid matching Rust enum patterns
-    let single_arrow_block = Regex::new(r"(\s)(\w+)\s*=>\s*\{").unwrap();
-    result = single_arrow_block
+    result = SINGLE_ARROW_BLOCK
         .replace_all(&result, |caps: &regex::Captures| {
             let space = &caps[1];
             let param = &caps[2];
@@ -393,8 +396,7 @@ pub fn normalize_arrow_functions(source: &str) -> String {
 
     // Single-param arrow without parens: x => expr
     // Only match when preceded by whitespace and param doesn't look like Rust pattern
-    let single_arrow = Regex::new(r"(\s)(\w+)\s*=>\s*(\S)").unwrap();
-    result = single_arrow
+    result = SINGLE_ARROW
         .replace_all(&result, |caps: &regex::Captures| {
             let space = &caps[1];
             let param = &caps[2];
@@ -516,11 +518,11 @@ pub fn infer_braces_from_indent(source: &str) -> String {
 fn uses_indentation_syntax(source: &str) -> bool {
     // If source uses NEW-style #[lang] { } blocks, skip brace inference entirely
     // This prevents mangling content inside explicit braced blocks
-    let unified_block_re = Regex::new(
+    static UNIFIED_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc)(?::[a-zA-Z0-9_:/\.\-]+)?\]\s*\{"
-    ).unwrap();
+    ).unwrap());
 
-    if unified_block_re.is_match(source) {
+    if UNIFIED_BLOCK_RE.is_match(source) {
         // Source uses new-style braced blocks - no brace inference needed
         return false;
     }

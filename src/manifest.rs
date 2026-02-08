@@ -66,10 +66,16 @@ impl Manifest {
         Some(manifest)
     }
     
-    /// Load manifest from the same directory as a .poly file
+    /// Load manifest from the same directory as a .poly file,
+    /// walking up parent directories until poly.toml is found.
     pub fn load_for_file(poly_file: &Path) -> Option<Self> {
-        let dir = poly_file.parent()?;
-        Self::load(dir)
+        let mut dir = poly_file.parent()?;
+        loop {
+            if let Some(manifest) = Self::load(dir) {
+                return Some(manifest);
+            }
+            dir = dir.parent()?;
+        }
     }
     
     /// Convert rust dependencies to Cargo.toml [dependencies] format
@@ -185,10 +191,74 @@ impl Manifest {
     pub fn has_pip_deps(&self) -> bool {
         !self.pip.is_empty()
     }
+
+    /// Generate a complete package.json from manifest metadata and npm deps.
+    /// Handles `[npm]` for dependencies and `[npm.dev]` sub-table for devDependencies.
+    /// Also auto-classifies @types/* and typescript/tsx as devDependencies.
+    pub fn generate_package_json(&self) -> String {
+        if self.npm.is_empty() {
+            return String::new();
+        }
+
+        let name = self.package.name.as_deref().unwrap_or("poly-project");
+        let version = self.package.version.as_deref().unwrap_or("0.1.0");
+
+        let mut deps: Vec<(String, String)> = Vec::new();
+        let mut dev_deps: Vec<(String, String)> = Vec::new();
+
+        for (pkg, value) in &self.npm {
+            // Handle [npm.dev] sub-table — all entries go to devDependencies
+            if pkg == "dev" {
+                if let Some(table) = value.as_table() {
+                    for (dev_pkg, dev_ver) in table {
+                        let ver = dev_ver.as_str().unwrap_or("*").to_string();
+                        dev_deps.push((dev_pkg.clone(), ver));
+                    }
+                }
+                continue;
+            }
+
+            let ver = value.as_str().unwrap_or("*").to_string();
+            // Auto-classify @types/*, typescript, tsx as devDependencies
+            if pkg.starts_with("@types/") || pkg == "typescript" || pkg == "tsx" {
+                dev_deps.push((pkg.clone(), ver));
+            } else {
+                deps.push((pkg.clone(), ver));
+            }
+        }
+
+        deps.sort_by(|a, b| a.0.cmp(&b.0));
+        dev_deps.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let fmt_deps = |items: &[(String, String)]| -> String {
+            items.iter()
+                .map(|(k, v)| format!("    \"{}\": \"{}\"", k, v))
+                .collect::<Vec<_>>()
+                .join(",\n")
+        };
+
+        format!(
+            r#"{{
+  "name": "{}",
+  "version": "{}",
+  "private": true,
+  "type": "module",
+  "scripts": {{
+    "start": "tsx main.ts"
+  }},
+  "dependencies": {{
+{}
+  }},
+  "devDependencies": {{
+{}
+  }}
+}}"#,
+            name, version, fmt_deps(&deps), fmt_deps(&dev_deps)
+        )
+    }
 }
 
-// Need serde_json for npm output
-use serde::Serialize;
+// serde_json is used for npm_dependencies_json()
 
 #[cfg(test)]
 mod tests {

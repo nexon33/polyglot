@@ -21,6 +21,10 @@ use std::time::{Duration, SystemTime};
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Polyglot compiler - Multi-language WASM development", long_about = None)]
 struct Args {
+    /// Enable verbose output
+    #[arg(long, short, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -48,6 +52,10 @@ enum Commands {
         /// Target: browser (default), host, android, linux, windows, apk
         #[arg(long, short, value_parser = ["browser", "host", "android", "linux", "windows", "apk"], default_value = "browser")]
         target: String,
+
+        /// Output file path (default: <input>.<ext>)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
     },
     /// Generate WIT interface from a poly file
     Wit {
@@ -67,7 +75,11 @@ enum Commands {
         #[arg(long, default_value_t = true)]
         release: bool,
 
-        /// Arguments to pass to the WASM program (use -- before args)
+        /// Target: browser (default), host
+        #[arg(long, short, value_parser = ["browser", "host"], default_value = "browser")]
+        target: String,
+
+        /// Arguments to pass to the program (use -- before args)
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -201,12 +213,24 @@ fn main() -> MietteResult<()> {
                 Err(e) => eprintln!("❌ {}", e),
             }
         }
-        Commands::Build { file, release, emit, target } => {
+        Commands::Build { file, release, emit, target, output } => {
             // Handle --emit=wit flag
             if emit.as_deref() == Some("wit") {
                 generate_wit_file(&file)?;
             }
-            build_poly(&file, release, false, &target)?;
+            let built_path = build_poly(&file, release, false, &target)?;
+            // If --output was specified, copy the result there
+            if let Some(out) = output {
+                if out != built_path {
+                    if let Some(parent) = out.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent).into_diagnostic()?;
+                        }
+                    }
+                    fs::copy(&built_path, &out).into_diagnostic()?;
+                    println!("📦 Copied to {}", out.display());
+                }
+            }
         }
         Commands::Wit { file, output } => {
             generate_wit_file_to(&file, output)?;
@@ -215,6 +239,7 @@ fn main() -> MietteResult<()> {
             file,
             release,
             args,
+            ..
         } => {
             let wasm_path = build_poly(&file, release, false, "browser")?;
             run_wasm(&wasm_path, &args)?;
@@ -641,11 +666,12 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) 
 
     // Print target info
     match target_str {
+        "browser" => println!("🎯 Target: browser (wasm32-wasip1)"),
         "host" => println!("🎯 Target: host (Node.js with native access)"),
         "android" => println!("🎯 Target: android (aarch64-linux-android native binary)"),
         "linux" => println!("🎯 Target: linux (x86_64-unknown-linux-gnu native binary)"),
         "windows" => println!("🎯 Target: windows (x86_64-pc-windows-msvc native binary)"),
-        _ => {}
+        _ => println!("🎯 Target: {}", target_str),
     }
 
     let opts = CompileOptions {
@@ -664,9 +690,17 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) 
             }
             println!("✅ Successfully compiled {} bytes", output.binary.len());
             
-            // Determine output extension based on target
-            let out_ext = target.output_extension();
-            let out_path = if out_ext.is_empty() {
+            // Determine output extension: use compile output override if present,
+            // otherwise fall back to target default
+            let out_ext = output.output_extension.as_deref()
+                .unwrap_or(target.output_extension());
+            let out_path = if out_ext == "ts" || out_ext == "js" {
+                // JS/TS targets: write to target/ directory (relative to cwd)
+                let target_dir = PathBuf::from("target");
+                fs::create_dir_all(&target_dir).into_diagnostic()?;
+                let fname = file.file_stem().unwrap_or(std::ffi::OsStr::new("main"));
+                target_dir.join(format!("{}.{}", fname.to_string_lossy(), out_ext))
+            } else if out_ext.is_empty() {
                 // Native binaries on Linux/Android have no extension
                 file.with_extension("")
             } else {
@@ -675,24 +709,73 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) 
             
             fs::write(&out_path, &output.binary).into_diagnostic()?;
             println!("📦 Wrote to {}", out_path.display());
-            
-            // For native targets with web assets, copy them to a web/ subdirectory
-            if target.is_native() && output.has_web_assets {
-                let web_dir = out_path.parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("web");
-                fs::create_dir_all(&web_dir).into_diagnostic()?;
-                
+
+            // For JS/TS targets: copy package.json, web assets, and run npm install
+            if out_ext == "ts" || out_ext == "js" {
+                let out_dir = out_path.parent()
+                    .unwrap_or(std::path::Path::new("."));
+
+                // Copy package.json if generated
+                let pkg_src = opts.temp_dir.join("package.json");
+                if pkg_src.exists() {
+                    let pkg_dst = out_dir.join("package.json");
+                    fs::copy(&pkg_src, &pkg_dst).into_diagnostic()?;
+                    println!("📄 Copied package.json");
+                }
+
+                // Copy web assets (index.html etc.)
                 for asset in &output.web_assets {
                     let src = opts.temp_dir.join(asset);
-                    let dst = web_dir.join(asset);
+                    let dst = out_dir.join(asset);
                     if src.exists() {
                         fs::copy(&src, &dst).into_diagnostic()?;
+                        println!("🌐 Copied {}", asset);
                     }
                 }
-                println!("🌐 Web assets copied to {}/", web_dir.display());
+
+                // Run npm install if package.json exists
+                let pkg_path = out_dir.join("package.json");
+                if pkg_path.exists() {
+                    println!("📦 Running npm install...");
+                    let npm_output = std::process::Command::new("npm")
+                        .arg("install")
+                        .current_dir(out_dir)
+                        .output();
+                    match npm_output {
+                        Ok(o) if o.status.success() => {
+                            println!("✅ npm install complete");
+                        }
+                        Ok(o) => {
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            eprintln!("⚠️  npm install had issues: {}", stderr.lines().next().unwrap_or(""));
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  Could not run npm install: {}", e);
+                        }
+                    }
+                }
+
+                println!("\n  Run with:");
+                println!("    cd {} && npx tsx main.{}", out_dir.display(), out_ext);
+            } else {
+                // For native targets with web assets, copy them to a web/ subdirectory
+                if target.is_native() && output.has_web_assets {
+                    let web_dir = out_path.parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join("web");
+                    fs::create_dir_all(&web_dir).into_diagnostic()?;
+
+                    for asset in &output.web_assets {
+                        let src = opts.temp_dir.join(asset);
+                        let dst = web_dir.join(asset);
+                        if src.exists() {
+                            fs::copy(&src, &dst).into_diagnostic()?;
+                        }
+                    }
+                    println!("🌐 Web assets copied to {}/", web_dir.display());
+                }
             }
-            
+
             Ok(out_path)
         }
         Err(e) => {
@@ -711,7 +794,7 @@ fn build_poly(file: &PathBuf, release: bool, test_mode: bool, target_str: &str) 
                     let mut second_span = (0usize, 10usize);
 
                     for (i, block) in parsed.blocks.iter().enumerate() {
-                        if block.code.contains("fn main(") || block.code.contains("def main(") {
+                        if block.code.contains("fn main(") || block.code.contains("def main(") || block.code.contains("function main(") {
                             let offset = diagnostic::line_col_to_offset(&source, block.start_line, 1);
                             if first_span.0 == 0 && i == 0 || first_span == (0, 10) {
                                 first_span = (offset, 15);
@@ -908,9 +991,9 @@ fn main() {{
 name = "{}"
 version = "0.1.0"
 
-[dependencies]
-# Add your dependencies here
-# gridmesh = {{ path = "../gridmesh" }}
+[rust]
+# Add your Rust dependencies here
+# serde = {{ version = "1.0", features = ["derive"] }}
 "#,
         project_name
     );
@@ -1586,6 +1669,29 @@ fn resolve_imports(parsed: &mut ParsedFile, base_dir: &Path) -> MietteResult<()>
     resolve_inner(parsed, base_dir, &mut visited)
 }
 
+/// Guess Content-Type header from file extension
+fn guess_content_type(path: &str) -> String {
+    let ct = match path.rsplit('.').next().unwrap_or("") {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "wasm" => "application/wasm",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    format!("Content-Type: {}", ct)
+}
+
 /// Watch mode with hot reload
 fn watch_poly(file: &PathBuf, port: u16, open: bool) -> MietteResult<()> {
     use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
@@ -1731,7 +1837,24 @@ fn watch_poly(file: &PathBuf, port: u16, open: bool) -> MietteResult<()> {
                 }
             }
             _ => {
-                // 404 for other paths
+                // Try serving static files from project directory
+                let clean_url = url.trim_start_matches('/');
+                let file_path = watch_dir.join(clean_url);
+                if !clean_url.is_empty() && file_path.exists() && file_path.is_file() {
+                    // Security: ensure file is within watch_dir
+                    if let (Ok(canonical), Ok(base)) = (file_path.canonicalize(), watch_dir.canonicalize()) {
+                        if canonical.starts_with(&base) {
+                            if let Ok(data) = fs::read(&canonical) {
+                                let content_type = guess_content_type(clean_url);
+                                let response = tiny_http::Response::from_data(data).with_header(
+                                    content_type.parse::<tiny_http::Header>().unwrap(),
+                                );
+                                let _ = request.respond(response);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 let response = tiny_http::Response::from_string("Not Found").with_status_code(404);
                 let _ = request.respond(response);
             }

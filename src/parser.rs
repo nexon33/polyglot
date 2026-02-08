@@ -3,6 +3,7 @@ use crate::types::{FunctionSig, Param, WitType};
 use regex::Regex;
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeRef {
@@ -415,18 +416,17 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     // Normalization is now applied PER-BLOCK after parsing, only to Rust/Python
     // blocks. JS/HTML/CSS/GPU blocks are left untouched to preserve their
     // native syntax (template literals, this., arrow functions, etc).
-    let source = source;
-
     let mut parsed = ParsedFile::default();
 
     // Parse import statements: use <item> from "<path>"
     // Syntax: use myfunction from "./other.poly"
     //         use * from "./types.poly"
     //         use { foo, bar } from "./utils.poly"
-    let import_re =
-        Regex::new(r#"(?m)^use\s+(?:(\*)|(\w+)|(?:\{([^}]+)\}))\s+from\s+"([^"]+)""#).unwrap();
+    static IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?m)^use\s+(?:(\*)|(\w+)|(?:\{([^}]+)\}))\s+from\s+"([^"]+)""#).unwrap()
+    });
 
-    for cap in import_re.captures_iter(source) {
+    for cap in IMPORT_RE.captures_iter(source) {
         let path = cap.get(4).unwrap().as_str().to_string();
         let items = if cap.get(1).is_some() {
             // use * from "..."
@@ -453,10 +453,15 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     // Supported: rust/rs, python/py, typescript/ts, javascript/js, interface, types, main, gpu, wgsl, jsx, html, rscss, css, test, doc
     // Static/config blocks (not compiled): md, toml, json, yaml, txt, cfg, ini, xml, env, dockerfile, makefile, sh, bat, ps1, sql
     // Note: Dependencies are declared in poly.toml, not inline blocks
-    let re = Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::[a-zA-Z0-9_:/\.\-]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
-        .unwrap();
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::[a-zA-Z0-9_:/\.\-]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
+            .unwrap()
+    });
 
-    let matches: Vec<_> = re.find_iter(source).collect();
+    let matches: Vec<_> = RE.find_iter(source).collect();
+
+    // Track claimed byte ranges to prevent duplicate blocks across parsing passes
+    let mut claimed_ranges: Vec<(usize, usize)> = Vec::new();
 
     for (i, m) in matches.iter().enumerate() {
         let start_idx = m.end();
@@ -507,6 +512,9 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
         let leading_newlines = tag_content.chars().take_while(|c| *c == '\n' || *c == '\r').filter(|c| *c == '\n').count();
         let code_start_line = start_line + 1 + leading_newlines;
 
+        // Claim this byte range
+        claimed_ranges.push((m.start(), end_idx));
+
         parsed.blocks.push(CodeBlock {
             lang_tag,
             code: tag_content.trim().to_string(),
@@ -524,10 +532,14 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     // This mirrors Rust macro syntax where ! signals "something special happening"
 
     // Pattern for block-level: lang {
-    let block_re = Regex::new(r"(?m)^(rust|rs|python|py|typescript|ts|javascript|js|wgsl|gpu)\s*\{").unwrap();
+    static BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^(rust|rs|python|py|typescript|ts|javascript|js|wgsl|gpu)\s*\{").unwrap()
+    });
 
     // Pattern for expression-level: lang!{
-    let expr_re = Regex::new(r"(?m)(rust|rs|python|py|typescript|ts|javascript|js|wgsl|gpu)!\s*\{").unwrap();
+    static EXPR_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)(rust|rs|python|py|typescript|ts|javascript|js|wgsl|gpu)!\s*\{").unwrap()
+    });
 
     // === UNIFIED SYNTAX: #[lang:path] { } - combines tag header with braces ===
     //
@@ -538,19 +550,30 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     //
     // The braces provide clear start/end markers, easier to parse and collapse
     // Static/config blocks (not compiled): md, toml, json, yaml, txt, cfg, ini, xml, env, dockerfile, makefile, sh, bat, ps1, sql
-    let unified_re = Regex::new(
-        r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::([a-zA-Z0-9_:/\.\-]+))?\]\s*\{"
-    ).unwrap();
+    static UNIFIED_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::([a-zA-Z0-9_:/\.\-]+))?\]\s*\{"
+        ).unwrap()
+    });
+
+    // Helper: check if a byte range overlaps with any claimed range
+    let overlaps_claimed = |start: usize, end: usize, ranges: &[(usize, usize)]| -> bool {
+        ranges.iter().any(|&(rs, re)| start < re && end > rs)
+    };
 
     // Find unified syntax: #[lang] { ... } or #[lang:path] { ... }
-    for cap in unified_re.captures_iter(source) {
+    for cap in UNIFIED_RE.captures_iter(source) {
         let m = cap.get(0).unwrap();
         let lang = cap.get(1).unwrap().as_str();
         let path = cap.get(2).map(|p| p.as_str().to_string());
 
         // Find matching closing brace
-        if let Some((content, _end_pos)) = find_matching_brace(source, m.end() - 1) {
-            eprintln!("📦 Block [{}] found: {} bytes", lang, content.len());
+        if let Some((content, end_pos)) = find_matching_brace(source, m.end() - 1) {
+            // Skip if this range overlaps with already-claimed blocks
+            if overlaps_claimed(m.start(), end_pos, &claimed_ranges) {
+                continue;
+            }
+
             let start_line = source[..m.start()].lines().count();
 
             // Normalize language tag
@@ -579,6 +602,9 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             let leading_newlines = content.chars().take_while(|c| *c == '\n' || *c == '\r').filter(|c| *c == '\n').count();
             let code_start_line = start_line + 1 + leading_newlines;
 
+            // Claim this byte range
+            claimed_ranges.push((m.start(), end_pos));
+
             parsed.blocks.push(CodeBlock {
                 lang_tag,
                 code: content.trim().to_string(),
@@ -592,12 +618,17 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     }
 
     // Find block-level syntax: lang { ... }
-    for cap in block_re.captures_iter(source) {
+    for cap in BLOCK_RE.captures_iter(source) {
         let m = cap.get(0).unwrap();
         let lang = cap.get(1).unwrap().as_str();
 
         // Find matching closing brace (handle nested braces)
-        if let Some((content, _end_pos)) = find_matching_brace(source, m.end() - 1) {
+        if let Some((content, end_pos)) = find_matching_brace(source, m.end() - 1) {
+            // Skip if this range overlaps with already-claimed blocks
+            if overlaps_claimed(m.start(), end_pos, &claimed_ranges) {
+                continue;
+            }
+
             let start_line = source[..m.start()].lines().count();
 
             // Normalize language tag
@@ -614,6 +645,9 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
             let leading_newlines = content.chars().take_while(|c| *c == '\n' || *c == '\r').filter(|c| *c == '\n').count();
             let code_start_line = start_line + 1 + leading_newlines;
 
+            // Claim this byte range
+            claimed_ranges.push((m.start(), end_pos));
+
             parsed.blocks.push(CodeBlock {
                 lang_tag,
                 code: content.trim().to_string(),
@@ -625,7 +659,7 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     }
 
     // Find expression-level syntax: lang!{ ... } (reserved - not yet implemented)
-    for cap in expr_re.captures_iter(source) {
+    for cap in EXPR_RE.captures_iter(source) {
         let m = cap.get(0).unwrap();
         let lang = cap.get(1).unwrap().as_str();
         let start_line = source[..m.start()].lines().count();
@@ -663,27 +697,28 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
 /// Scan code blocks for `export fn`, `public fn` (Rust) and `export def`, `public def` (Python)
 fn scan_exported_functions(parsed: &mut ParsedFile) {
     use crate::interface::parser::{FunctionDecl, InterfaceItem, Visibility};
-    use regex::Regex;
 
     // Rust patterns:
     // - export fn name(params) -> Type  => Export visibility
     // Only `export fn` creates interface functions (not `pub fn` which is internal visibility)
     // This prevents matching `pub fn new()` inside impl blocks
-    let rust_export_re =
-        Regex::new(r"export\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^\{]+))?").unwrap();
+    static RUST_EXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"export\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^\{]+))?").unwrap()
+    });
 
     // Python: only `export def` creates interface functions
-    let python_export_re =
-        Regex::new(r"export\s+def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap();
+    static PYTHON_EXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"export\s+def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?").unwrap()
+    });
 
     for block in &parsed.blocks {
         let (patterns, is_rust): (Vec<(&Regex, Visibility)>, bool) = match block.lang_tag.as_str() {
             "rust" | "rs" => (
-                vec![(&rust_export_re, Visibility::Export)],
+                vec![(&RUST_EXPORT_RE, Visibility::Export)],
                 true,
             ),
             "python" | "py" => (
-                vec![(&python_export_re, Visibility::Export)],
+                vec![(&PYTHON_EXPORT_RE, Visibility::Export)],
                 false,
             ),
             _ => continue,

@@ -42,7 +42,7 @@ impl PolySource {
 #[error("No main entry point found")]
 #[diagnostic(
     code(polyglot::E001),
-    help("Add a main function:\n\n  #[main] {{\n      fn main() {{\n          println!(\"Hello!\");\n      }}\n  }}\n\n  -- or --\n\n  #[python] {{\n      def main():\n          print(\"Hello!\")\n  }}")
+    help("Add a main function:\n\n  #[main] {{\n      fn main() {{\n          println!(\"Hello!\");\n      }}\n  }}\n\n  -- or --\n\n  #[python] {{\n      def main():\n          print(\"Hello!\")\n  }}\n\n  -- or --\n\n  #[ts] {{\n      function main() {{\n          console.log(\"Hello!\");\n      }}\n      main();\n  }}")
 )]
 pub struct NoMainError {
     #[source_code]

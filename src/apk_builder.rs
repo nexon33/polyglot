@@ -6,8 +6,8 @@
 //! - zipalign: optimize APK
 //! - apksigner: sign APK
 
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -36,7 +36,7 @@ impl Default for ApkConfig {
 
 #[derive(Debug)]
 pub struct ApkBuilder {
-    sdk_path: PathBuf,
+    _sdk_path: PathBuf,
     build_tools_path: PathBuf,
     platform_path: PathBuf,
     work_dir: PathBuf,
@@ -50,7 +50,7 @@ impl ApkBuilder {
         let platform_path = find_platform(&sdk_path)?;
         
         Ok(Self {
-            sdk_path,
+            _sdk_path: sdk_path,
             build_tools_path,
             platform_path,
             work_dir,
@@ -78,7 +78,7 @@ impl ApkBuilder {
         self.compile_resources()?;
         
         // 4. Link resources into base APK
-        let base_apk = self.link_resources(config)?;
+        let _base_apk = self.link_resources(config)?;
         
         // 5. Generate and compile Java code
         self.generate_java_code(config)?;
@@ -223,7 +223,7 @@ impl ApkBuilder {
         Ok(())
     }
     
-    fn link_resources(&self, config: &ApkConfig) -> Result<PathBuf, String> {
+    fn link_resources(&self, _config: &ApkConfig) -> Result<PathBuf, String> {
         let aapt2 = self.build_tools_path.join("aapt2.exe");
         let android_jar = self.platform_path.join("android.jar");
         let manifest = self.work_dir.join("AndroidManifest.xml");

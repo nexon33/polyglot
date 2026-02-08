@@ -1,31 +1,16 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<title>LoRa Chat</title>
-<link rel="stylesheet" href="styles.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polyglot App</title>
 </head>
 <body>
-<div class="app">
-<header><b>LoRa Chat v6</b><span id="status" class="off">Offline</span></header>
-<div id="conn">
-<input id="name" placeholder="Your Name" value="User">
-<div class="row">
-<select id="ports"><option>Scanning...</option></select>
-<button onclick="getPorts()">↻</button>
-</div>
-<button onclick="doConnect()">Connect</button>
-</div>
-<div id="chat">
-<div id="msgs"></div>
-<div id="inp">
-<input id="msg" placeholder="Type message..." onkeypress="if(event.key==='Enter')doSend()">
-<button onclick="doSend()">Send</button>
-</div>
-</div>
-<div id="log"></div>
-</div>
-<script src="app.js"></script>
+    <div id="root"></div>
+    <script type="module">
+        import init from './pkg/poly_cell.js';
+        await init();
+        import('./app.js');
+    </script>
 </body>
 </html>

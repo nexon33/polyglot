@@ -6,8 +6,8 @@ use crate::types::CompileOptions;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
+use std::sync::LazyLock;
 
 /// Deduplicate `use` statements in merged Rust code
 /// 
@@ -87,6 +87,126 @@ fn deduplicate_use_statements(code: &str) -> String {
     result
 }
 
+/// Sort merged Rust code so that `fn main()` appears last.
+/// This avoids forward-reference issues when merging multiple blocks.
+fn sort_main_last(code: &str) -> String {
+    // Split into logical chunks: we look for top-level fn definitions
+    // and move any chunk containing `fn main(` to the end
+    let mut before_main = Vec::new();
+    let mut main_chunk = Vec::new();
+    let mut current_chunk = Vec::new();
+    let mut in_main = false;
+    let mut brace_depth: i32 = 0;
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+
+        // Detect start of fn main
+        if !in_main && (trimmed.starts_with("fn main(") || trimmed.starts_with("pub fn main(")
+            || trimmed.starts_with("async fn main(") || trimmed.starts_with("pub async fn main("))
+        {
+            // Push accumulated non-main lines
+            if !current_chunk.is_empty() {
+                before_main.push(current_chunk.join("\n"));
+                current_chunk = Vec::new();
+            }
+            in_main = true;
+            brace_depth = 0;
+        }
+
+        if in_main {
+            for ch in line.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => brace_depth -= 1,
+                    _ => {}
+                }
+            }
+            main_chunk.push(line);
+            if brace_depth <= 0 && main_chunk.len() > 1 {
+                // End of main function body
+                in_main = false;
+            }
+        } else {
+            current_chunk.push(line);
+        }
+    }
+
+    // Push remaining lines
+    if !current_chunk.is_empty() {
+        before_main.push(current_chunk.join("\n"));
+    }
+
+    let mut result = before_main.join("\n");
+    if !main_chunk.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&main_chunk.join("\n"));
+    }
+    result
+}
+
+/// Sort merged JS/TS code so `function main()` and the `main()` call appear last.
+/// This avoids forward-reference issues when merging multiple blocks.
+fn sort_js_main_last(code: &str) -> String {
+    let mut before_main = Vec::new();
+    let mut main_chunk = Vec::new();
+    let mut main_call_line: Option<String> = None;
+    let mut in_main = false;
+    let mut brace_depth: i32 = 0;
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+
+        // Detect standalone main() call (not inside a function definition)
+        if !in_main && (trimmed == "main();" || trimmed == "main()") {
+            main_call_line = Some(line.to_string());
+            continue;
+        }
+
+        // Detect start of function main
+        if !in_main && (trimmed.starts_with("function main(")
+            || trimmed.starts_with("export function main(")
+            || trimmed.starts_with("async function main(")
+            || trimmed.starts_with("export async function main("))
+        {
+            in_main = true;
+            brace_depth = 0;
+        }
+
+        if in_main {
+            for ch in line.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => brace_depth -= 1,
+                    _ => {}
+                }
+            }
+            main_chunk.push(line);
+            if brace_depth <= 0 && main_chunk.len() > 1 {
+                in_main = false;
+            }
+        } else {
+            before_main.push(line);
+        }
+    }
+
+    let mut result = before_main.join("\n");
+    if !main_chunk.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&main_chunk.join("\n"));
+    }
+    if let Some(call) = main_call_line {
+        result.push('\n');
+        result.push_str(&call);
+    }
+    result.push('\n');
+    result
+}
+
 // We need a local error type or just use anyhow
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
@@ -103,12 +223,15 @@ pub enum CompileError {
 /// Result of compilation, may include binary and/or web assets
 #[derive(Debug, Default)]
 pub struct CompileOutput {
-    /// The compiled binary (WASM or native)
+    /// The compiled binary (WASM, native, or merged source for script targets)
     pub binary: Vec<u8>,
     /// Whether this includes web assets (JS/HTML/CSS)
     pub has_web_assets: bool,
     /// Paths to generated web assets (relative to temp_dir)
     pub web_assets: Vec<String>,
+    /// Override output extension (e.g. "ts" for TypeScript, "js" for JavaScript)
+    /// If None, uses the target's default extension
+    pub output_extension: Option<String>,
 }
 
 pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<CompileOutput, CompileError> {
@@ -149,9 +272,17 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<CompileOutp
                 gpu_blocks.push(block.code.clone());
             }
             "js" | "jsx" | "javascript" => {
+                // Detect JS main: function main()
+                if block.code.contains("function main(") {
+                    main_locations.push(("javascript", &block.code[..block.code.len().min(50)]));
+                }
                 js_blocks.push(block.code.clone());
             }
             "ts" | "tsx" | "typescript" => {
+                // Detect TS main: function main()
+                if block.code.contains("function main(") {
+                    main_locations.push(("typescript", &block.code[..block.code.len().min(50)]));
+                }
                 // TypeScript blocks - will be transpiled alongside JS
                 // For browser, Babel handles TS transpilation
                 js_blocks.push(block.code.clone());
@@ -190,7 +321,7 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<CompileOutp
     let main_lang = match main_locations.len() {
         0 => {
             return Err(CompileError::Build(
-                "No main function found. Add `fn main()` in a Rust block or `def main():` in a Python block.".to_string()
+                "No main function found. Add `fn main()` in a Rust block, `def main():` in a Python block, or `function main()` in a JS/TS block.".to_string()
             ));
         }
         1 => main_locations[0].0,
@@ -207,6 +338,112 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<CompileOutp
     };
 
     eprintln!("📍 Entry point: {} main()", main_lang);
+
+    // ── JavaScript/TypeScript compilation path ────────────────────────────
+    // When the main entry point is in a JS/TS block, merge all JS/TS blocks
+    // into a single file and return it as the output (no Rust/WASM compilation).
+    if main_lang == "javascript" || main_lang == "typescript" {
+        let is_ts = main_lang == "typescript";
+        let ext = if is_ts { "ts" } else { "js" };
+
+        // Deduplicate ES import statements and merge blocks
+        let mut seen_imports: HashSet<String> = HashSet::new();
+        let mut import_lines: Vec<String> = Vec::new();
+        let mut body_lines: Vec<String> = Vec::new();
+
+        for block_code in &js_blocks {
+            for line in block_code.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("import ") {
+                    if seen_imports.insert(trimmed.to_string()) {
+                        import_lines.push(line.to_string());
+                    }
+                } else {
+                    body_lines.push(line.to_string());
+                }
+            }
+            body_lines.push(String::new()); // blank line between blocks
+        }
+
+        let mut merged = String::new();
+        merged.push_str(&format!("// Auto-generated by polyglot compiler ({})\n\n", main_lang));
+        for imp in &import_lines {
+            merged.push_str(imp);
+            merged.push('\n');
+        }
+        if !import_lines.is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str(&body_lines.join("\n"));
+
+        // Sort so function main() is at the end, followed by the main() call
+        let merged = sort_js_main_last(&merged);
+
+        let out_file = opts.temp_dir.join(format!("main.{}", ext));
+        fs::write(&out_file, &merged)?;
+        eprintln!("📜 Generated: main.{} ({} lines)", ext, merged.lines().count());
+
+        // Write static files (package.json etc.) if provided
+        for (_lang, path, content) in &static_files {
+            if !path.is_empty() {
+                let file_path = opts.temp_dir.join(path);
+                if let Some(parent) = file_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&file_path, content)?;
+                eprintln!("📄 Generated: {} ({} bytes)", path, content.len());
+            }
+        }
+
+        // Auto-generate package.json from poly.toml if not already provided
+        let has_pkg_json = static_files.iter().any(|(_, p, _)| p == "package.json")
+            || opts.temp_dir.join("package.json").exists();
+        if !has_pkg_json {
+            if let Some(source_path) = &opts.source_path {
+                let manifest = crate::manifest::Manifest::load_for_file(source_path);
+                if let Some(manifest) = manifest {
+                    let pkg_json = manifest.generate_package_json();
+                    if !pkg_json.is_empty() {
+                        fs::write(opts.temp_dir.join("package.json"), &pkg_json)?;
+                        eprintln!("📄 Generated: package.json (from poly.toml)");
+                    }
+                }
+            }
+        }
+
+        // Copy web assets (HTML files)
+        for html in &html_blocks {
+            fs::write(opts.temp_dir.join("index.html"), html)?;
+            eprintln!("🌐 Generated: index.html");
+        }
+
+        // For host target, also copy any source-adjacent web files
+        if let Some(source_path) = &opts.source_path {
+            let src_dir = source_path.parent().unwrap_or(std::path::Path::new("."));
+            let web_dir = src_dir.join("web");
+            if web_dir.exists() {
+                let target_web = opts.temp_dir.clone();
+                if let Ok(entries) = fs::read_dir(&web_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            let fname = path.file_name().unwrap();
+                            let dst = target_web.join(fname);
+                            fs::copy(&path, &dst)?;
+                            eprintln!("📄 Copied: {}", fname.to_string_lossy());
+                        }
+                    }
+                }
+            }
+        }
+
+        return Ok(CompileOutput {
+            binary: merged.into_bytes(),
+            has_web_assets: !html_blocks.is_empty(),
+            web_assets: if !html_blocks.is_empty() { vec!["index.html".to_string()] } else { vec![] },
+            output_extension: Some(ext.to_string()),
+        });
+    }
 
     // Determine if this is a multi-file Rust project
     // Multi-file if we have blocks with different paths (e.g., src/main.rs, src/stack.rs)
@@ -328,16 +565,72 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<CompileOutp
             }
         }
 
+        // Generate Cargo.toml if not provided as a static file
+        let has_cargo_toml = static_files.iter().any(|(_, p, _)| p == "Cargo.toml")
+            || rust_opts.temp_dir.join("Cargo.toml").exists();
+        if !has_cargo_toml {
+            let manifest = opts.source_path.as_ref()
+                .and_then(|p| crate::manifest::Manifest::load_for_file(p));
+            let manifest_deps = manifest.as_ref()
+                .map(|m| m.rust_dependencies_toml())
+                .unwrap_or_default();
+            // Auto-detect if no manifest
+            let auto_deps = if manifest_deps.is_empty() {
+                crate::languages::rust::Rust::detect_dependencies_from_code(&raw_rust_code)
+            } else {
+                String::new()
+            };
+            let all_deps = format!("{}{}", manifest_deps,
+                if !manifest_deps.is_empty() && !auto_deps.is_empty() { "\n" } else { "" });
+            let all_deps = format!("{}{}", all_deps, auto_deps);
+
+            let pkg_name = opts.source_path.as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "poly_project".to_string())
+                .replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_");
+
+            let cargo_toml = format!(
+                r#"[workspace]
+
+[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "{name}"
+path = "src/main.rs"
+
+[dependencies]
+{deps}
+"#,
+                name = pkg_name,
+                deps = all_deps
+            );
+            fs::write(rust_opts.temp_dir.join("Cargo.toml"), &cargo_toml)?;
+            eprintln!("  📄 Cargo.toml (auto-generated)");
+        }
+
         // Compile the multi-file project using cargo directly
         // (Don't use rust_lang.compile() as it overwrites with its own lib.rs)
-        eprintln!("🔨 Running cargo build...");
+        let target_triple = opts.target.target_triple();
+        eprintln!("🔨 Running cargo build (target: {})...", target_triple);
 
         let mut cmd = Command::new("cargo");
         cmd.current_dir(&rust_opts.temp_dir);
-        cmd.env("RUSTFLAGS", "-C target-feature=+simd128")
-            .arg("build")
-            .arg("--target=wasm32-wasip1")
-            .arg("--release");
+
+        // Only set WASM-specific RUSTFLAGS for WASM targets
+        if !opts.target.is_native() {
+            cmd.env("RUSTFLAGS", "-C target-feature=+simd128");
+        }
+
+        cmd.arg("build")
+            .arg(format!("--target={}", target_triple));
+
+        if opts.release {
+            cmd.arg("--release");
+        }
 
         let output = cmd.output()?;
 
@@ -350,21 +643,43 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<CompileOutp
             )));
         }
 
-        // Find the output WASM file
-        let wasm_path = rust_opts.temp_dir
+        // Find the output binary
+        let profile_dir = if opts.release { "release" } else { "debug" };
+        let output_dir = rust_opts.temp_dir
             .join("target")
-            .join("wasm32-wasip1")
-            .join("release");
+            .join(target_triple)
+            .join(profile_dir);
 
-        // Look for any .wasm file in the release directory
-        let wasm_file = fs::read_dir(&wasm_path)?
-            .filter_map(|e| e.ok())
-            .find(|e| e.path().extension().map_or(false, |ext| ext == "wasm"))
-            .map(|e| e.path())
-            .ok_or_else(|| CompileError::Build("No WASM output found".to_string()))?;
+        // Look for output file based on target type
+        let output_ext = opts.target.output_extension();
+        let output_file = if output_ext == "wasm" {
+            // WASM: look for any .wasm file
+            fs::read_dir(&output_dir)?
+                .filter_map(|e| e.ok())
+                .find(|e| e.path().extension().map_or(false, |ext| ext == "wasm"))
+                .map(|e| e.path())
+                .ok_or_else(|| CompileError::Build("No WASM output found".to_string()))?
+        } else if output_ext == "exe" {
+            // Windows: look for .exe files
+            fs::read_dir(&output_dir)?
+                .filter_map(|e| e.ok())
+                .find(|e| e.path().extension().map_or(false, |ext| ext == "exe"))
+                .map(|e| e.path())
+                .ok_or_else(|| CompileError::Build("No native binary output found".to_string()))?
+        } else {
+            // Linux/Android: look for extensionless executable files
+            fs::read_dir(&output_dir)?
+                .filter_map(|e| e.ok())
+                .find(|e| {
+                    let path = e.path();
+                    path.extension().is_none() && path.is_file()
+                })
+                .map(|e| e.path())
+                .ok_or_else(|| CompileError::Build("No native binary output found".to_string()))?
+        };
 
-        let wasm_bytes = fs::read(&wasm_file)?;
-        wasm_modules.push(wasm_bytes);
+        let binary_bytes = fs::read(&output_file)?;
+        wasm_modules.push(binary_bytes);
 
         // Clear static_files that were already written to avoid duplication
         static_files.retain(|(_, path, _)| path.is_empty());
@@ -375,8 +690,17 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<CompileOutp
         // For native targets, we skip polyglot-specific imports and just use raw code
         if opts.target.is_native() {
             merged_rust_code.push_str("// Auto-generated by polyglot compiler (native target)\n\n");
+
+            // Include interface trait definitions (from #[interface] blocks)
+            merged_rust_code.push_str(&rs_interface);
+
+            // Include foreign implementation stubs (JS/TS @implements → JsRuntime calls)
+            merged_rust_code.push_str(&foreign_stubs);
+
+            // Sort blocks so fn main() is last (avoids forward-reference issues)
+            let sorted_code = sort_main_last(&raw_rust_code);
             // Deduplicate use statements when merging multiple blocks
-            let deduped_code = deduplicate_use_statements(&raw_rust_code);
+            let deduped_code = deduplicate_use_statements(&sorted_code);
             merged_rust_code.push_str(&deduped_code);
         } else {
             // WASM targets: Auto-import polyglot macros for .poly files
@@ -545,25 +869,31 @@ pub fn compile(parsed: &ParsedFile, opts: &CompileOptions) -> Result<CompileOutp
         binary,
         has_web_assets,
         web_assets,
+        output_extension: None,
     })
 }
 
 /// Extract pub const NAME: &str = "VALUE"; from Rust code
 fn extract_rust_constants(rust_code: &str) -> std::collections::HashMap<String, String> {
     use regex::Regex;
+    static CONST_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"pub\s+const\s+(\w+)\s*:\s*&str\s*=\s*"([^"]+)"\s*;"#).unwrap()
+    });
+    static ENUM_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"pub\s+enum\s+(\w+)\s*\{([^}]+)\}").unwrap()
+    });
+
     let mut consts = std::collections::HashMap::new();
 
     // Match: pub const NAME: &str = "VALUE";
-    let re = Regex::new(r#"pub\s+const\s+(\w+)\s*:\s*&str\s*=\s*"([^"]+)"\s*;"#).unwrap();
-    for cap in re.captures_iter(rust_code) {
+    for cap in CONST_RE.captures_iter(rust_code) {
         if let (Some(name), Some(value)) = (cap.get(1), cap.get(2)) {
             consts.insert(name.as_str().to_string(), value.as_str().to_string());
         }
     }
 
     // Match enum variants for @{Enum::Variant} syntax
-    let enum_re = Regex::new(r"pub\s+enum\s+(\w+)\s*\{([^}]+)\}").unwrap();
-    for cap in enum_re.captures_iter(rust_code) {
+    for cap in ENUM_RE.captures_iter(rust_code) {
         if let (Some(enum_name), Some(body)) = (cap.get(1), cap.get(2)) {
             for variant in body.as_str().split(',') {
                 let variant = variant.trim().split('(').next().unwrap_or("").trim();
@@ -597,9 +927,11 @@ fn interpolate_css_constants(
     consts: &std::collections::HashMap<String, String>,
 ) -> String {
     use regex::Regex;
-    let re = Regex::new(r"@\{([^}]+)\}").unwrap();
+    static CSS_CONST_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"@\{([^}]+)\}").unwrap()
+    });
 
-    re.replace_all(css, |caps: &regex::Captures| {
+    CSS_CONST_RE.replace_all(css, |caps: &regex::Captures| {
         let key = &caps[1];
         consts.get(key).cloned().unwrap_or_else(|| {
             eprintln!("⚠️  Warning: CSS constant @{{{}}} not found in Rust", key);
@@ -634,15 +966,19 @@ fn generate_index_html(has_css: bool, has_js: bool) -> String {
 }
 
 fn link_modules(modules: &[Vec<u8>], _opts: &CompileOptions) -> Result<Vec<u8>, CompileError> {
-    // For now, if there is only one module, just return it.
-    // Real component linking requires more complex logic with wasm-tools
+    if modules.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Single module: just return it directly
     if modules.len() == 1 {
         return Ok(modules[0].clone());
     }
 
-    // Temporary: return the first one to allow build to pass for single-language tests
-    // In a real polyglot scenario, we'd use wasm-compose or similar.
-    println!("Note: Multi-module linking requires wasm-compose. Returning first module.");
+    // Multi-module linking is not yet implemented.
+    // Use `polyglot component` + `polyglot compose` for WASM component linking.
+    eprintln!("⚠️  Multi-module linking not yet built-in. Using first module only.");
+    eprintln!("   Tip: Use `polyglot component` + `polyglot compose` for multi-language linking.");
     Ok(modules[0].clone())
 }
 

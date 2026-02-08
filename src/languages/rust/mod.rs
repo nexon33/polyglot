@@ -7,6 +7,50 @@ use std::fs;
 use std::process::Command;
 use std::path::PathBuf;
 
+/// Find the workspace root directory containing gridmesh, polyglot-macros, etc.
+/// Walks up from the executable location looking for a Cargo.toml with [workspace].
+fn find_workspace_root() -> Option<PathBuf> {
+    // Try 1: Walk up from the executable path
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        while let Some(d) = dir {
+            let cargo_toml = d.join("Cargo.toml");
+            if cargo_toml.exists() {
+                if let Ok(content) = fs::read_to_string(&cargo_toml) {
+                    if content.contains("[workspace]") && d.join("gridmesh").exists() {
+                        return Some(d);
+                    }
+                }
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+    }
+
+    // Try 2: Walk up from the current working directory
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut dir = Some(cwd);
+        while let Some(d) = dir {
+            let cargo_toml = d.join("Cargo.toml");
+            if cargo_toml.exists() {
+                if let Ok(content) = fs::read_to_string(&cargo_toml) {
+                    if content.contains("[workspace]") && d.join("gridmesh").exists() {
+                        return Some(d);
+                    }
+                }
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+    }
+
+    // Try 3: CARGO_MANIFEST_DIR at build time (compiled-in fallback)
+    let build_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if build_dir.join("gridmesh").exists() {
+        return Some(build_dir);
+    }
+
+    None
+}
+
 pub struct Rust;
 
 impl Rust {
@@ -15,6 +59,11 @@ impl Rust {
     }
     
     /// Auto-detect crate dependencies from `use` statements
+    pub fn detect_dependencies_from_code(source: &str) -> String {
+        Self::detect_dependencies(source)
+    }
+
+    /// Auto-detect crate dependencies from `use` statements (internal)
     fn detect_dependencies(source: &str) -> String {
         let mut deps = Vec::new();
         
@@ -84,7 +133,22 @@ impl Rust {
         } else {
             ""
         };
-        
+
+        // Detect if JS/TS runtime is needed (foreign_impls generates JsRuntime calls)
+        let needs_js_runtime = source.contains("JsRuntime") || source.contains("polyglot_runtime");
+        let runtime_dep = if needs_js_runtime {
+            let ws = find_workspace_root()
+                .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+            let ws_str = ws.display().to_string().replace('\\', "/");
+            eprintln!("📦 Including polyglot-runtime (Boa JS engine) for cross-language execution");
+            format!(
+                "polyglot-runtime = {{ path = \"{}/polyglot-runtime\", default-features = false, features = [\"javascript\"] }}\n",
+                ws_str
+            )
+        } else {
+            String::new()
+        };
+
         // Load manifest dependencies from poly.toml (highest priority)
         let manifest_deps = opts.source_path.as_ref()
             .and_then(|p| Manifest::load_for_file(p))
@@ -100,8 +164,9 @@ impl Rust {
         
         // Combine all dependencies (manifest > auto-detect)
         let all_deps = format!(
-            "{serial_dep}{manifest_deps}\n{auto_deps}",
+            "{serial_dep}{runtime_dep}{manifest_deps}\n{auto_deps}",
             serial_dep = serial_dep,
+            runtime_dep = runtime_dep,
             manifest_deps = manifest_deps,
             auto_deps = auto_deps
         );
@@ -191,9 +256,7 @@ strip = true
             let jni_source = self.generate_jni_lib(source);
             fs::write(opts.temp_dir.join("lib.rs"), &jni_source)?;
             
-            // Debug: save a copy for inspection
-            let debug_path = std::path::Path::new("C:/Users/adria/.openclaw/workspace/tmp/debug_lib.rs");
-            let _ = fs::write(debug_path, &jni_source);
+            // JNI source is written to lib.rs above
         } else {
             // Write the source directly (no WASM wrappers needed)
             let main_rs = opts.temp_dir.join("main.rs");
@@ -204,8 +267,11 @@ strip = true
         let mut cmd = Command::new("cargo");
         cmd.current_dir(&opts.temp_dir);
         cmd.arg("build")
-            .arg("--release")
             .arg(format!("--target={}", target_triple));
+
+        if opts.release {
+            cmd.arg("--release");
+        }
 
         let output = cmd.output()?;
 
@@ -219,12 +285,13 @@ strip = true
         }
 
         // Find output binary/library
+        let profile_dir = if opts.release { "release" } else { "debug" };
         let binary_path = if is_android {
             // Android: shared library
             opts.temp_dir
                 .join("target")
                 .join(target_triple)
-                .join("release")
+                .join(profile_dir)
                 .join("libpoly_native.so")
         } else {
             let ext = opts.target.output_extension();
@@ -236,7 +303,7 @@ strip = true
             opts.temp_dir
                 .join("target")
                 .join(target_triple)
-                .join("release")
+                .join(profile_dir)
                 .join(&binary_name)
         };
 
@@ -348,12 +415,15 @@ linker = "{}"
     
     /// Generate JNI wrapper library for Android
     fn generate_jni_lib(&self, source: &str) -> String {
+        use std::sync::LazyLock;
         // Extract public functions from source (export fn becomes pub fn during preprocessing)
         // Match top-level pub fn (at start of line or after newline)
-        let export_re = regex::Regex::new(r"(?m)^pub\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^\{]+))?").unwrap();
-        
+        static EXPORT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"(?m)^pub\s+fn\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^\{]+))?").unwrap()
+        });
+
         let mut jni_functions = String::new();
-        for cap in export_re.captures_iter(source) {
+        for cap in EXPORT_RE.captures_iter(source) {
             let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             let params_str = cap.get(2).map(|m| m.as_str()).unwrap_or("");
             let ret_type = cap.get(3).map(|m| m.as_str().trim());
@@ -517,7 +587,11 @@ impl Language for Rust {
         // Check if Python bridge is being used (contains RustPython imports)
         let needs_rustpython = source.contains("rustpython_vm");
 
-        let mut cargo_toml = String::from(
+        let workspace_root = find_workspace_root()
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let ws_str = workspace_root.display().to_string().replace('\\', "/");
+
+        let mut cargo_toml = format!(
             r#"
 [workspace]
 
@@ -531,12 +605,13 @@ crate-type = ["cdylib"]
 path = "lib.rs"
 
 [dependencies]
-anyhow = "1.0" 
+anyhow = "1.0"
 wit-bindgen = "0.41"
-gridmesh = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/gridmesh" }
-polyglot-macros = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/polyglot-macros" }
-polyglot-runtime = { path = "C:/Users/adria/Downloads/pyrs polygot/pyrs/polyglot-runtime", default-features = false, features = ["javascript", "scripting"] }
+gridmesh = {{ path = "{ws}/gridmesh" }}
+polyglot-macros = {{ path = "{ws}/polyglot-macros" }}
+polyglot-runtime = {{ path = "{ws}/polyglot-runtime", default-features = false, features = ["javascript", "scripting"] }}
 "#,
+            ws = ws_str
         );
 
         if needs_rustpython {
@@ -773,7 +848,6 @@ pub extern "C" fn __pyrs_keepalive() {{}}
                 // We keep capturing all top-level functions.
 
                 let name = func.sig.ident.to_string();
-                println!("DEBUG: Found function: {}", name);
                 let is_async = func.sig.asyncness.is_some();
 
                 // Parse params

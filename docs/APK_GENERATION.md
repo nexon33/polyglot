@@ -189,8 +189,10 @@ poly build app.poly --target apk \
 
 ## Status
 
-- [ ] Create APK template project
-- [ ] Implement apktool-based injection
-- [ ] Implement signing
-- [ ] Add --target apk to CLI
-- [ ] Test on device
+- [x] Create APK template project
+- [x] Implement zip-based APK assembly (no apktool needed)
+- [x] Implement debug signing
+- [x] Add --target apk to CLI
+- [ ] Test on physical device
+- [ ] JNI library generation for exported functions
+- [ ] Multiple architecture support
