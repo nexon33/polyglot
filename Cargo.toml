@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "gridmesh", "poly-lsp", "polyglot-macros", "polyglot-runtime"]
+members = [".", "gridmesh", "poly-lsp", "poly-verified", "polyglot-macros", "polyglot-runtime"]
 
 [package]
 name = "polyglot"

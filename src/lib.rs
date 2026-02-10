@@ -16,6 +16,7 @@ pub mod syntax_aliases;
 pub mod transpile;
 pub mod types;
 pub mod validation;
+pub mod verified;
 pub mod wit_gen;
 
 pub use parser::{CodeBlock, ParsedFile, parse_poly};

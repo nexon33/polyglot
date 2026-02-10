@@ -16,22 +16,26 @@ pub struct Manifest {
     /// Package metadata
     #[serde(default)]
     pub package: Package,
-    
+
     /// Rust/Cargo dependencies
     #[serde(default)]
     pub rust: HashMap<String, toml::Value>,
-    
+
     /// NPM/JS/TS dependencies
     #[serde(default)]
     pub npm: HashMap<String, toml::Value>,
-    
+
     /// Python/pip dependencies
     #[serde(default)]
     pub pip: HashMap<String, toml::Value>,
-    
+
     /// Build configuration
     #[serde(default)]
     pub build: BuildConfig,
+
+    /// Verified execution configuration
+    #[serde(default)]
+    pub verified: VerifiedConfig,
 }
 
 /// Package metadata
@@ -51,6 +55,27 @@ pub struct BuildConfig {
     pub target: Option<String>,
     /// Enable release mode by default
     pub release: Option<bool>,
+}
+
+/// Verified execution configuration
+#[derive(Debug, Deserialize, Default)]
+pub struct VerifiedConfig {
+    /// IVC backend: "hash-ivc" (default) or "mock"
+    pub backend: Option<String>,
+    /// Auto-fold every N operations (default: 32)
+    pub fold_interval: Option<u32>,
+}
+
+impl VerifiedConfig {
+    /// Returns the backend name, defaulting to "hash-ivc"
+    pub fn backend_name(&self) -> &str {
+        self.backend.as_deref().unwrap_or("hash-ivc")
+    }
+
+    /// Returns the fold interval, defaulting to 32
+    pub fn fold_interval_value(&self) -> u32 {
+        self.fold_interval.unwrap_or(32)
+    }
 }
 
 impl Manifest {

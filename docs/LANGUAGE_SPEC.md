@@ -60,6 +60,7 @@ Or with options:
 | `rust` | `rs` | Rust code (primary) |
 | `javascript` | `js` | JavaScript code |
 | `python` | `py` | Python code |
+| `verified` | — | Verified execution (Rust with proofs) |
 | `html` | — | HTML markup |
 | `css` | — | CSS styles |
 | `main` | — | Entry point marker |
@@ -168,6 +169,56 @@ For styling.
 ```
 
 CSS is extracted and inlined into a `<style>` tag.
+
+### Verified Blocks
+
+For provably correct computation. Code in `#[verified]` blocks is treated as Rust but with determinism enforcement and automatic proof generation.
+
+```poly
+#[verified] {
+    use poly_verified::prelude::*;
+    use polyglot_macros::{verified, pure, fold};
+
+    #[pure]
+    fn double(x: u64) -> u64 {
+        x * 2
+    }
+
+    #[verified]
+    fn compute(a: u64, b: u64) -> u64 {
+        let sum = a.saturating_add(b);
+        fold!(sum);  // explicit fold checkpoint
+        double(sum)
+    }
+
+    fn main() {
+        let result = compute(10, 20);
+        println!("Value: {}", result.value());
+        println!("Proof valid: {}", result.is_verified());
+    }
+}
+```
+
+**Compile-time restrictions** (V001-V015):
+- No `f32`/`f64` (use `FixedPoint` instead)
+- No `unsafe` blocks or raw pointers
+- No IO, networking, filesystem access
+- No random number generation
+- No system time or environment variables
+- No thread/async task spawning
+- No `static mut`, `Cell`, `RefCell`, `Mutex`
+- No `HashMap` iteration (use `BTreeMap`)
+- No inline assembly or process spawning
+
+**Macros:**
+- `#[verified]` — wraps return type in `Verified<T>` with cryptographic proof
+- `#[verified(mock)]` — uses mock backend for testing
+- `#[pure]` — marks deterministic helper functions (no separate proof)
+- `fold!(expr)` — explicit IVC fold checkpoint
+
+**IVC Backends:**
+- `hash-ivc` (default) — quantum-resistant hash-chain based proofs
+- `mock` — always-valid proofs for testing
 
 ### Main Block
 
@@ -469,6 +520,15 @@ error[E0001]: Unmatched brace
    |              ^ unclosed brace
 ```
 
+## Verified Execution Macros
+
+| Macro | Type | Description |
+|-------|------|-------------|
+| `#[verified]` | Attribute | Wraps function in IVC proof lifecycle |
+| `#[verified(mock)]` | Attribute | Uses mock backend (testing) |
+| `#[pure]` | Attribute | Marks deterministic helper function |
+| `fold!(expr)` | Expression | Creates explicit fold checkpoint |
+
 ## Reserved Keywords
 
 These are reserved for future use:
@@ -484,7 +544,7 @@ comment     = "//" { any } newline ;
 import      = "use" import_items "from" string ;
 import_items = "*" | "{" ident { "," ident } "}" ;
 block       = "#[" tag { "," option } "]" "{" code "}" ;
-tag         = "rust" | "rs" | "js" | "javascript" | "python" | "py" | "html" | "css" | "main" ;
+tag         = "rust" | "rs" | "js" | "javascript" | "python" | "py" | "verified" | "html" | "css" | "main" ;
 option      = ident "=" string ;
 code        = { any except unmatched-brace } ;
 ```

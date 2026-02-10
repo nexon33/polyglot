@@ -22,11 +22,14 @@ use proc_macro::TokenStream;
 
 mod bridge_macro;
 mod capture;
+mod fold_macro;
 mod gpu_macro;
 mod js_macro;
+mod pure_macro;
 mod py_macro;
 mod sql_macro;
 mod ts_macro;
+mod verified_macro;
 
 /// Python expression macro - executes Python code and returns result
 ///
@@ -94,6 +97,41 @@ pub fn gpu(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn sql(input: TokenStream) -> TokenStream {
     sql_macro::expand(input.into()).into()
+}
+
+/// Verified execution attribute macro
+///
+/// Marks a function for verified computation. The function body is wrapped
+/// in an IVC accumulator lifecycle that produces a mathematical proof of
+/// correct execution. The return type is automatically changed from `T`
+/// to `Verified<T>`.
+///
+/// # Backend Selection
+/// - `#[verified]` — uses HashIvc (default, quantum-resistant)
+/// - `#[verified(mock)]` — uses MockIvc (for testing)
+#[proc_macro_attribute]
+pub fn verified(args: TokenStream, input: TokenStream) -> TokenStream {
+    verified_macro::expand(args.into(), input.into()).into()
+}
+
+/// Pure function attribute macro
+///
+/// Marks a function as pure (no side effects). Pure functions can be called
+/// from within `#[verified]` functions without requiring their own proof.
+/// Basic compile-time checks reject obvious impurities (IO, networking,
+/// thread spawning, unsafe code).
+#[proc_macro_attribute]
+pub fn pure(args: TokenStream, input: TokenStream) -> TokenStream {
+    pure_macro::expand(args.into(), input.into()).into()
+}
+
+/// Fold point expression macro
+///
+/// Creates an explicit fold point in verified execution. The expression's
+/// value is hashed and can be folded into the IVC accumulator.
+#[proc_macro]
+pub fn fold(input: TokenStream) -> TokenStream {
+    fold_macro::expand(input.into()).into()
 }
 
 /// Type-safe cross-language FFI bridge

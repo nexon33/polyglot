@@ -60,6 +60,7 @@ polyglot build hello.poly --target apk      # → hello.apk
 | JavaScript blocks | ✅ Full support |
 | Python blocks | ✅ Full support |
 | HTML/CSS blocks | ✅ Full support |
+| Verified execution (`#[verified]`) | ✅ Working |
 | Native executables (Windows/Linux) | ✅ Working |
 | WASM compilation | ✅ Working |
 | Browser bundling | ✅ Working |
@@ -156,6 +157,32 @@ polyglot bundle app.poly -o app.html
 polyglot build gui.poly --target windows
 ./gui.exe
 ```
+
+### Verified Execution
+
+Mark functions with `#[verified]` to get mathematical proofs of correct execution:
+
+```poly
+#[rust] {
+    use poly_verified::prelude::*;
+    use polyglot_macros::verified;
+
+    #[verified]
+    fn add_scores(a: u64, b: u64) -> u64 {
+        a.saturating_add(b)
+    }
+
+    fn main() {
+        let result = add_scores(42, 58);
+        println!("Value: {}", result.value());      // 100
+        println!("Verified: {}", result.is_verified()); // true
+    }
+}
+```
+
+The compiler enforces determinism at compile time -- no floats, IO, unsafe, or randomness allowed inside `#[verified]` functions. Results are wrapped in `Verified<T>` which carries a cryptographic proof.
+
+See [Verified Execution](docs/VERIFIED_EXECUTION.md) for full documentation.
 
 ## Language Blocks
 
@@ -296,12 +323,17 @@ lodash = "^4.17.0"
 [pip]
 numpy = ">=1.20"
 requests = ">=2.25"
+
+[verified]
+backend = "hash-ivc"    # or "mock" for testing
+fold_interval = 32       # auto-fold every N operations
 ```
 
 Dependencies flow into the appropriate package manager:
 - `[rust]` → Cargo.toml
 - `[npm]` → package.json
 - `[pip]` → requirements.txt
+- `[verified]` → Verified execution configuration
 
 If no `poly.toml` exists, common dependencies are auto-detected from `use` statements.
 
@@ -318,6 +350,7 @@ See the `examples/` directory:
 
 - [Language Specification](docs/LANGUAGE_SPEC.md) - Full syntax reference
 - [Architecture](docs/ARCHITECTURE.md) - Compiler internals
+- [Verified Execution](docs/VERIFIED_EXECUTION.md) - Provable computation guide
 - [Android Builds](docs/APK_GENERATION.md) - APK generation guide
 
 ## Philosophy

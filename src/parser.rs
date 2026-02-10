@@ -454,7 +454,7 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     // Static/config blocks (not compiled): md, toml, json, yaml, txt, cfg, ini, xml, env, dockerfile, makefile, sh, bat, ps1, sql
     // Note: Dependencies are declared in poly.toml, not inline blocks
     static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::[a-zA-Z0-9_:/\.\-]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
+        Regex::new(r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|verified|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::[a-zA-Z0-9_:/\.\-]+)?(?::[a-zA-Z0-9_]+)?\]\s*$")
             .unwrap()
     });
 
@@ -552,7 +552,7 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
     // Static/config blocks (not compiled): md, toml, json, yaml, txt, cfg, ini, xml, env, dockerfile, makefile, sh, bat, ps1, sql
     static UNIFIED_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::([a-zA-Z0-9_:/\.\-]+))?\]\s*\{"
+            r"(?m)^#\[(interface|types|rust|rs|python|py|typescript|ts|javascript|js|main|verified|gpu|wgsl|jsx|html|rscss|css|test|doc|md|markdown|toml|json|yaml|yml|txt|cfg|ini|xml|env|dockerfile|makefile|sh|bat|ps1|sql)(?::([a-zA-Z0-9_:/\.\-]+))?\]\s*\{"
         ).unwrap()
     });
 

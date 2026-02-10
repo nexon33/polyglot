@@ -74,7 +74,33 @@ polyglot/src/
 ├── component_builder.rs  # WASM Component Model builder
 ├── component_linker.rs   # WASM component linking
 ├── implements_verify.rs  # @implements verification
-└── ast_parser.rs         # AST-level parsing utilities
+├── ast_parser.rs         # AST-level parsing utilities
+├── manifest.rs           # poly.toml manifest parser
+└── verified/             # Verified execution pipeline
+    ├── mod.rs             # Entry point, marker detection
+    ├── determinism_check.rs  # V001-V015 determinism enforcement
+    ├── error_codes.rs     # Compiler error definitions
+    └── verified_codegen.rs   # Auto-imports and code generation
+
+poly-verified/src/        # Verified execution runtime crate
+├── lib.rs                # Crate root + prelude
+├── types.rs              # Hash, Commitment, VerifiedProof, StepWitness
+├── error.rs              # ProofSystemError, VerifiedError
+├── step.rs               # StepFunction trait
+├── verified_type.rs      # Verified<T> wrapper
+├── fixed_point.rs        # Deterministic FixedPoint arithmetic
+├── proof_serialize.rs    # Wire format (spec section 10)
+├── proof_composition.rs  # Composite proofs for nested calls
+├── crypto/               # Cryptographic primitives
+│   ├── hash.rs           # Domain-separated SHA-256
+│   ├── merkle.rs         # Merkle tree + inclusion proofs
+│   ├── chain.rs          # Hash chain accumulator
+│   ├── commitment.rs     # Commitment signing/verification
+│   └── signing.rs        # Ed25519 code attestation
+└── ivc/                  # IVC backend system
+    ├── mod.rs            # IvcBackend trait
+    ├── hash_ivc.rs       # Hash-chain IVC (quantum-resistant)
+    └── mock_ivc.rs       # Mock backend (testing)
 ```
 
 ## Key Modules
@@ -308,6 +334,66 @@ enum PolyError {
     Validation(ValidationError),
 }
 ```
+
+## Verified Execution Pipeline
+
+When a `.poly` file contains `#[verified]` markers, an additional pipeline stage runs:
+
+```
+.poly source
+    │
+    ▼
+┌──────────────────────────────────────┐
+│           PARSER                      │
+│  Recognizes #[verified] block tag     │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│      DETERMINISM CHECKER              │
+│  Scans #[verified] function bodies    │
+│  for non-deterministic patterns:      │
+│  → f32/f64 types (V002)              │
+│  → unsafe blocks (V005)              │
+│  → IO/net/fs operations (V001)       │
+│  → Random, time, env (V001/V009/V010)│
+│  → Thread spawning (V011)            │
+│  → Interior mutability (V008)        │
+│  → HashMap iteration (V006)          │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│      VERIFIED CODEGEN                 │
+│  Auto-adds imports:                   │
+│  → use poly_verified::prelude::*;    │
+│  → use sha2::Digest;                 │
+│  Auto-adds dependencies:              │
+│  → poly-verified, sha2               │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│      PROC MACRO EXPANSION             │
+│  #[verified] → IVC accumulator wrap  │
+│  #[pure] → inline + purity check    │
+│  fold!(expr) → hash checkpoint      │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│      RUST COMPILATION                 │
+│  Compiles with poly-verified runtime │
+│  → Verified<T> wraps return values   │
+│  → Proofs generated at runtime       │
+└──────────────────────────────────────┘
+```
+
+**Key design decisions:**
+- Determinism checking is pattern-based (line scanning), not AST-based, for robustness with partial code
+- `Verified<T>::new_proven()` is `pub(crate)` — user code cannot forge verified values
+- Hash-IVC backend uses OVM's hash chain + Merkle tree primitives, repurposed for IVC folding
+- `FixedPoint` uses i128 with 48 fractional bits (Q80.48) — no floating point anywhere
 
 ## Extension Points
 
