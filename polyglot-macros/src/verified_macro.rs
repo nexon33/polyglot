@@ -10,6 +10,8 @@ pub fn expand(args: TokenStream, input: TokenStream) -> TokenStream {
 
     let args_str = args.to_string();
     let use_mock = args_str.contains("mock");
+    let is_private = args_str.contains("private") && !args_str.contains("private_inputs");
+    let is_private_inputs = args_str.contains("private_inputs");
 
     let fn_name = &input_fn.sig.ident;
     let fn_vis = &input_fn.vis;
@@ -66,13 +68,23 @@ pub fn expand(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
+    let privacy_mode_expr = if is_private {
+        quote! { poly_verified::types::PrivacyMode::Private }
+    } else if is_private_inputs {
+        quote! { poly_verified::types::PrivacyMode::PrivateInputs }
+    } else {
+        quote! { poly_verified::types::PrivacyMode::Transparent }
+    };
+
     let backend_init = if use_mock {
         quote! {
-            let mut __acc = <poly_verified::ivc::mock_ivc::MockIvc as poly_verified::ivc::IvcBackend>::init(&__code_hash);
+            let __privacy = #privacy_mode_expr;
+            let mut __acc = <poly_verified::ivc::mock_ivc::MockIvc as poly_verified::ivc::IvcBackend>::init(&__code_hash, __privacy);
         }
     } else {
         quote! {
-            let mut __acc = <poly_verified::ivc::hash_ivc::HashIvc as poly_verified::ivc::IvcBackend>::init(&__code_hash);
+            let __privacy = #privacy_mode_expr;
+            let mut __acc = <poly_verified::ivc::hash_ivc::HashIvc as poly_verified::ivc::IvcBackend>::init(&__code_hash, __privacy);
         }
     };
 

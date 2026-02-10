@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::types::{Hash, StepWitness, VerifiedProof};
+use crate::types::{Hash, PrivacyMode, StepWitness, VerifiedProof};
 
 pub mod hash_ivc;
 pub mod mock_ivc;
@@ -15,7 +15,7 @@ pub trait IvcBackend {
     type Accumulator: Clone;
 
     /// Initialize a fresh accumulator for a new verified computation.
-    fn init(&self, code_hash: &Hash) -> Self::Accumulator;
+    fn init(&self, code_hash: &Hash, privacy: PrivacyMode) -> Self::Accumulator;
 
     /// Fold a single step's witness into the running accumulator.
     fn fold_step(

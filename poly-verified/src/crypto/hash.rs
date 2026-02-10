@@ -38,6 +38,15 @@ pub fn hash_transition(prev: &Hash, input: &Hash, claimed: &Hash) -> Hash {
     hasher.finalize().into()
 }
 
+/// Domain-separated blinding factor: SHA-256(0x04 || data).
+/// Used for privacy-mode blinding commitments.
+pub fn hash_blinding(data: &[u8]) -> Hash {
+    let mut hasher = Sha256::new();
+    hasher.update([0x04]);
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
 /// Domain-separated hash chain step: SHA-256(0x02 || tip || state_hash).
 /// Input is 65 bytes total.
 pub fn hash_chain_step(tip: &Hash, state_hash: &Hash) -> Hash {

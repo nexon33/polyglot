@@ -256,6 +256,80 @@ let composite = CompositeProof::compose(outer_proof, vec![inner_proof_1, inner_p
 assert!(composite.verify_composition());
 ```
 
+## Privacy Modes
+
+Verified execution supports optional zero-knowledge privacy. Privacy is a thin layer on top of the correctness system — blinding factors on the polynomial commitments, one additional hash per fold step.
+
+### Three Modes
+
+| Mode | Syntax | What Verifier Sees |
+|------|--------|--------------------|
+| **Transparent** | `#[verified]` | Everything: input hash, output hash, code hash |
+| **Private** | `#[verified(private)]` | Nothing except "proof is valid" |
+| **Private Inputs** | `#[verified(private_inputs)]` | Output value, but not inputs |
+
+### Usage
+
+```rust
+// Transparent (default) — verifier sees everything
+#[verified]
+fn public_add(a: u64, b: u64) -> u64 {
+    a.saturating_add(b)
+}
+
+// Full ZK — verifier learns nothing except correctness
+#[verified(private)]
+fn secret_compute(salary: u64, bonus: u64) -> u64 {
+    salary.saturating_add(bonus)
+}
+
+// Selective disclosure — verifier sees output but not inputs
+#[verified(private_inputs)]
+fn hidden_input_score(answers: u64, key: u64) -> u64 {
+    answers ^ key
+}
+
+// Combine with mock backend for testing
+#[verified(private, mock)]
+fn test_private(x: u64) -> u64 { x + 1 }
+```
+
+### What Each Mode Reveals
+
+```
+                    Transparent    Private    PrivateInputs
+Input hash:         ✓ visible      ✗ hidden   ✗ hidden
+Output hash:        ✓ visible      ✗ hidden   ✓ visible
+Code hash:          ✓ visible      ✗ hidden   ✓ visible
+Value bytes:        ✓ present      ✗ empty    ✓ present
+Blinding commit:    ✗ none         ✓ present  ✓ present
+```
+
+### How It Works
+
+1. **Compile time:** The `#[verified(private)]` macro passes `PrivacyMode::Private` to the IVC backend.
+2. **Fold step:** For each computation step, an additional blinding factor is generated via domain-separated hashing (domain `0x04`) and folded into a running blinding commitment.
+3. **Finalize:** The proof includes the blinding commitment. Hidden hashes are zeroed out.
+4. **Verify:** The verifier checks structural validity without needing the hidden data.
+
+Privacy adds ~2x overhead to the fold step (one extra hash per step). The proof size increases by 32 bytes (the blinding commitment).
+
+### Quantum-Resistant Privacy
+
+The Hash-IVC backend provides quantum-resistant privacy because both the proofs and blinding factors use only SHA-256 hash functions. No pairings, no trusted setup, no toxic waste.
+
+### Proof Composition with Privacy
+
+When composing proofs from nested `#[verified]` calls, the composite proof's privacy mode is the most restrictive among all contained proofs. If any inner proof is `Private`, the composite is `Private`.
+
+### Use Cases
+
+- **Private transactions** — prove a transfer is valid without revealing amounts
+- **Private AI inference** — prove model output correctness without revealing weights
+- **Whistleblower protection** — prove data authenticity without revealing source
+- **Private voting** — prove vote validity without revealing choice
+- **Private auctions** — prove bid validity without revealing amount
+
 ## poly.toml Configuration
 
 ```toml
@@ -270,7 +344,7 @@ The `poly-verified` crate provides the runtime:
 
 | Module | Purpose |
 |--------|---------|
-| `crypto::hash` | Domain-separated SHA-256 (4 domains) |
+| `crypto::hash` | Domain-separated SHA-256 (5 domains) |
 | `crypto::merkle` | Merkle tree + inclusion proofs |
 | `crypto::chain` | Hash chain accumulator |
 | `crypto::commitment` | Commitment signing/verification |

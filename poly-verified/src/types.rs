@@ -351,6 +351,61 @@ impl BackendId {
 }
 
 // ---------------------------------------------------------------------------
+// Privacy Mode
+// ---------------------------------------------------------------------------
+
+/// Privacy mode for verified execution proofs.
+///
+/// Controls what information is revealed to the verifier:
+/// - `Transparent`: verifier sees input hash, output hash, code hash (default)
+/// - `Private`: full ZK — verifier learns nothing except proof validity
+/// - `PrivateInputs`: selective disclosure — verifier sees output but not inputs
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum PrivacyMode {
+    /// Transparent: verifier sees input hash, output hash, code hash.
+    Transparent = 0x00,
+    /// Full ZK: verifier learns nothing except proof validity.
+    Private = 0x01,
+    /// Selective: verifier sees output but not inputs.
+    PrivateInputs = 0x02,
+}
+
+impl PrivacyMode {
+    pub fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0x00 => Ok(Self::Transparent),
+            0x01 => Ok(Self::Private),
+            0x02 => Ok(Self::PrivateInputs),
+            _ => Err(ProofSystemError::InvalidEncoding(format!(
+                "unknown privacy mode: 0x{v:02x}"
+            ))),
+        }
+    }
+
+    /// Returns true if this mode hides any information from the verifier.
+    pub fn is_private(&self) -> bool {
+        !matches!(self, Self::Transparent)
+    }
+
+    /// Returns true if inputs are hidden from the verifier.
+    pub fn hides_inputs(&self) -> bool {
+        matches!(self, Self::Private | Self::PrivateInputs)
+    }
+
+    /// Returns true if outputs are hidden from the verifier.
+    pub fn hides_outputs(&self) -> bool {
+        matches!(self, Self::Private)
+    }
+}
+
+impl Default for PrivacyMode {
+    fn default() -> Self {
+        Self::Transparent
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VerifiedProof — the proof attached to Verified<T>
 // ---------------------------------------------------------------------------
 
@@ -363,11 +418,15 @@ pub enum VerifiedProof {
         merkle_root: Hash,
         step_count: u64,
         code_hash: Hash,
+        privacy_mode: PrivacyMode,
+        /// H(blinding_factors) — present when privacy_mode != Transparent.
+        blinding_commitment: Option<Hash>,
     },
     /// Mock proof for testing.
     Mock {
         input_hash: Hash,
         output_hash: Hash,
+        privacy_mode: PrivacyMode,
     },
 }
 
@@ -381,8 +440,27 @@ impl VerifiedProof {
 
     pub fn code_hash(&self) -> Hash {
         match self {
-            Self::HashIvc { code_hash, .. } => *code_hash,
+            Self::HashIvc {
+                code_hash,
+                privacy_mode,
+                ..
+            } => {
+                // In full Private mode, don't leak the code identity
+                if *privacy_mode == PrivacyMode::Private {
+                    ZERO_HASH
+                } else {
+                    *code_hash
+                }
+            }
             Self::Mock { .. } => ZERO_HASH,
+        }
+    }
+
+    /// Returns the privacy mode of this proof.
+    pub fn privacy_mode(&self) -> PrivacyMode {
+        match self {
+            Self::HashIvc { privacy_mode, .. } => *privacy_mode,
+            Self::Mock { privacy_mode, .. } => *privacy_mode,
         }
     }
 }

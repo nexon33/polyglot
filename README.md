@@ -182,6 +182,11 @@ Mark functions with `#[verified]` to get mathematical proofs of correct executio
 
 The compiler enforces determinism at compile time -- no floats, IO, unsafe, or randomness allowed inside `#[verified]` functions. Results are wrapped in `Verified<T>` which carries a cryptographic proof.
 
+**Privacy modes** — optional zero-knowledge privacy via blinding factors:
+- `#[verified]` — transparent (default)
+- `#[verified(private)]` — full ZK: verifier learns nothing except validity
+- `#[verified(private_inputs)]` — selective: verifier sees output but not inputs
+
 See [Verified Execution](docs/VERIFIED_EXECUTION.md) for full documentation.
 
 ## Language Blocks

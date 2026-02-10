@@ -1,9 +1,9 @@
 use crate::crypto::chain::HashChain;
-use crate::crypto::hash::hash_transition;
+use crate::crypto::hash::{hash_blinding, hash_combine, hash_transition};
 use crate::crypto::merkle::MerkleTree;
 use crate::error::{ProofSystemError, Result};
 use crate::ivc::IvcBackend;
-use crate::types::{Hash, StepWitness, VerifiedProof};
+use crate::types::{Hash, PrivacyMode, StepWitness, VerifiedProof, ZERO_HASH};
 
 /// Hash-chain based Incrementally Verifiable Computation.
 ///
@@ -15,6 +15,9 @@ use crate::types::{Hash, StepWitness, VerifiedProof};
 /// - The sequence of steps was executed in order (hash chain)
 /// - Each step's transition is included in the commitment (Merkle tree)
 /// - The code identity that produced the computation (code_hash binding)
+///
+/// When privacy mode is enabled, blinding factors are folded into each
+/// step, producing a blinding commitment that hides the computation trace.
 pub struct HashIvc;
 
 /// The running accumulator for Hash-IVC.
@@ -23,16 +26,21 @@ pub struct HashIvcAccumulator {
     chain: HashChain,
     checkpoints: Vec<Hash>,
     code_hash: Hash,
+    privacy_mode: PrivacyMode,
+    /// Accumulated H(blinding_factors) — only non-zero when privacy is enabled.
+    blinding_hash: Hash,
 }
 
 impl IvcBackend for HashIvc {
     type Accumulator = HashIvcAccumulator;
 
-    fn init(&self, code_hash: &Hash) -> Self::Accumulator {
+    fn init(&self, code_hash: &Hash, privacy: PrivacyMode) -> Self::Accumulator {
         HashIvcAccumulator {
             chain: HashChain::new(),
             checkpoints: Vec::new(),
             code_hash: *code_hash,
+            privacy_mode: privacy,
+            blinding_hash: ZERO_HASH,
         }
     }
 
@@ -48,6 +56,18 @@ impl IvcBackend for HashIvc {
         );
         accumulator.chain.append(&transition);
         accumulator.checkpoints.push(transition);
+
+        // When privacy is enabled, generate and accumulate a blinding factor.
+        // Domain 0x04 is used for blinding (separate from leaf/transition/chain/combine).
+        if accumulator.privacy_mode.is_private() {
+            let step_counter = accumulator.chain.length.to_le_bytes();
+            let mut blinding_input = Vec::with_capacity(32 + 8);
+            blinding_input.extend_from_slice(&transition);
+            blinding_input.extend_from_slice(&step_counter);
+            let blinding = hash_blinding(&blinding_input);
+            accumulator.blinding_hash = hash_combine(&accumulator.blinding_hash, &blinding);
+        }
+
         Ok(())
     }
 
@@ -58,11 +78,19 @@ impl IvcBackend for HashIvc {
 
         let tree = MerkleTree::build(&accumulator.checkpoints);
 
+        let blinding_commitment = if accumulator.privacy_mode.is_private() {
+            Some(accumulator.blinding_hash)
+        } else {
+            None
+        };
+
         Ok(VerifiedProof::HashIvc {
             chain_tip: accumulator.chain.tip,
             merkle_root: tree.root,
             step_count: accumulator.chain.length,
             code_hash: accumulator.code_hash,
+            privacy_mode: accumulator.privacy_mode,
+            blinding_commitment,
         })
     }
 
@@ -73,10 +101,21 @@ impl IvcBackend for HashIvc {
         _output_hash: &Hash,
     ) -> Result<bool> {
         match proof {
-            VerifiedProof::HashIvc { step_count, .. } => {
-                // Hash-IVC verification: structural integrity check.
-                // Full verification requires spot-check re-execution.
-                Ok(*step_count > 0)
+            VerifiedProof::HashIvc {
+                step_count,
+                privacy_mode,
+                blinding_commitment,
+                ..
+            } => {
+                // Structural check: must have at least one step.
+                if *step_count == 0 {
+                    return Ok(false);
+                }
+                // In private modes, the blinding commitment must be present.
+                if privacy_mode.is_private() && blinding_commitment.is_none() {
+                    return Ok(false);
+                }
+                Ok(true)
             }
             _ => Err(ProofSystemError::ProofVerificationFailed(
                 "wrong proof type for HashIvc backend".into(),
@@ -99,9 +138,8 @@ mod tests {
         let backend = HashIvc;
         let code_hash = hash_data(b"test_function");
 
-        let mut acc = backend.init(&code_hash);
+        let mut acc = backend.init(&code_hash, PrivacyMode::Transparent);
 
-        // Fold 3 steps
         for i in 0..3u8 {
             let witness = StepWitness {
                 state_before: hash_data(&[i]),
@@ -113,7 +151,6 @@ mod tests {
 
         let proof = backend.finalize(acc).unwrap();
 
-        // Verify
         let input_hash = hash_data(&[0]);
         let output_hash = hash_data(&[3]);
         assert!(backend.verify(&proof, &input_hash, &output_hash).unwrap());
@@ -123,7 +160,7 @@ mod tests {
     fn test_hash_ivc_empty_fails() {
         let backend = HashIvc;
         let code_hash = hash_data(b"test_function");
-        let acc = backend.init(&code_hash);
+        let acc = backend.init(&code_hash, PrivacyMode::Transparent);
 
         assert!(backend.finalize(acc).is_err());
     }
@@ -133,7 +170,7 @@ mod tests {
         let backend = HashIvc;
         let code_hash = hash_data(b"my_verified_fn");
 
-        let mut acc = backend.init(&code_hash);
+        let mut acc = backend.init(&code_hash, PrivacyMode::Transparent);
         let witness = StepWitness {
             state_before: hash_data(b"before"),
             state_after: hash_data(b"after"),
@@ -147,10 +184,14 @@ mod tests {
             VerifiedProof::HashIvc {
                 step_count,
                 code_hash: ch,
+                privacy_mode,
+                blinding_commitment,
                 ..
             } => {
                 assert_eq!(*step_count, 1);
                 assert_eq!(*ch, code_hash);
+                assert_eq!(*privacy_mode, PrivacyMode::Transparent);
+                assert!(blinding_commitment.is_none());
             }
             _ => panic!("wrong proof type"),
         }
@@ -166,10 +207,9 @@ mod tests {
         let backend = HashIvc;
         let code_hash = hash_data(b"determinism_test");
 
-        // Run the same computation twice
         let mut results = Vec::new();
         for _ in 0..2 {
-            let mut acc = backend.init(&code_hash);
+            let mut acc = backend.init(&code_hash, PrivacyMode::Transparent);
             for i in 0..5u8 {
                 let witness = StepWitness {
                     state_before: hash_data(&[i]),
@@ -181,7 +221,6 @@ mod tests {
             results.push(backend.finalize(acc).unwrap());
         }
 
-        // Both runs must produce identical proofs
         match (&results[0], &results[1]) {
             (
                 VerifiedProof::HashIvc {
@@ -202,6 +241,101 @@ mod tests {
                 assert_eq!(a_count, b_count);
             }
             _ => panic!("wrong proof types"),
+        }
+    }
+
+    #[test]
+    fn test_hash_ivc_private_mode_blinding() {
+        let backend = HashIvc;
+        let code_hash = hash_data(b"private_fn");
+
+        let mut acc = backend.init(&code_hash, PrivacyMode::Private);
+        let witness = StepWitness {
+            state_before: hash_data(b"before"),
+            state_after: hash_data(b"after"),
+            step_inputs: hash_data(b"inputs"),
+        };
+        backend.fold_step(&mut acc, &witness).unwrap();
+
+        let proof = backend.finalize(acc).unwrap();
+
+        match &proof {
+            VerifiedProof::HashIvc {
+                privacy_mode,
+                blinding_commitment,
+                ..
+            } => {
+                assert_eq!(*privacy_mode, PrivacyMode::Private);
+                assert!(blinding_commitment.is_some());
+                assert_ne!(blinding_commitment.unwrap(), ZERO_HASH);
+            }
+            _ => panic!("wrong proof type"),
+        }
+
+        // Full private: code_hash() should return ZERO_HASH
+        assert_eq!(proof.code_hash(), ZERO_HASH);
+        assert!(backend.verify(&proof, &ZERO_HASH, &ZERO_HASH).unwrap());
+    }
+
+    #[test]
+    fn test_hash_ivc_private_inputs_mode() {
+        let backend = HashIvc;
+        let code_hash = hash_data(b"selective_fn");
+
+        let mut acc = backend.init(&code_hash, PrivacyMode::PrivateInputs);
+        let witness = StepWitness {
+            state_before: hash_data(b"before"),
+            state_after: hash_data(b"after"),
+            step_inputs: hash_data(b"inputs"),
+        };
+        backend.fold_step(&mut acc, &witness).unwrap();
+
+        let proof = backend.finalize(acc).unwrap();
+
+        match &proof {
+            VerifiedProof::HashIvc {
+                privacy_mode,
+                blinding_commitment,
+                code_hash: ch,
+                ..
+            } => {
+                assert_eq!(*privacy_mode, PrivacyMode::PrivateInputs);
+                assert!(blinding_commitment.is_some());
+                // PrivateInputs: code_hash is still visible
+                assert_eq!(*ch, code_hash);
+            }
+            _ => panic!("wrong proof type"),
+        }
+
+        // PrivateInputs: code_hash() should return the real code hash
+        assert_eq!(proof.code_hash(), code_hash);
+    }
+
+    #[test]
+    fn test_hash_ivc_transparent_no_blinding() {
+        let backend = HashIvc;
+        let code_hash = hash_data(b"transparent_fn");
+
+        let mut acc = backend.init(&code_hash, PrivacyMode::Transparent);
+        let witness = StepWitness {
+            state_before: hash_data(b"before"),
+            state_after: hash_data(b"after"),
+            step_inputs: hash_data(b"inputs"),
+        };
+        backend.fold_step(&mut acc, &witness).unwrap();
+
+        let proof = backend.finalize(acc).unwrap();
+
+        match &proof {
+            VerifiedProof::HashIvc {
+                privacy_mode,
+                blinding_commitment,
+                ..
+            } => {
+                assert_eq!(*privacy_mode, PrivacyMode::Transparent);
+                assert!(blinding_commitment.is_none());
+            }
+            _ => panic!("wrong proof type"),
         }
     }
 }

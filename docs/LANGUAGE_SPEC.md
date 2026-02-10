@@ -524,8 +524,11 @@ error[E0001]: Unmatched brace
 
 | Macro | Type | Description |
 |-------|------|-------------|
-| `#[verified]` | Attribute | Wraps function in IVC proof lifecycle |
+| `#[verified]` | Attribute | Wraps function in IVC proof lifecycle (transparent) |
 | `#[verified(mock)]` | Attribute | Uses mock backend (testing) |
+| `#[verified(private)]` | Attribute | Full ZK: verifier learns nothing except validity |
+| `#[verified(private_inputs)]` | Attribute | Selective: verifier sees output but not inputs |
+| `#[verified(private, mock)]` | Attribute | Private mode with mock backend (testing) |
 | `#[pure]` | Attribute | Marks deterministic helper function |
 | `fold!(expr)` | Expression | Creates explicit fold checkpoint |
 

@@ -1,20 +1,26 @@
 use crate::crypto::hash::hash_data;
 use crate::error::{ProofSystemError, Result};
-use crate::types::{BackendId, Hash, VerifiedProof};
+use crate::types::{BackendId, Hash, PrivacyMode, VerifiedProof, ZERO_HASH};
 
 /// Wire format for transmitting verified values with their proofs.
 ///
-/// Layout (per spec §10):
+/// Layout:
 /// ```text
 /// value_hash(32) | input_hash(32) | code_hash(32) | proof_scheme(1) |
-/// proof_length(4) | proof_bytes(N) | verifier_key_hash(32) | value_bytes(M)
+/// privacy_mode(1) | proof_length(4) | proof_bytes(N) | verifier_key_hash(32) | value_bytes(M)
 /// ```
+///
+/// Privacy behavior:
+/// - `Private`: value_hash = ZERO, input_hash = ZERO, value_bytes = empty
+/// - `PrivateInputs`: input_hash = ZERO, value_hash and value_bytes present
+/// - `Transparent`: all fields present
 #[derive(Clone, Debug)]
 pub struct VerifiedResponse {
     pub value_hash: Hash,
     pub input_hash: Hash,
     pub code_hash: Hash,
     pub proof_scheme: BackendId,
+    pub privacy_mode: PrivacyMode,
     pub proof_bytes: Vec<u8>,
     pub verifier_key_hash: Hash,
     pub value_bytes: Vec<u8>,
@@ -28,32 +34,42 @@ impl VerifiedResponse {
         value_bytes: Vec<u8>,
         verifier_key_hash: Hash,
     ) -> Self {
-        let value_hash = hash_data(&value_bytes);
-        let code_hash = proof.code_hash();
+        let privacy = proof.privacy_mode();
         let proof_scheme = proof.backend_id();
+        let code_hash = proof.code_hash();
         let proof_bytes = serde_json::to_vec(proof).unwrap_or_default();
 
+        // Apply privacy: zero out hidden fields
+        let (effective_value_hash, effective_input_hash, effective_value_bytes) = match privacy {
+            PrivacyMode::Private => (ZERO_HASH, ZERO_HASH, Vec::new()),
+            PrivacyMode::PrivateInputs => (hash_data(&value_bytes), ZERO_HASH, value_bytes),
+            PrivacyMode::Transparent => (hash_data(&value_bytes), input_hash, value_bytes),
+        };
+
         Self {
-            value_hash,
-            input_hash,
+            value_hash: effective_value_hash,
+            input_hash: effective_input_hash,
             code_hash,
             proof_scheme,
+            privacy_mode: privacy,
             proof_bytes,
             verifier_key_hash,
-            value_bytes,
+            value_bytes: effective_value_bytes,
         }
     }
 
     /// Serialize to wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let proof_len = self.proof_bytes.len() as u32;
-        let total = 32 + 32 + 32 + 1 + 4 + self.proof_bytes.len() + 32 + self.value_bytes.len();
+        let total =
+            32 + 32 + 32 + 1 + 1 + 4 + self.proof_bytes.len() + 32 + self.value_bytes.len();
         let mut buf = Vec::with_capacity(total);
 
         buf.extend_from_slice(&self.value_hash);
         buf.extend_from_slice(&self.input_hash);
         buf.extend_from_slice(&self.code_hash);
         buf.push(self.proof_scheme as u8);
+        buf.push(self.privacy_mode as u8);
         buf.extend_from_slice(&proof_len.to_be_bytes());
         buf.extend_from_slice(&self.proof_bytes);
         buf.extend_from_slice(&self.verifier_key_hash);
@@ -64,7 +80,8 @@ impl VerifiedResponse {
 
     /// Deserialize from wire format.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let min_size = 32 + 32 + 32 + 1 + 4 + 32; // 133 minimum
+        // 32+32+32+1+1+4+32 = 134 minimum
+        let min_size = 134;
         if data.len() < min_size {
             return Err(ProofSystemError::InvalidEncoding(
                 "verified response: too short".into(),
@@ -79,16 +96,17 @@ impl VerifiedResponse {
         code_hash.copy_from_slice(&data[64..96]);
 
         let proof_scheme = BackendId::from_u8(data[96])?;
-        let proof_len = u32::from_be_bytes(data[97..101].try_into().unwrap()) as usize;
+        let privacy_mode = PrivacyMode::from_u8(data[97])?;
+        let proof_len = u32::from_be_bytes(data[98..102].try_into().unwrap()) as usize;
 
-        let proof_end = 101 + proof_len;
+        let proof_end = 102 + proof_len;
         if data.len() < proof_end + 32 {
             return Err(ProofSystemError::InvalidEncoding(
                 "verified response: proof section truncated".into(),
             ));
         }
 
-        let proof_bytes = data[101..proof_end].to_vec();
+        let proof_bytes = data[102..proof_end].to_vec();
 
         let mut verifier_key_hash = [0u8; 32];
         verifier_key_hash.copy_from_slice(&data[proof_end..proof_end + 32]);
@@ -100,6 +118,7 @@ impl VerifiedResponse {
             input_hash,
             code_hash,
             proof_scheme,
+            privacy_mode,
             proof_bytes,
             verifier_key_hash,
             value_bytes,
@@ -107,7 +126,11 @@ impl VerifiedResponse {
     }
 
     /// Verify that value_bytes matches value_hash.
+    /// In Private mode, always returns true (value is hidden).
     pub fn verify_value_integrity(&self) -> bool {
+        if self.privacy_mode == PrivacyMode::Private {
+            return true;
+        }
         hash_data(&self.value_bytes) == self.value_hash
     }
 }
@@ -118,19 +141,71 @@ mod tests {
     use crate::types::{VerifiedProof, ZERO_HASH};
 
     #[test]
-    fn test_roundtrip() {
+    fn test_roundtrip_transparent() {
         let proof = VerifiedProof::Mock {
             input_hash: ZERO_HASH,
             output_hash: ZERO_HASH,
+            privacy_mode: PrivacyMode::Transparent,
         };
         let value_bytes = b"hello world".to_vec();
 
         let response = VerifiedResponse::new(&proof, ZERO_HASH, value_bytes.clone(), ZERO_HASH);
+        assert_eq!(response.privacy_mode, PrivacyMode::Transparent);
+
         let bytes = response.to_bytes();
         let decoded = VerifiedResponse::from_bytes(&bytes).unwrap();
 
         assert_eq!(decoded.value_bytes, value_bytes);
         assert_eq!(decoded.input_hash, ZERO_HASH);
+        assert_eq!(decoded.privacy_mode, PrivacyMode::Transparent);
+        assert!(decoded.verify_value_integrity());
+    }
+
+    #[test]
+    fn test_roundtrip_private() {
+        let proof = VerifiedProof::Mock {
+            input_hash: ZERO_HASH,
+            output_hash: ZERO_HASH,
+            privacy_mode: PrivacyMode::Private,
+        };
+        let value_bytes = b"secret data".to_vec();
+
+        let response =
+            VerifiedResponse::new(&proof, [0x42; 32], value_bytes, ZERO_HASH);
+
+        // Private: value_bytes should be empty, hashes zeroed
+        assert!(response.value_bytes.is_empty());
+        assert_eq!(response.value_hash, ZERO_HASH);
+        assert_eq!(response.input_hash, ZERO_HASH);
+
+        let bytes = response.to_bytes();
+        let decoded = VerifiedResponse::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.privacy_mode, PrivacyMode::Private);
+        assert!(decoded.value_bytes.is_empty());
+        assert!(decoded.verify_value_integrity());
+    }
+
+    #[test]
+    fn test_roundtrip_private_inputs() {
+        let proof = VerifiedProof::Mock {
+            input_hash: ZERO_HASH,
+            output_hash: ZERO_HASH,
+            privacy_mode: PrivacyMode::PrivateInputs,
+        };
+        let value_bytes = b"visible output".to_vec();
+
+        let response =
+            VerifiedResponse::new(&proof, [0x42; 32], value_bytes.clone(), ZERO_HASH);
+
+        // PrivateInputs: input_hash zeroed, value present
+        assert_eq!(response.input_hash, ZERO_HASH);
+        assert_eq!(response.value_bytes, value_bytes);
+        assert_ne!(response.value_hash, ZERO_HASH);
+
+        let bytes = response.to_bytes();
+        let decoded = VerifiedResponse::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.privacy_mode, PrivacyMode::PrivateInputs);
+        assert_eq!(decoded.value_bytes, value_bytes);
         assert!(decoded.verify_value_integrity());
     }
 }

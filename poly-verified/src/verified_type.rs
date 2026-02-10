@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::VerifiedError;
-use crate::types::VerifiedProof;
+use crate::types::{PrivacyMode, VerifiedProof};
 
 /// A value produced by verified execution, carrying a mathematical proof
 /// of correct computation.
@@ -51,6 +51,16 @@ impl<T> Verified<T> {
         }
     }
 
+    /// Returns the privacy mode of the proof.
+    pub fn privacy_mode(&self) -> PrivacyMode {
+        self.proof.privacy_mode()
+    }
+
+    /// Returns true if this value's proof hides information from the verifier.
+    pub fn is_private(&self) -> bool {
+        self.proof.privacy_mode().is_private()
+    }
+
     /// Map the inner value while preserving the proof.
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Verified<U> {
         Verified {
@@ -95,12 +105,13 @@ impl<T> Verified<Result<T, VerifiedError>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Hash, ZERO_HASH};
+    use crate::types::{PrivacyMode, ZERO_HASH};
 
     fn mock_proof() -> VerifiedProof {
         VerifiedProof::Mock {
             input_hash: ZERO_HASH,
             output_hash: ZERO_HASH,
+            privacy_mode: PrivacyMode::Transparent,
         }
     }
 
@@ -146,5 +157,36 @@ mod tests {
     fn test_verified_display() {
         let v = Verified::new_proven(42u64, mock_proof());
         assert_eq!(format!("{v}"), "Verified(42)");
+    }
+
+    #[test]
+    fn test_verified_privacy_mode_transparent() {
+        let v = Verified::new_proven(42u64, mock_proof());
+        assert_eq!(v.privacy_mode(), PrivacyMode::Transparent);
+        assert!(!v.is_private());
+    }
+
+    #[test]
+    fn test_verified_privacy_mode_private() {
+        let proof = VerifiedProof::Mock {
+            input_hash: ZERO_HASH,
+            output_hash: ZERO_HASH,
+            privacy_mode: PrivacyMode::Private,
+        };
+        let v = Verified::new_proven(42u64, proof);
+        assert_eq!(v.privacy_mode(), PrivacyMode::Private);
+        assert!(v.is_private());
+    }
+
+    #[test]
+    fn test_verified_privacy_mode_private_inputs() {
+        let proof = VerifiedProof::Mock {
+            input_hash: ZERO_HASH,
+            output_hash: ZERO_HASH,
+            privacy_mode: PrivacyMode::PrivateInputs,
+        };
+        let v = Verified::new_proven(42u64, proof);
+        assert_eq!(v.privacy_mode(), PrivacyMode::PrivateInputs);
+        assert!(v.is_private());
     }
 }

@@ -34,6 +34,6 @@ pub mod prelude {
     pub use crate::ivc::mock_ivc::MockIvc;
     pub use crate::ivc::IvcBackend;
     pub use crate::step::StepFunction;
-    pub use crate::types::{Hash, StepWitness, VerifiedProof};
+    pub use crate::types::{Hash, PrivacyMode, StepWitness, VerifiedProof};
     pub use crate::verified_type::Verified;
 }
