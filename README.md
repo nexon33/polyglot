@@ -367,4 +367,4 @@ See the `examples/` directory:
 
 ## License
 
-MIT
+AGPL3
