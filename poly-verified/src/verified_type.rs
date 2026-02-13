@@ -26,6 +26,16 @@ impl<T> Verified<T> {
         Self { value, proof }
     }
 
+    /// Internal constructor used by the `#[verified]` proc macro.
+    ///
+    /// **Do not call directly.** This is public only because proc macros
+    /// expand in the caller's crate and need access. Use `#[verified]`
+    /// to create `Verified<T>` values.
+    #[doc(hidden)]
+    pub fn __macro_new(value: T, proof: VerifiedProof) -> Self {
+        Self { value, proof }
+    }
+
     /// Access the inner value by reference.
     pub fn value(&self) -> &T {
         &self.value

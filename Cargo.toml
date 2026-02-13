@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "gridmesh", "poly-lsp", "poly-verified", "polyglot-macros", "polyglot-runtime"]
+members = [".", "gridmesh", "poly-lsp", "poly-verified", "poly-chain", "polyglot-macros", "polyglot-runtime", "poly-inference"]
 
 [package]
 name = "polyglot"
@@ -39,3 +39,6 @@ serde_json = "1.0"
 
 [dev-dependencies]
 polyglot-runtime = { path = "./polyglot-runtime", features = ["javascript", "scripting"] }
+polyglot-macros = { path = "./polyglot-macros" }
+poly-verified = { path = "./poly-verified" }
+sha2 = "0.10"

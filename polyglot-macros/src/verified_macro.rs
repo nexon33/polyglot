@@ -79,35 +79,27 @@ pub fn expand(args: TokenStream, input: TokenStream) -> TokenStream {
     let backend_init = if use_mock {
         quote! {
             let __privacy = #privacy_mode_expr;
-            let mut __acc = <poly_verified::ivc::mock_ivc::MockIvc as poly_verified::ivc::IvcBackend>::init(&__code_hash, __privacy);
+            let __backend = poly_verified::ivc::mock_ivc::MockIvc;
+            let mut __acc = poly_verified::ivc::IvcBackend::init(&__backend, &__code_hash, __privacy);
         }
     } else {
         quote! {
             let __privacy = #privacy_mode_expr;
-            let mut __acc = <poly_verified::ivc::hash_ivc::HashIvc as poly_verified::ivc::IvcBackend>::init(&__code_hash, __privacy);
+            let __backend = poly_verified::ivc::hash_ivc::HashIvc;
+            let mut __acc = poly_verified::ivc::IvcBackend::init(&__backend, &__code_hash, __privacy);
         }
     };
 
-    let fold_and_finalize = if use_mock {
-        quote! {
-            let __witness = poly_verified::types::StepWitness {
-                state_before: __input_hash,
-                state_after: __output_hash,
-                step_inputs: __input_hash,
-            };
-            <poly_verified::ivc::mock_ivc::MockIvc as poly_verified::ivc::IvcBackend>::fold_step(&mut __acc, &__witness);
-            let __proof = <poly_verified::ivc::mock_ivc::MockIvc as poly_verified::ivc::IvcBackend>::finalize(__acc);
-        }
-    } else {
-        quote! {
-            let __witness = poly_verified::types::StepWitness {
-                state_before: __input_hash,
-                state_after: __output_hash,
-                step_inputs: __input_hash,
-            };
-            <poly_verified::ivc::hash_ivc::HashIvc as poly_verified::ivc::IvcBackend>::fold_step(&mut __acc, &__witness);
-            let __proof = <poly_verified::ivc::hash_ivc::HashIvc as poly_verified::ivc::IvcBackend>::finalize(__acc);
-        }
+    let fold_and_finalize = quote! {
+        let __witness = poly_verified::types::StepWitness {
+            state_before: __input_hash,
+            state_after: __output_hash,
+            step_inputs: __input_hash,
+        };
+        poly_verified::ivc::IvcBackend::fold_step(&__backend, &mut __acc, &__witness)
+            .expect("verified execution: IVC fold step failed");
+        let __proof = poly_verified::ivc::IvcBackend::finalize(&__backend, __acc)
+            .expect("verified execution: IVC finalize failed");
     };
 
     quote! {
@@ -148,7 +140,7 @@ pub fn expand(args: TokenStream, input: TokenStream) -> TokenStream {
             #fold_and_finalize
 
             // Wrap in Verified<T>
-            poly_verified::verified_type::Verified::new_proven(__result, __proof)
+            poly_verified::verified_type::Verified::__macro_new(__result, __proof)
         }
     }
 }

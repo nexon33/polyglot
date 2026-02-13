@@ -1,0 +1,17 @@
+[package]
+name = "poly-chain"
+version = "0.1.0"
+edition = "2021"
+description = "Verify-only blockchain protocol for the Poly programming language"
+
+[dependencies]
+poly-verified = { path = "../poly-verified" }
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+rand = "0.8"
+hex = "0.4"

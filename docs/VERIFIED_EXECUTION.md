@@ -56,10 +56,13 @@ result.is_verified()      // bool — structural validity check
 
 // Transform the inner value
 let doubled = result.map(|v| v * 2);
+// Note: map carries the original proof. The proof attests to the
+// pre-transformation value, not the mapped result.
 
 // Flatten nested verified values
 let nested: Verified<Verified<u64>> = ...;
 let flat: Verified<u64> = nested.flatten();
+// Note: flatten keeps the outer proof (which encompasses the inner computation).
 ```
 
 ### `VerifiedProof`
@@ -93,7 +96,7 @@ let b = FixedPoint::from_decimal(14, 2);  // 0.14
 let pi_approx = a + b;                    // 3.14
 
 let result = pi_approx * FixedPoint::from_int(2);
-println!("{}", result);  // 6.280000000000000
+println!("{}", result);  // 6.280000
 ```
 
 ### `VerifiedError`
@@ -175,6 +178,7 @@ The compiler enforces determinism in `#[verified]` functions with error codes V0
 | V001 | No IO/net/random | `std::fs::read()`, `rand::thread_rng()` |
 | V002 | No floating point | `let x: f64 = 3.14;` |
 | V003 | Bounded loops | `loop { ... }` without bound |
+| V004 | No unverified calls | `external_lib::compute()` |
 | V005 | No unsafe/raw ptrs | `unsafe { }`, `*const T` |
 | V006 | Deterministic iteration | `HashMap::iter()` |
 | V007 | No global mut state | `static mut X: i32 = 0;` |
@@ -182,8 +186,10 @@ The compiler enforces determinism in `#[verified]` functions with error codes V0
 | V009 | No system time | `SystemTime::now()` |
 | V010 | No env variables | `std::env::var("KEY")` |
 | V011 | No thread spawning | `std::thread::spawn()` |
+| V012 | No dynamic dispatch | `dyn Trait` in verified context |
 | V013 | No inline assembly | `asm!()` |
 | V014 | No process spawning | `Command::new()` |
+| V015 | No unverified crates | Unverified external crate usage |
 
 **Allowed alternatives:**
 - `f64` → `FixedPoint` (deterministic arithmetic)
@@ -245,6 +251,8 @@ let decoded = VerifiedResponse::from_bytes(&wire_bytes)?;
 assert!(decoded.verify_value_integrity(&value_bytes));
 ```
 
+For Hash-IVC, `verifier_key_hash` is `ZERO_HASH` (no trusted setup). This field is reserved for future SNARK backends (Nova, HyperNova).
+
 ## Proof Composition
 
 When `#[verified]` functions call other `#[verified]` functions, proofs compose:
@@ -258,7 +266,7 @@ assert!(composite.verify_composition());
 
 ## Privacy Modes
 
-Verified execution supports optional zero-knowledge privacy. Privacy is a thin layer on top of the correctness system — blinding factors on the polynomial commitments, one additional hash per fold step.
+Verified execution supports optional zero-knowledge privacy. Privacy is a thin layer on top of the correctness system — blinding factors on the hash commitments, one additional hash per fold step.
 
 ### Three Modes
 
@@ -317,6 +325,8 @@ Privacy adds ~2x overhead to the fold step (one extra hash per step). The proof 
 ### Quantum-Resistant Privacy
 
 The Hash-IVC backend provides quantum-resistant privacy because both the proofs and blinding factors use only SHA-256 hash functions. No pairings, no trusted setup, no toxic waste.
+
+> **Note:** Quantum resistance applies to the proof system (Hash-IVC). The code attestation layer (`crypto::signing`) currently uses Ed25519, which is not quantum-resistant. Attestation signatures do not affect proof validity — they are an optional integrity check on the function identity.
 
 ### Proof Composition with Privacy
 
