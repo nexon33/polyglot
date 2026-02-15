@@ -104,3 +104,60 @@ func TestHashEqDifferent(t *testing.T) {
 		t.Fatal("different hashes should not be equal")
 	}
 }
+
+func TestHashLeafDomainPrefix(t *testing.T) {
+	data := []byte("leaf_test_data")
+	leaf := HashLeaf(data)
+	plain := HashData(data)
+	if leaf == plain {
+		t.Fatal("HashLeaf (0x00 prefix) must differ from HashData")
+	}
+}
+
+func TestHashTransitionDeterministic(t *testing.T) {
+	prev := HashData([]byte("prev"))
+	input := HashData([]byte("input"))
+	claimed := HashData([]byte("claimed"))
+
+	r1 := HashTransition(prev, input, claimed)
+	r2 := HashTransition(prev, input, claimed)
+	if r1 != r2 {
+		t.Fatal("same inputs should produce same output")
+	}
+
+	// Each argument matters
+	alt := HashData([]byte("other"))
+	if HashTransition(alt, input, claimed) == r1 {
+		t.Fatal("different prev should change output")
+	}
+	if HashTransition(prev, alt, claimed) == r1 {
+		t.Fatal("different input should change output")
+	}
+	if HashTransition(prev, input, alt) == r1 {
+		t.Fatal("different claimed should change output")
+	}
+}
+
+func TestHashTransitionDomainSeparation(t *testing.T) {
+	a := HashData([]byte("a"))
+	b := HashData([]byte("b"))
+
+	transition := HashTransition(a, b, a)
+	chainStep := HashChainStep(a, b)
+	if transition == chainStep {
+		t.Fatal("HashTransition (0x01) must differ from HashChainStep (0x02)")
+	}
+}
+
+func TestHashBlindingDomainPrefix(t *testing.T) {
+	data := []byte("blinding_data")
+	blinding := HashBlinding(data)
+	plain := HashData(data)
+	leaf := HashLeaf(data)
+	if blinding == plain {
+		t.Fatal("HashBlinding (0x04 prefix) must differ from HashData")
+	}
+	if blinding == leaf {
+		t.Fatal("HashBlinding (0x04 prefix) must differ from HashLeaf (0x00)")
+	}
+}
