@@ -2,16 +2,11 @@ package verified
 
 import "fmt"
 
-// MerkleTree is built from an ordered list of leaf hashes.
 type MerkleTree struct {
-	// Layers[0] = leaves, Layers[last] = [root].
 	Layers [][]Hash
 	Root   Hash
 }
 
-// BuildMerkleTree constructs a Merkle tree from leaf hashes.
-// Odd-element rule: when a layer has an odd number of elements,
-// the last element is duplicated as HashCombine(element, element).
 func BuildMerkleTree(leaves []Hash) *MerkleTree {
 	if len(leaves) == 0 {
 		return &MerkleTree{
@@ -32,7 +27,6 @@ func BuildMerkleTree(leaves []Hash) *MerkleTree {
 			if i+1 < len(current) {
 				next = append(next, HashCombine(current[i], current[i+1]))
 			} else {
-				// Odd element: duplicate
 				next = append(next, HashCombine(current[i], current[i]))
 			}
 		}
@@ -49,7 +43,6 @@ func BuildMerkleTree(leaves []Hash) *MerkleTree {
 	}
 }
 
-// GenerateProof creates a Merkle inclusion proof for the leaf at leafIndex.
 func (t *MerkleTree) GenerateProof(leafIndex uint64, codeHash Hash) (*MerkleProof, error) {
 	idx := int(leafIndex)
 	leaves := t.Layers[0]
@@ -61,7 +54,6 @@ func (t *MerkleTree) GenerateProof(leafIndex uint64, codeHash Hash) (*MerkleProo
 	var siblings []ProofNode
 	currentIndex := idx
 
-	// Traverse from leaf layer to just before root layer
 	for _, layer := range t.Layers[:len(t.Layers)-1] {
 		var siblingIndex int
 		if currentIndex%2 == 0 {
@@ -74,12 +66,9 @@ func (t *MerkleTree) GenerateProof(leafIndex uint64, codeHash Hash) (*MerkleProo
 		if siblingIndex < len(layer) {
 			siblingHash = layer[siblingIndex]
 		} else {
-			// Edge case: odd layer, duplicate self
-			siblingHash = layer[currentIndex]
+				siblingHash = layer[currentIndex]
 		}
 
-		// is_left means: this sibling is on the LEFT of current node
-		// i.e., current_index is odd => sibling (at index-1) is on the left
 		isLeft := currentIndex%2 == 1
 
 		siblings = append(siblings, ProofNode{
@@ -99,7 +88,6 @@ func (t *MerkleTree) GenerateProof(leafIndex uint64, codeHash Hash) (*MerkleProo
 	}, nil
 }
 
-// VerifyMerkleProof verifies a Merkle inclusion proof.
 func VerifyMerkleProof(proof *MerkleProof) bool {
 	current := proof.Leaf
 

@@ -12,7 +12,6 @@ func TestLoadOrGenerateIdentity(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "test.key")
 
-	// Generate new key.
 	id1, err := LoadOrGenerateIdentity(keyPath)
 	if err != nil {
 		t.Fatalf("generate: %v", err)
@@ -21,7 +20,6 @@ func TestLoadOrGenerateIdentity(t *testing.T) {
 		t.Fatalf("expected %d byte public key, got %d", ed25519.PublicKeySize, len(id1.PublicKey))
 	}
 
-	// Load existing key — should get the same keypair.
 	id2, err := LoadOrGenerateIdentity(keyPath)
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -50,7 +48,6 @@ func TestSignAndVerifyProof(t *testing.T) {
 		t.Fatal("valid signature should verify")
 	}
 
-	// Tamper with proof — signature should fail.
 	proof.StepCount = 999
 	if VerifyProofSignature(id.PublicKey, proof, sig) {
 		t.Fatal("tampered proof should fail verification")
@@ -73,7 +70,6 @@ func TestSignatureDeterministic(t *testing.T) {
 	sig1 := id.SignProof(proof)
 	sig2 := id.SignProof(proof)
 
-	// Ed25519 is deterministic.
 	if hex.EncodeToString(sig1) != hex.EncodeToString(sig2) {
 		t.Fatal("Ed25519 signatures should be deterministic")
 	}
@@ -122,7 +118,6 @@ func TestToSignedJSON(t *testing.T) {
 		t.Fatal("public_key mismatch")
 	}
 
-	// Verify the hex signature is valid.
 	sigBytes, err := hex.DecodeString(spj.Signature)
 	if err != nil {
 		t.Fatalf("invalid hex signature: %v", err)

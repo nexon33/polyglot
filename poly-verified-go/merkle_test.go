@@ -45,46 +45,6 @@ func TestBuild4Leaves(t *testing.T) {
 	}
 }
 
-func TestProofIndex2(t *testing.T) {
-	leaves := make4Leaves()
-	tree := BuildMerkleTree(leaves)
-	proof, err := tree.GenerateProof(2, ZeroHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if proof.Leaf != leaves[2] {
-		t.Fatal("leaf mismatch")
-	}
-	if proof.LeafIndex != 2 {
-		t.Fatal("leaf index mismatch")
-	}
-	if len(proof.Siblings) != 2 {
-		t.Fatalf("expected 2 siblings, got %d", len(proof.Siblings))
-	}
-
-	// Sibling 0: leaf_3, is_left=false (index 2 is even)
-	if proof.Siblings[0].Hash != leaves[3] {
-		t.Fatal("sibling 0 hash mismatch")
-	}
-	if proof.Siblings[0].IsLeft {
-		t.Fatal("sibling 0 should not be left")
-	}
-
-	// Sibling 1: node_0, is_left=true (index 1 is odd)
-	node0 := HashCombine(leaves[0], leaves[1])
-	if proof.Siblings[1].Hash != node0 {
-		t.Fatal("sibling 1 hash mismatch")
-	}
-	if !proof.Siblings[1].IsLeft {
-		t.Fatal("sibling 1 should be left")
-	}
-
-	if !VerifyMerkleProof(proof) {
-		t.Fatal("proof verification failed")
-	}
-}
-
 func TestProofAllIndices(t *testing.T) {
 	leaves := make4Leaves()
 	tree := BuildMerkleTree(leaves)

@@ -99,91 +99,52 @@ func TestHashIvcDeterministic(t *testing.T) {
 	}
 }
 
-func TestHashIvcPrivateModeBlinding(t *testing.T) {
-	codeHash := HashData([]byte("private_fn"))
-
-	acc := NewHashIvc(codeHash, Private)
-	witness := StepWitness{
-		StateBefore: HashData([]byte("before")),
-		StateAfter:  HashData([]byte("after")),
-		StepInputs:  HashData([]byte("inputs")),
+func TestHashIvcPrivacyModes(t *testing.T) {
+	tests := []struct {
+		name     string
+		mode     PrivacyMode
+		hasBlind bool
+		hideCode bool
+	}{
+		{"Private", Private, true, true},
+		{"PrivateInputs", PrivateInputs, true, false},
+		{"Transparent", Transparent, false, false},
 	}
-	acc.FoldStep(witness)
-
-	proof, err := acc.Finalize()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if proof.Privacy != Private {
-		t.Fatal("expected Private privacy")
-	}
-	if proof.BlindingCommitment == nil {
-		t.Fatal("blinding should be present in Private mode")
-	}
-	if *proof.BlindingCommitment == ZeroHash {
-		t.Fatal("blinding should not be zero")
-	}
-
-	// Full private: PublicCodeHash() should return ZeroHash
-	if proof.PublicCodeHash() != ZeroHash {
-		t.Fatal("Private mode should hide code_hash")
-	}
-
-	if !proof.Verify() {
-		t.Fatal("proof verification failed")
-	}
-}
-
-func TestHashIvcPrivateInputsMode(t *testing.T) {
-	codeHash := HashData([]byte("selective_fn"))
-
-	acc := NewHashIvc(codeHash, PrivateInputs)
-	witness := StepWitness{
-		StateBefore: HashData([]byte("before")),
-		StateAfter:  HashData([]byte("after")),
-		StepInputs:  HashData([]byte("inputs")),
-	}
-	acc.FoldStep(witness)
-
-	proof, err := acc.Finalize()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if proof.Privacy != PrivateInputs {
-		t.Fatal("expected PrivateInputs privacy")
-	}
-	if proof.BlindingCommitment == nil {
-		t.Fatal("blinding should be present")
-	}
-	// PrivateInputs: code_hash is still visible
-	if proof.CodeHash != codeHash {
-		t.Fatal("code_hash should match for PrivateInputs")
-	}
-	if proof.PublicCodeHash() != codeHash {
-		t.Fatal("PublicCodeHash should return real code_hash for PrivateInputs")
-	}
-}
-
-func TestHashIvcTransparentNoBlinding(t *testing.T) {
-	codeHash := HashData([]byte("transparent_fn"))
-
-	acc := NewHashIvc(codeHash, Transparent)
-	witness := StepWitness{
-		StateBefore: HashData([]byte("before")),
-		StateAfter:  HashData([]byte("after")),
-		StepInputs:  HashData([]byte("inputs")),
-	}
-	acc.FoldStep(witness)
-
-	proof, _ := acc.Finalize()
-
-	if proof.Privacy != Transparent {
-		t.Fatal("expected Transparent")
-	}
-	if proof.BlindingCommitment != nil {
-		t.Fatal("blinding should be nil for Transparent")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			codeHash := HashData([]byte(tt.name + "_fn"))
+			acc := NewHashIvc(codeHash, tt.mode)
+			acc.FoldStep(StepWitness{
+				StateBefore: HashData([]byte("before")),
+				StateAfter:  HashData([]byte("after")),
+				StepInputs:  HashData([]byte("inputs")),
+			})
+			proof, err := acc.Finalize()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if proof.Privacy != tt.mode {
+				t.Fatalf("expected %v privacy", tt.mode)
+			}
+			if tt.hasBlind && proof.BlindingCommitment == nil {
+				t.Fatal("blinding should be present")
+			}
+			if !tt.hasBlind && proof.BlindingCommitment != nil {
+				t.Fatal("blinding should be nil")
+			}
+			if tt.hasBlind && proof.BlindingCommitment != nil && *proof.BlindingCommitment == ZeroHash {
+				t.Fatal("blinding should not be zero")
+			}
+			if tt.hideCode && proof.PublicCodeHash() != ZeroHash {
+				t.Fatal("should hide code_hash")
+			}
+			if !tt.hideCode && proof.PublicCodeHash() != codeHash {
+				t.Fatal("code_hash should match")
+			}
+			if !proof.Verify() {
+				t.Fatal("proof verification failed")
+			}
+		})
 	}
 }
 
