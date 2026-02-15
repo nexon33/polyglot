@@ -6,7 +6,6 @@ import (
 	"fmt"
 )
 
-// HexHash is a Hash that serializes to/from hex strings in JSON.
 type HexHash Hash
 
 func (h HexHash) MarshalJSON() ([]byte, error) {
@@ -33,7 +32,6 @@ func hashToHex(h Hash) string {
 	return hex.EncodeToString(h[:])
 }
 
-// ProofJSON is the JSON-serializable representation of a VerifiedProof.
 type ProofJSON struct {
 	Backend            string  `json:"backend"`
 	ChainTip           string  `json:"chain_tip"`
@@ -46,7 +44,6 @@ type ProofJSON struct {
 	Verified           bool    `json:"verified"`
 }
 
-// ToJSON converts a VerifiedProof to its JSON representation.
 func (p *VerifiedProof) ToJSON() *ProofJSON {
 	pj := &ProofJSON{
 		Backend:          BackendHashIvc.String(),
@@ -67,7 +64,6 @@ func (p *VerifiedProof) ToJSON() *ProofJSON {
 	return pj
 }
 
-// VerificationResponse is the JSON object injected into API responses.
 type VerificationResponse struct {
 	Proof     *ProofJSON `json:"proof"`
 	InputHash *string    `json:"input_hash,omitempty"`
@@ -75,14 +71,12 @@ type VerificationResponse struct {
 	ModelID   string     `json:"model_id"`
 }
 
-// NewVerificationResponse builds the verification response for API injection.
 func NewVerificationResponse(proof *VerifiedProof, inputHash, outputHash Hash, modelID string) *VerificationResponse {
 	vr := &VerificationResponse{
 		Proof:   proof.ToJSON(),
 		ModelID: modelID,
 	}
 
-	// Only include hashes per privacy mode
 	if !proof.Privacy.IsPrivate() || proof.Privacy == PrivateInputs {
 		oh := hex.EncodeToString(outputHash[:])
 		vr.OutputHash = &oh
