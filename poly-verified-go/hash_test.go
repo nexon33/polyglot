@@ -16,36 +16,25 @@ func hexToHash(t *testing.T, s string) Hash {
 	return h
 }
 
-// Appendix B.1: hash_data test vectors (byte-compatible with Rust)
-func TestHashDataEmpty(t *testing.T) {
-	result := HashData([]byte{})
-	expected := hexToHash(t, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-	if result != expected {
-		t.Fatalf("hash_data empty: got %x, want %x", result, expected)
+func TestHashDataVectors(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []byte
+		want  string
+	}{
+		{"empty", []byte{}, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+		{"0x00", []byte{0x00}, "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"},
+		{"0x01", []byte{0x01}, "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"},
+		{"multi", []byte{0x01, 0x02, 0x03, 0x04, 0x05}, "74f81fe167d99b4cb41d6d0ccda82278caee9f3e2f25d5e5a3936ff3dcec60d0"},
 	}
-}
-
-func TestHashData0x00(t *testing.T) {
-	result := HashData([]byte{0x00})
-	expected := hexToHash(t, "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d")
-	if result != expected {
-		t.Fatalf("hash_data 0x00: got %x, want %x", result, expected)
-	}
-}
-
-func TestHashData0x01(t *testing.T) {
-	result := HashData([]byte{0x01})
-	expected := hexToHash(t, "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a")
-	if result != expected {
-		t.Fatalf("hash_data 0x01: got %x, want %x", result, expected)
-	}
-}
-
-func TestHashDataMultiByte(t *testing.T) {
-	result := HashData([]byte{0x01, 0x02, 0x03, 0x04, 0x05})
-	expected := hexToHash(t, "74f81fe167d99b4cb41d6d0ccda82278caee9f3e2f25d5e5a3936ff3dcec60d0")
-	if result != expected {
-		t.Fatalf("hash_data multi: got %x, want %x", result, expected)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := HashData(tt.input)
+			want := hexToHash(t, tt.want)
+			if got != want {
+				t.Fatalf("got %x, want %x", got, want)
+			}
+		})
 	}
 }
 
@@ -113,5 +102,62 @@ func TestHashEqDifferent(t *testing.T) {
 	b := HashData([]byte("test2"))
 	if HashEq(a, b) {
 		t.Fatal("different hashes should not be equal")
+	}
+}
+
+func TestHashLeafDomainPrefix(t *testing.T) {
+	data := []byte("leaf_test_data")
+	leaf := HashLeaf(data)
+	plain := HashData(data)
+	if leaf == plain {
+		t.Fatal("HashLeaf (0x00 prefix) must differ from HashData")
+	}
+}
+
+func TestHashTransitionDeterministic(t *testing.T) {
+	prev := HashData([]byte("prev"))
+	input := HashData([]byte("input"))
+	claimed := HashData([]byte("claimed"))
+
+	r1 := HashTransition(prev, input, claimed)
+	r2 := HashTransition(prev, input, claimed)
+	if r1 != r2 {
+		t.Fatal("same inputs should produce same output")
+	}
+
+	// Each argument matters
+	alt := HashData([]byte("other"))
+	if HashTransition(alt, input, claimed) == r1 {
+		t.Fatal("different prev should change output")
+	}
+	if HashTransition(prev, alt, claimed) == r1 {
+		t.Fatal("different input should change output")
+	}
+	if HashTransition(prev, input, alt) == r1 {
+		t.Fatal("different claimed should change output")
+	}
+}
+
+func TestHashTransitionDomainSeparation(t *testing.T) {
+	a := HashData([]byte("a"))
+	b := HashData([]byte("b"))
+
+	transition := HashTransition(a, b, a)
+	chainStep := HashChainStep(a, b)
+	if transition == chainStep {
+		t.Fatal("HashTransition (0x01) must differ from HashChainStep (0x02)")
+	}
+}
+
+func TestHashBlindingDomainPrefix(t *testing.T) {
+	data := []byte("blinding_data")
+	blinding := HashBlinding(data)
+	plain := HashData(data)
+	leaf := HashLeaf(data)
+	if blinding == plain {
+		t.Fatal("HashBlinding (0x04 prefix) must differ from HashData")
+	}
+	if blinding == leaf {
+		t.Fatal("HashBlinding (0x04 prefix) must differ from HashLeaf (0x00)")
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 )
 
-// HashIvcAccumulator is the running accumulator for Hash-IVC.
 type HashIvcAccumulator struct {
 	chain        *HashChainState
 	checkpoints  []Hash
@@ -14,7 +13,6 @@ type HashIvcAccumulator struct {
 	blindingHash Hash
 }
 
-// NewHashIvc creates a new Hash-IVC accumulator.
 func NewHashIvc(codeHash Hash, privacy PrivacyMode) *HashIvcAccumulator {
 	return &HashIvcAccumulator{
 		chain:        NewHashChain(),
@@ -25,13 +23,11 @@ func NewHashIvc(codeHash Hash, privacy PrivacyMode) *HashIvcAccumulator {
 	}
 }
 
-// FoldStep folds a computation step into the accumulator.
 func (a *HashIvcAccumulator) FoldStep(witness StepWitness) error {
 	transition := HashTransition(witness.StateBefore, witness.StepInputs, witness.StateAfter)
 	a.chain.Append(transition)
 	a.checkpoints = append(a.checkpoints, transition)
 
-	// When privacy is enabled, generate and accumulate a blinding factor.
 	if a.privacyMode.IsPrivate() {
 		var stepCounter [8]byte
 		binary.LittleEndian.PutUint64(stepCounter[:], a.chain.Length)
@@ -47,7 +43,6 @@ func (a *HashIvcAccumulator) FoldStep(witness StepWitness) error {
 	return nil
 }
 
-// Finalize produces the final VerifiedProof from the accumulated state.
 func (a *HashIvcAccumulator) Finalize() (*VerifiedProof, error) {
 	if len(a.checkpoints) == 0 {
 		return nil, errors.New("empty commitment: no steps folded")
