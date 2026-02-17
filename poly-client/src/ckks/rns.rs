@@ -317,26 +317,32 @@ fn garner_reconstruct(residues: &[i64], primes: &[i64]) -> i64 {
         };
     }
 
-    // Garner's algorithm: compute mixed-radix digits v[0..k]
-    // such that x = v[0] + v[1]*m[0] + v[2]*m[0]*m[1] + ...
+    // For small prime counts (≤ 3), use fast i128 path
+    if k <= 3 {
+        return garner_reconstruct_i128(residues, primes);
+    }
+
+    // For many primes, use variable-width arithmetic
+    garner_reconstruct_wide(residues, primes)
+}
+
+/// Fast path for ≤ 3 primes: i128 is sufficient (~108 bits).
+fn garner_reconstruct_i128(residues: &[i64], primes: &[i64]) -> i64 {
+    let k = residues.len();
     let mut v = vec![0i128; k];
     v[0] = residues[0] as i128;
 
     for i in 1..k {
         let q_i = primes[i] as i128;
         let mut u = residues[i] as i128;
-
-        // u = (...((a[i] - v[0]) * m[0]^(-1) - v[1]) * m[1]^(-1) ...) mod m[i]
         for j in 0..i {
-            let q_j = primes[j];
             u = ((u - v[j]) % q_i + q_i) % q_i;
-            let inv = mod_inv(q_j, primes[i]) as i128;
+            let inv = mod_inv(primes[j], primes[i]) as i128;
             u = u * inv % q_i;
         }
         v[i] = u;
     }
 
-    // Reconstruct: value = v[0] + v[1]*m[0] + v[2]*m[0]*m[1] + ...
     let mut result: i128 = v[0];
     let mut product: i128 = 1;
     for i in 1..k {
@@ -344,23 +350,136 @@ fn garner_reconstruct(residues: &[i64], primes: &[i64]) -> i64 {
         result += v[i] * product;
     }
 
-    // Compute Q = product of all primes
     let mut q_total: i128 = 1;
     for &p in primes {
         q_total *= p as i128;
     }
 
-    // Center the result into (-Q/2, Q/2]
     result %= q_total;
-    if result < 0 {
-        result += q_total;
-    }
+    if result < 0 { result += q_total; }
     let half_q = q_total / 2;
-    if result > half_q {
-        result -= q_total;
+    if result > half_q { result -= q_total; }
+    result as i64
+}
+
+/// Wide path for 4+ primes: uses variable-width arithmetic.
+fn garner_reconstruct_wide(residues: &[i64], primes: &[i64]) -> i64 {
+    let k = residues.len();
+    let num_limbs = (k * 36 + 63) / 64 + 1;
+
+    // Step 1: Garner mixed-radix coefficients (each < m_i, fits in i64)
+    let mut v = vec![0i64; k];
+    v[0] = residues[0];
+
+    for i in 1..k {
+        let q_i = primes[i] as i128;
+        let mut u = residues[i] as i128;
+        for j in 0..i {
+            u = ((u - v[j] as i128) % q_i + q_i) % q_i;
+            let inv = mod_inv(primes[j], primes[i]) as i128;
+            u = u * inv % q_i;
+        }
+        v[i] = u as i64;
     }
 
-    result as i64
+    // Step 2: Reconstruct as wide unsigned
+    let mut result = wide_from_u64(v[0] as u64, num_limbs);
+    let mut product = wide_from_u64(1, num_limbs);
+    for i in 1..k {
+        product = wide_mul_u64(&product, primes[i - 1] as u64);
+        let term = wide_mul_u64(&product, v[i] as u64);
+        result = wide_add(&result, &term);
+    }
+
+    // Step 3: Compute Q = product of all primes
+    let mut q_total = wide_from_u64(1, num_limbs);
+    for &p in primes {
+        q_total = wide_mul_u64(&q_total, p as u64);
+    }
+
+    // Step 4: Center — if result > Q/2, return result - Q (negative)
+    let half_q = wide_shr(&q_total, 1);
+    if wide_gt(&result, &half_q) {
+        // Centered value = result - Q (negative, fits in i64)
+        let diff = wide_sub(&q_total, &result);
+        -(diff[0] as i64)
+    } else {
+        // Positive value, fits in i64
+        result[0] as i64
+    }
+}
+
+// ── Wide integer helpers for CRT reconstruction ─────────────────────
+
+fn wide_from_u64(v: u64, n: usize) -> Vec<u64> {
+    let mut limbs = vec![0u64; n];
+    limbs[0] = v;
+    limbs
+}
+
+fn wide_mul_u64(a: &[u64], b: u64) -> Vec<u64> {
+    let n = a.len();
+    let mut result = vec![0u64; n];
+    let mut carry = 0u128;
+    for i in 0..n {
+        let prod = a[i] as u128 * b as u128 + carry;
+        result[i] = prod as u64;
+        carry = prod >> 64;
+    }
+    result
+}
+
+fn wide_add(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let n = a.len();
+    let mut result = vec![0u64; n];
+    let mut carry = 0u128;
+    for i in 0..n {
+        let bv = if i < b.len() { b[i] as u128 } else { 0 };
+        let sum = a[i] as u128 + bv + carry;
+        result[i] = sum as u64;
+        carry = sum >> 64;
+    }
+    result
+}
+
+fn wide_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let n = a.len();
+    let mut result = vec![0u64; n];
+    let mut borrow = 0i128;
+    for i in 0..n {
+        let bv = if i < b.len() { b[i] as i128 } else { 0 };
+        let diff = a[i] as i128 - bv - borrow;
+        if diff < 0 {
+            result[i] = (diff + (1i128 << 64)) as u64;
+            borrow = 1;
+        } else {
+            result[i] = diff as u64;
+            borrow = 0;
+        }
+    }
+    result
+}
+
+fn wide_shr(a: &[u64], bits: u32) -> Vec<u64> {
+    let n = a.len();
+    let mut result = vec![0u64; n];
+    for i in 0..n {
+        result[i] = a[i] >> bits;
+        if i + 1 < n {
+            result[i] |= a[i + 1] << (64 - bits);
+        }
+    }
+    result
+}
+
+fn wide_gt(a: &[u64], b: &[u64]) -> bool {
+    let n = a.len();
+    for i in (0..n).rev() {
+        let bv = if i < b.len() { b[i] } else { 0 };
+        if a[i] > bv { return true; }
+        if a[i] < bv { return false; }
+    }
+    false // equal
 }
 
 // ═══════════════════════════════════════════════════════════════════════

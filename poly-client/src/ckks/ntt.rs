@@ -29,27 +29,59 @@ use super::params::N;
 /// - q ≡ 1 (mod 8192), so primitive 2N-th roots of unity exist
 /// - q fits comfortably in i64 (< 2^37)
 /// - q * q fits in i128 for multiplication without overflow
-/// - Products of subsets fit in i128 for CRT reconstruction
 ///
-/// With 5 primes of ~36 bits each, total log₂(Q) ≈ 180 bits,
-/// supporting 4 multiplication levels (L = num_primes - 1).
-pub const NTT_PRIMES: [i64; 5] = [
-    68719403009, // 8192 * 8388599 + 1
-    68719230977, // 8192 * 8388578 + 1
-    68719206401, // 8192 * 8388575 + 1
-    68719190017, // 8192 * 8388573 + 1
-    68719157249, // 8192 * 8388569 + 1
+/// 20 primes of ~36 bits each. Use any prefix for the desired depth:
+/// - 5 primes → 4 levels (basic neural net inference)
+/// - 10 primes → 9 levels (polynomial activations, degree-7 SiLU)
+/// - 15 primes → 14 levels (bootstrapping, deep circuits)
+/// - 20 primes → 19 levels (full transformer inference)
+pub const NTT_PRIMES: [i64; 20] = [
+    68719403009,
+    68719230977,
+    68719206401,
+    68719190017,
+    68719157249,
+    68718764033,
+    68718428161,
+    68718346241,
+    68718305281,
+    68717928449,
+    68717740033,
+    68717682689,
+    68717592577,
+    68717363201,
+    68717223937,
+    68717142017,
+    68717076481,
+    68717068289,
+    68716781569,
+    68716707841,
 ];
 
 /// Precomputed primitive 2N-th roots of unity (ψ) for each prime.
 /// ψ = g^((q-1)/(2N)) where g is the smallest generator that works.
 /// Satisfies ψ^N ≡ -1 (mod q) and ψ^(2N) ≡ 1 (mod q).
-const NTT_ROOTS: [i64; 5] = [
-    5546991020,  // for q = 68719403009, g=3
-    41019061109, // for q = 68719230977, g=3
-    41978190371, // for q = 68719206401, g=3
-    60726334289, // for q = 68719190017, g=5
-    36981953102, // for q = 68719157249, g=3
+const NTT_ROOTS: [i64; 20] = [
+    5546991020,
+    41019061109,
+    41978190371,
+    60726334289,
+    36981953102,
+    1937762328,
+    22370218154,
+    6173043660,
+    67995098886,
+    59422617459,
+    54640452894,
+    52499569528,
+    36661170687,
+    63942896849,
+    12605105312,
+    27475774088,
+    37399532359,
+    45270410758,
+    20421207940,
+    18573596375,
 ];
 
 /// Number of levels supported = num_primes - 1.
@@ -544,6 +576,7 @@ mod tests {
             assert_eq!(p % (2 * N as i64), 1);
         }
     }
+
 
     #[test]
     fn mod_pow_basic() {

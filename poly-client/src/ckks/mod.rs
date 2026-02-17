@@ -25,6 +25,8 @@ pub mod ntt;
 pub mod params;
 pub mod rns;
 pub mod rns_ckks;
+pub mod poly_eval;
+pub mod rns_fhe_layer;
 pub mod simd;
 pub mod poly;
 pub mod sampling;

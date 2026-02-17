@@ -10,9 +10,9 @@
 //! - Can repeat until only 1 prime remains
 //!
 //! Key design decisions:
-//! - DELTA = 2^30 (close to prime size ~2^36, so rescaling preserves scale)
+//! - DELTA = 2^36 (matches prime size ~2^36, so scale²/q ≈ scale at every level)
 //! - Digit decomposition with base T = 2^18 for low-noise relinearization
-//! - CRT reconstruction via Garner's algorithm in i128 (supports up to 3 primes)
+//! - CRT reconstruction via Garner's algorithm with variable-width arithmetic (up to 20 primes)
 
 use std::collections::HashMap;
 
@@ -43,7 +43,9 @@ pub struct RnsCiphertext {
     pub c0: RnsPoly,
     pub c1: RnsPoly,
     /// Current scaling factor (Δ for fresh, Δ² after multiply, ~Δ after rescale).
-    pub scale: i64,
+    /// Tracked as f64 so Δ can be close to the prime size (~2^35) without
+    /// i64 overflow on Δ².
+    pub scale: f64,
     /// Number of rescale operations performed (0 for fresh).
     pub level: usize,
 }
@@ -61,7 +63,7 @@ pub struct RnsCiphertextTriple {
     pub d0: RnsPoly,
     pub d1: RnsPoly,
     pub d2: RnsPoly,
-    pub scale: i64,
+    pub scale: f64,
     pub level: usize,
 }
 
@@ -69,6 +71,7 @@ pub struct RnsCiphertextTriple {
 ///
 /// Encrypts σ_m(s) under s using digit decomposition, where σ_m is the
 /// Galois automorphism corresponding to the desired rotation.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RnsRotationKey {
     /// (b_d, a_d) pairs — one per decomposition digit.
     /// key_i encrypts σ_m(s) · T^i under s.
@@ -78,6 +81,7 @@ pub struct RnsRotationKey {
 }
 
 /// Collection of rotation keys for multiple rotation amounts.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RnsRotationKeySet {
     /// Maps rotation amount (signed) to its rotation key.
     pub keys: HashMap<i32, RnsRotationKey>,
@@ -95,9 +99,10 @@ const GALOIS_GEN: usize = 5;
 pub struct RnsCkksContext {
     pub ntt: Vec<NttContext>,
     pub num_primes: usize,
-    /// Scaling factor. Set to 2^30 so rescaling by q ≈ 2^36 brings
-    /// scale from Δ² ≈ 2^60 back to ~2^24 (still high precision).
-    pub delta: i64,
+    /// Scaling factor. Must match prime size for scale stability in deep chains:
+    /// after multiply+rescale, scale_new = scale²/q ≈ scale when scale ≈ q.
+    /// With Δ = 2^36 ≈ q, the scale is perfectly preserved at every level.
+    pub delta: f64,
 }
 
 impl RnsCkksContext {
@@ -109,7 +114,7 @@ impl RnsCkksContext {
             NTT_PRIMES.len()
         );
         let ntt = create_ntt_contexts();
-        let delta = 1i64 << 30; // DELTA = 2^30
+        let delta = (1u64 << 36) as f64; // DELTA = 2^36, matches prime size for stable deep chains
         Self {
             ntt,
             num_primes,
@@ -136,78 +141,126 @@ fn num_decomp_digits(num_primes: usize, decomp_bits: u32) -> usize {
     ((total_bits + decomp_bits - 1) / decomp_bits) as usize
 }
 
-/// Garner's CRT reconstruction returning i128 (no truncation to i64).
-/// Supports up to 3 primes (Q ≈ 2^108, fits in i128).
-fn garner_wide(residues: &[i64], primes: &[i64]) -> i128 {
-    let k = residues.len();
-    if k == 1 {
-        let q = primes[0];
-        let half = q / 2;
-        return if residues[0] > half {
-            residues[0] as i128 - q as i128
-        } else {
-            residues[0] as i128
-        };
+// ── Variable-width unsigned arithmetic for CRT ──────────────────────
+
+/// Variable-width unsigned integer as little-endian u64 limbs.
+/// Supports arbitrary prime counts (5 primes → 4 limbs, 20 primes → 12 limbs).
+struct WideInt {
+    limbs: Vec<u64>,
+}
+
+impl WideInt {
+    fn from_u64(v: u64, num_limbs: usize) -> Self {
+        let mut limbs = vec![0u64; num_limbs];
+        limbs[0] = v;
+        Self { limbs }
     }
 
-    // Garner's algorithm: compute mixed-radix digits v[0..k]
-    let mut v = vec![0i128; k];
-    v[0] = residues[0] as i128;
+    fn mul_u64(&self, b: u64) -> Self {
+        let n = self.limbs.len();
+        let mut result = vec![0u64; n];
+        let mut carry = 0u128;
+        for i in 0..n {
+            let prod = self.limbs[i] as u128 * b as u128 + carry;
+            result[i] = prod as u64;
+            carry = prod >> 64;
+        }
+        Self { limbs: result }
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        let n = self.limbs.len();
+        let mut result = vec![0u64; n];
+        let mut carry = 0u128;
+        for i in 0..n {
+            let a = self.limbs[i] as u128;
+            let b = if i < other.limbs.len() { other.limbs[i] as u128 } else { 0 };
+            let sum = a + b + carry;
+            result[i] = sum as u64;
+            carry = sum >> 64;
+        }
+        Self { limbs: result }
+    }
+
+    fn shr(&self, bits: u32) -> Self {
+        if bits == 0 {
+            return Self { limbs: self.limbs.clone() };
+        }
+        let n = self.limbs.len();
+        let mut result = vec![0u64; n];
+        for i in 0..n {
+            result[i] = self.limbs[i] >> bits;
+            if i + 1 < n {
+                result[i] |= self.limbs[i + 1] << (64 - bits);
+            }
+        }
+        Self { limbs: result }
+    }
+
+    fn low_bits(&self, bits: u32) -> u64 {
+        self.limbs[0] & ((1u64 << bits) - 1)
+    }
+}
+
+// ── Garner CRT + digit extraction ───────────────────────────────────
+
+/// Garner CRT reconstruction + base-B digit extraction.
+///
+/// Uses variable-width arithmetic so it works for any number of primes
+/// (20 primes at ~36 bits → Q ≈ 2^720, needs 12 limbs).
+/// Returns `num_digits` digits in base `2^decomp_bits`.
+fn garner_to_digits(
+    residues: &[i64],
+    primes: &[i64],
+    decomp_bits: u32,
+    num_digits: usize,
+) -> Vec<i64> {
+    let k = residues.len();
+    // Number of 64-bit limbs needed: ceil(k * 36 / 64) + 1 for safety
+    let num_limbs = (k * 36 + 63) / 64 + 1;
+
+    // Step 1: Garner mixed-radix coefficients (each < m_i, fits in i64)
+    let mut v = vec![0i64; k];
+    v[0] = residues[0];
 
     for i in 1..k {
         let q_i = primes[i] as i128;
         let mut u = residues[i] as i128;
 
         for j in 0..i {
-            let q_j = primes[j];
-            u = ((u - v[j]) % q_i + q_i) % q_i;
-            let inv = mod_inv(q_j, primes[i]) as i128;
+            u = ((u - v[j] as i128) % q_i + q_i) % q_i;
+            let inv = mod_inv(primes[j], primes[i]) as i128;
             u = u * inv % q_i;
         }
-        v[i] = u;
+        v[i] = u as i64;
     }
 
-    // Reconstruct: value = v[0] + v[1]*m[0] + v[2]*m[0]*m[1] + ...
-    let mut result: i128 = v[0];
-    let mut product: i128 = 1;
+    // Step 2: Reconstruct as wide unsigned (value in [0, Q))
+    let mut result = WideInt::from_u64(v[0] as u64, num_limbs);
+    let mut product = WideInt::from_u64(1, num_limbs);
     for i in 1..k {
-        product *= primes[i - 1] as i128;
-        result += v[i] * product;
+        product = product.mul_u64(primes[i - 1] as u64);
+        let term = product.mul_u64(v[i] as u64);
+        result = result.add(&term);
     }
 
-    // Compute Q = product of all primes
-    let mut q_total: i128 = 1;
-    for &p in primes {
-        q_total *= p as i128;
+    // Step 3: Extract base-B digits
+    let mut digits = vec![0i64; num_digits];
+    for d in 0..num_digits {
+        digits[d] = result.low_bits(decomp_bits) as i64;
+        result = result.shr(decomp_bits);
     }
 
-    // Center into (-Q/2, Q/2]
-    result %= q_total;
-    if result < 0 {
-        result += q_total;
-    }
-    let half_q = q_total / 2;
-    if result > half_q {
-        result -= q_total;
-    }
-
-    result
+    digits
 }
 
 /// Decompose an RNS polynomial into base-T digit polynomials.
 ///
-/// Pipeline: CRT reconstruct → base-T digit extract → back to RNS.
+/// Pipeline: CRT reconstruct (256-bit) → base-T digit extract → back to RNS.
 /// Each output digit polynomial has coefficients in [0, T).
 fn decompose_digits(d2: &RnsPoly, decomp_bits: u32) -> Vec<RnsPoly> {
-    let primes = &NTT_PRIMES[..d2.num_primes];
+    let primes: Vec<i64> = NTT_PRIMES[..d2.num_primes].to_vec();
     let nd = num_decomp_digits(d2.num_primes, decomp_bits);
-    let base = 1i128 << decomp_bits;
-
-    // Compute Q for making values positive
-    let mut q_total: i128 = 1;
-    for &p in primes {
-        q_total *= p as i128;
-    }
 
     let mut digit_coeffs: Vec<Vec<i64>> = vec![vec![0i64; N]; nd];
 
@@ -215,14 +268,10 @@ fn decompose_digits(d2: &RnsPoly, decomp_bits: u32) -> Vec<RnsPoly> {
         let residues: Vec<i64> = (0..d2.num_primes)
             .map(|i| d2.residues[i][j])
             .collect();
-        let val = garner_wide(&residues, primes);
-
-        // Make non-negative for digit extraction
-        let mut v = if val < 0 { val + q_total } else { val };
+        let digits = garner_to_digits(&residues, &primes, decomp_bits, nd);
 
         for d in 0..nd {
-            digit_coeffs[d][j] = (v % base) as i64;
-            v /= base;
+            digit_coeffs[d][j] = digits[d];
         }
     }
 
@@ -324,7 +373,11 @@ pub fn rns_gen_eval_key<R: rand::Rng>(
 // Encryption / Decryption
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Encrypt a single f64 value.
+/// Encrypt a single f64 value using SIMD slot 0.
+///
+/// Internally uses SIMD encoding (value in slot 0, zeros elsewhere) rather
+/// than raw coefficient encoding. This distributes energy across all N
+/// coefficients, giving ~√N headroom before modular wrap-around.
 pub fn rns_encrypt_f64<R: rand::Rng>(
     value: f64,
     pk_b: &RnsPoly,
@@ -332,50 +385,19 @@ pub fn rns_encrypt_f64<R: rand::Rng>(
     ctx: &RnsCkksContext,
     rng: &mut R,
 ) -> RnsCiphertext {
-    let num_primes = ctx.num_primes;
-
-    // Encode: m = round(value * delta)
-    let m_val = (value * ctx.delta as f64).round() as i64;
-    let m = RnsPoly::from_coeffs(&[m_val], num_primes);
-
-    // Ephemeral: u (ternary), e1, e2 (gaussian)
-    let mut u_coeffs = vec![0i64; N];
-    for c in u_coeffs.iter_mut() {
-        *c = rng.gen_range(-1..=1);
-    }
-    let u = RnsPoly::from_coeffs(&u_coeffs, num_primes);
-    let e1 = rns_sample_gaussian(rng, num_primes);
-    let e2 = rns_sample_gaussian(rng, num_primes);
-
-    let c0 = pk_b.mul(&u, &ctx.ntt).add(&e1).add(&m);
-    let c1 = pk_a.mul(&u, &ctx.ntt).add(&e2);
-
-    RnsCiphertext {
-        c0,
-        c1,
-        scale: ctx.delta,
-        level: 0,
-    }
+    rns_encrypt_simd(&[value], pk_b, pk_a, ctx, rng)
 }
 
-/// Decrypt a ciphertext and decode to f64.
+/// Decrypt a ciphertext and decode to f64 (reads SIMD slot 0).
+///
+/// Pairs with `rns_encrypt_f64` which uses SIMD encoding.
 pub fn rns_decrypt_f64(
     ct: &RnsCiphertext,
     s: &RnsPoly,
     ctx: &RnsCkksContext,
 ) -> f64 {
-    // m_noisy = c0 + c1 * s
-    let s_at_level = if s.num_primes > ct.c0.num_primes {
-        rns_truncate(s, ct.c0.num_primes)
-    } else {
-        s.clone()
-    };
-
-    let c1_s = ct.c1.mul(&s_at_level, &ctx.ntt);
-    let m_noisy = ct.c0.add(&c1_s);
-
-    let coeffs = m_noisy.to_coeffs();
-    coeffs[0] as f64 / ct.scale as f64
+    let decoded = rns_decrypt_simd(ct, s, ctx, 1);
+    decoded[0]
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -396,7 +418,7 @@ pub fn rns_encrypt_simd<R: rand::Rng>(
     let num_primes = ctx.num_primes;
 
     // Encode values into polynomial coefficients via canonical embedding
-    let coeffs = simd::encode_simd(values, ctx.delta as f64);
+    let coeffs = simd::encode_simd(values, ctx.delta);
     let m = RnsPoly::from_coeffs(&coeffs, num_primes);
 
     // Same encryption as rns_encrypt_f64: c0 = pk_b*u + e1 + m, c1 = pk_a*u + e2
@@ -436,7 +458,7 @@ pub fn rns_decrypt_simd(
     let m_noisy = ct.c0.add(&c1_s);
 
     let coeffs = m_noisy.to_coeffs();
-    simd::decode_simd(&coeffs, ct.scale as f64, count)
+    simd::decode_simd(&coeffs, ct.scale, count)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -477,15 +499,111 @@ pub fn rns_ct_scalar_mul(ct: &RnsCiphertext, scalar: i64) -> RnsCiphertext {
     }
 }
 
-/// Add an encoded plaintext to a ciphertext.
-pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: i64) -> RnsCiphertext {
-    let p_val = (plain_val * delta as f64).round() as i64;
-    let p = RnsPoly::from_coeffs(&[p_val], ct.c0.num_primes);
+/// Add an encoded plaintext scalar to a ciphertext.
+///
+/// Uses SIMD encoding (value in slot 0) to match `rns_encrypt_f64`.
+pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: f64) -> RnsCiphertext {
+    let coeffs = simd::encode_simd(&[plain_val], delta);
+    let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
     RnsCiphertext {
         c0: ct.c0.add(&p),
         c1: ct.c1.clone(),
         scale: ct.scale,
         level: ct.level,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Level-aware operations (for polynomial evaluation and deep circuits)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Mod-switch a ciphertext to have `target_primes` primes.
+///
+/// Free operation — just drops extra RNS components without changing
+/// the encrypted value or scale. Used to align levels before ct-ct multiply
+/// when operands are at different depths.
+pub fn rns_ct_mod_switch_to(ct: &RnsCiphertext, target_primes: usize) -> RnsCiphertext {
+    assert!(target_primes >= 1 && target_primes <= ct.c0.num_primes);
+    if target_primes == ct.c0.num_primes {
+        return ct.clone();
+    }
+    let levels_dropped = ct.c0.num_primes - target_primes;
+    RnsCiphertext {
+        c0: rns_truncate(&ct.c0, target_primes),
+        c1: rns_truncate(&ct.c1, target_primes),
+        scale: ct.scale,
+        level: ct.level + levels_dropped,
+    }
+}
+
+/// Add a scalar broadcast to all SIMD slots of a ciphertext.
+///
+/// Encodes `scalar` at the ciphertext's current scale so the addition
+/// is semantically correct. No level consumed.
+pub fn rns_ct_add_scalar_broadcast(ct: &RnsCiphertext, scalar: f64) -> RnsCiphertext {
+    let values = vec![scalar; simd::NUM_SLOTS];
+    let coeffs = simd::encode_simd(&values, ct.scale);
+    let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
+    RnsCiphertext {
+        c0: ct.c0.add(&p),
+        c1: ct.c1.clone(),
+        scale: ct.scale,
+        level: ct.level,
+    }
+}
+
+/// Multiply two ciphertexts with automatic level matching.
+///
+/// Unlike `rns_ct_mul`, does not require exact scale/level equality.
+/// The higher-level (more primes) ciphertext is mod-switched down to
+/// match the lower one. Result scale = a.scale × b.scale.
+pub fn rns_ct_mul_leveled(
+    a: &RnsCiphertext,
+    b: &RnsCiphertext,
+    ctx: &RnsCkksContext,
+) -> RnsCiphertextTriple {
+    let target = a.c0.num_primes.min(b.c0.num_primes);
+    let a_m = rns_ct_mod_switch_to(a, target);
+    let b_m = rns_ct_mod_switch_to(b, target);
+
+    let d0 = a_m.c0.mul(&b_m.c0, &ctx.ntt);
+    let d1 = a_m.c0.mul(&b_m.c1, &ctx.ntt).add(&a_m.c1.mul(&b_m.c0, &ctx.ntt));
+    let d2 = a_m.c1.mul(&b_m.c1, &ctx.ntt);
+
+    RnsCiphertextTriple {
+        d0,
+        d1,
+        d2,
+        scale: a_m.scale * b_m.scale,
+        level: a_m.level,
+    }
+}
+
+/// Multiply + relinearize with automatic level matching.
+pub fn rns_ct_mul_relin_leveled(
+    a: &RnsCiphertext,
+    b: &RnsCiphertext,
+    evk: &RnsEvalKey,
+    ctx: &RnsCkksContext,
+) -> RnsCiphertext {
+    let triple = rns_ct_mul_leveled(a, b, ctx);
+    rns_relinearize(triple, evk, ctx)
+}
+
+/// Add two ciphertexts with automatic level matching.
+///
+/// Mod-switches the higher ciphertext to match the lower one.
+/// Uses the average of (approximately equal) scales.
+pub fn rns_ct_add_leveled(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
+    let target = a.c0.num_primes.min(b.c0.num_primes);
+    let a_m = rns_ct_mod_switch_to(a, target);
+    let b_m = rns_ct_mod_switch_to(b, target);
+
+    RnsCiphertext {
+        c0: a_m.c0.add(&b_m.c0),
+        c1: a_m.c1.add(&b_m.c1),
+        scale: (a_m.scale + b_m.scale) / 2.0,
+        level: a_m.level,
     }
 }
 
@@ -572,7 +690,7 @@ pub fn rns_rescale(ct: &RnsCiphertext) -> RnsCiphertext {
     RnsCiphertext {
         c0: ct.c0.drop_last_prime(),
         c1: ct.c1.drop_last_prime(),
-        scale: ct.scale / q_last,
+        scale: ct.scale / q_last as f64,
         level: ct.level + 1,
     }
 }
@@ -733,7 +851,7 @@ pub fn rns_ct_mul_plain_simd(
     values: &[f64],
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
-    let coeffs = simd::encode_simd(values, ctx.delta as f64);
+    let coeffs = simd::encode_simd(values, ctx.delta);
     let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
 
     RnsCiphertext {
@@ -951,7 +1069,7 @@ mod tests {
 
         // Multiply: scale goes to Δ²
         let ct_prod = rns_ct_mul_relin(&ct1, &ct2, &evk, &ctx);
-        assert_eq!(ct_prod.scale, ctx.delta * ctx.delta);
+        assert!((ct_prod.scale - ctx.delta * ctx.delta).abs() < 1.0);
         assert_eq!(ct_prod.c0.num_primes, 3);
 
         // Rescale: drop one prime, scale goes back to ~Δ
@@ -1012,6 +1130,43 @@ mod tests {
 
         let ctx5 = RnsCkksContext::new(5);
         assert_eq!(ctx5.max_depth(), 4);
+
+        let ctx10 = RnsCkksContext::new(10);
+        assert_eq!(ctx10.max_depth(), 9);
+
+        let ctx20 = RnsCkksContext::new(20);
+        assert_eq!(ctx20.max_depth(), 19);
+    }
+
+    #[test]
+    fn deep_chain_10_primes() {
+        // Verify that 10-prime chain supports 8 sequential squarings.
+        // x=1.1, square 8 times → x^256 ≈ 39.5 billion.
+        // With delta=2^36 ≈ q, scale is preserved at every level.
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(10);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+        let evk = rns_gen_eval_key(&s, &ctx, &mut rng);
+
+        let ct = rns_encrypt_f64(1.1, &pk_b, &pk_a, &ctx, &mut rng);
+
+        let mut ct_pow = ct.clone();
+        let mut expected = 1.1f64;
+        for _ in 0..8 {
+            ct_pow = rns_ct_mul_relin(&ct_pow, &ct_pow, &evk, &ctx);
+            ct_pow = rns_rescale(&ct_pow);
+            expected *= expected;
+        }
+
+        assert_eq!(ct_pow.c0.num_primes, 2, "should have 2 primes after 8 squarings");
+
+        let decrypted = rns_decrypt_f64(&ct_pow, &s, &ctx);
+        let rel_error = (decrypted - expected).abs() / expected;
+        assert!(
+            rel_error < 0.01, // within 1% relative error
+            "1.1^256: expected {:.2}, got {:.2}, rel_err {:.6}",
+            expected, decrypted, rel_error
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1357,7 +1512,7 @@ mod tests {
         let ct_prod = rns_ct_mul_plain_simd(&ct, &plain_vals, &ctx);
 
         // Scale is now Δ², need to rescale
-        assert_eq!(ct_prod.scale, ctx.delta * ctx.delta);
+        assert!((ct_prod.scale - ctx.delta * ctx.delta).abs() < 1.0);
         let ct_rescaled = rns_rescale(&ct_prod);
 
         let decrypted = rns_decrypt_simd(&ct_rescaled, &s, &ctx, 5);
