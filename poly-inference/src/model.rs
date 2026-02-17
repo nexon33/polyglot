@@ -19,6 +19,19 @@ pub static EMBED_TENSOR: OnceLock<Tensor> = OnceLock::new();
 
 const MODEL_ID: &str = "Qwen/Qwen3-0.6B";
 
+/// Wrap a user message in Qwen3 chat template for instruct-tuned models.
+///
+/// This enables the model's built-in safety training (soft refusal for
+/// harmful prompts). Used as a first line of defense before the cryptographic
+/// compliance proof gate.
+pub fn format_chat_prompt(user_message: &str) -> String {
+    format!(
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+         <|im_start|>user\n{user_message}<|im_end|>\n\
+         <|im_start|>assistant\n"
+    )
+}
+
 pub fn load_model(device: Device) -> Result<()> {
     let api = Api::new()?;
     let repo = api.model(MODEL_ID.to_string());

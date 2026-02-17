@@ -15,6 +15,9 @@ use poly_verified::ivc::hash_ivc::HashIvc;
 use poly_verified::ivc::IvcBackend;
 use poly_verified::types::{PrivacyMode, StepWitness, VerifiedProof};
 
+use crate::compliance::{default_policy, ContentPolicy};
+use crate::compliance_proof::ComplianceProof;
+
 /// Server-side inference backend trait.
 ///
 /// Takes an `InferRequest` (from the thin client) and produces an `InferResponse`
@@ -126,6 +129,77 @@ impl InferenceBackend for RealInferenceBackend {
         };
 
         // 3. Re-encrypt output
+        let output_ct = MockCiphertext {
+            tokens: output_tokens,
+        };
+        let encrypted_output = serde_json::to_vec(&output_ct)?;
+
+        Ok(InferResponse {
+            encrypted_output,
+            proof,
+            model_id: request.model_id.clone(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ComplianceInferenceBackend — real model + per-token compliance gate
+// ---------------------------------------------------------------------------
+
+/// Real inference with per-token compliance enforcement.
+///
+/// Wraps `RealInferenceBackend` with `generate_compliant()` — every token
+/// is checked against the content policy. If a token violates the policy,
+/// generation halts and the compliance proof records the violation.
+///
+/// The compliance proof is stored after each request and can be retrieved
+/// via `last_compliance_proof()`.
+pub struct ComplianceInferenceBackend {
+    policy: ContentPolicy,
+    last_proof: std::cell::RefCell<Option<ComplianceProof>>,
+}
+
+impl ComplianceInferenceBackend {
+    pub fn new(policy: ContentPolicy) -> Self {
+        Self {
+            policy,
+            last_proof: std::cell::RefCell::new(None),
+        }
+    }
+
+    pub fn with_default_policy() -> Self {
+        Self::new(default_policy())
+    }
+
+    /// Retrieve the compliance proof from the most recent `infer()` call.
+    pub fn last_compliance_proof(&self) -> Option<ComplianceProof> {
+        self.last_proof.borrow().clone()
+    }
+}
+
+impl InferenceBackend for ComplianceInferenceBackend {
+    fn infer(&self, request: &InferRequest) -> Result<InferResponse> {
+        // 1. Decrypt input
+        let input_ct: MockCiphertext = serde_json::from_slice(&request.encrypted_input)?;
+        let input_tokens = input_ct.tokens;
+
+        // 2. Run compliant generation (halts on policy violation)
+        let (output_tokens, compliance_proof) = crate::inference::generate_compliant(
+            input_tokens,
+            request.max_tokens,
+            request.temperature,
+            request.seed,
+            self.policy.clone(),
+        );
+
+        // 3. Create computation proof (separate from compliance proof)
+        let privacy = request.mode.to_privacy_mode();
+        let proof = create_proof(&output_tokens, privacy)?;
+
+        // 4. Store compliance proof for caller to retrieve
+        *self.last_proof.borrow_mut() = Some(compliance_proof);
+
+        // 5. Re-encrypt output
         let output_ct = MockCiphertext {
             tokens: output_tokens,
         };

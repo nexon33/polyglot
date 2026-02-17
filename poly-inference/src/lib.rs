@@ -10,6 +10,8 @@
 //! - **`server`** — `InferenceBackend` trait + `MockInferenceBackend` + `RealInferenceBackend`
 //! - **`http`** — HTTP transport via `tiny_http`
 
+pub mod compliance;
+pub mod compliance_proof;
 pub mod inference;
 pub mod model;
 pub mod server;

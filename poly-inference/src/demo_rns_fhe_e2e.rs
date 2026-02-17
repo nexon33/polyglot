@@ -11,6 +11,8 @@ use std::time::Instant;
 
 use poly_client::ckks::rns_ckks::*;
 use poly_client::ckks::rns_fhe_layer::*;
+use poly_inference::compliance::{default_policy, PolicyChecker, TokenVerdict};
+use poly_inference::compliance_proof::ComplianceAccumulator;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -180,6 +182,15 @@ fn main() {
     eprintln!(" done ({:.0}ms, N=4096, {} primes)", keygen_ms, num_primes);
     eprintln!();
 
+    // [B1.5] Compliance gate setup
+    let policy = default_policy();
+    let client_checker = PolicyChecker::new(policy.clone());
+    let server_checker = PolicyChecker::new(policy.clone());
+    let mut compliance_acc = ComplianceAccumulator::new(client_checker);
+    eprintln!("  [B1.5] Compliance gate: policy v{}, {} blocked IDs, {} blocked n-grams",
+        policy.version, policy.blocked_token_ids.len(), policy.blocked_ngrams.len());
+    eprintln!();
+
     // [B2] Initial Qwen3 forward pass (prompt → KV cache + first hidden state)
     eprint!("  [B2] Qwen3 forward on prompt ({} tokens)...", token_ids.len());
     let t = Instant::now();
@@ -273,6 +284,23 @@ fn main() {
 
         let next_id = top[0].0;
         let next_text = &top[0].1;
+
+        // ── COMPLIANCE GATE ─────────────────────────────────────────
+        // CLIENT: check token + fold into IVC accumulator
+        let verdict = compliance_acc.check_and_fold(next_id)
+            .expect("compliance fold failed");
+        if let TokenVerdict::Blocked(reason) = &verdict {
+            eprintln!("\n  [COMPLIANCE] Blocked at token {step}: {reason:?}");
+            break;
+        }
+        // SERVER: belt-and-suspenders independent check
+        let server_verdict = server_checker.check_token(next_id, &enc_generated);
+        if let TokenVerdict::Blocked(reason) = &server_verdict {
+            eprintln!("\n  [SERVER COMPLIANCE] Blocked at token {step}: {reason:?}");
+            break;
+        }
+        // ─────────────────────────────────────────────────────────────
+
         enc_generated.push(next_id);
         eprint!("{}", next_text);
 
@@ -291,6 +319,15 @@ fn main() {
     let gen_total_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
     let n_enc = enc_generated.len();
     eprintln!();
+    eprintln!();
+
+    // Finalize compliance proof
+    let compliance_proof = compliance_acc.finalize()
+        .expect("compliance finalize failed");
+    let compliance_verified = compliance_proof.verify().unwrap_or(false);
+    eprintln!("  Compliance proof: {} tokens checked, {} compliant, policy v{}",
+        compliance_proof.total_tokens, compliance_proof.compliant_tokens, policy.version);
+    eprintln!("  IVC proof verified: {}", if compliance_verified { "PASS" } else { "FAIL" });
     eprintln!();
 
     // Full encrypted output
@@ -393,6 +430,9 @@ fn main() {
         n_enc, n_enc as f64 / (gen_total_ms / 1000.0), per_token_ms / 1000.0);
     eprintln!("    FHE verify:  {} (max error {:.2e} across {} tokens)",
         if fhe_verified { "PASS" } else { "FAIL" }, max_fhe_err, n_enc);
+    eprintln!("    Compliance:  {} ({}/{} tokens, policy v{})",
+        if compliance_verified && compliance_proof.all_compliant() { "PASS" } else { "BLOCKED" },
+        compliance_proof.compliant_tokens, compliance_proof.total_tokens, policy.version);
     eprintln!("    Privacy:     Server NEVER sees plaintext data");
     eprintln!();
     separator();
