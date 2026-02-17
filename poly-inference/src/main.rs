@@ -124,6 +124,11 @@ fn main() {
     let load_time = t0.elapsed();
     eprintln!(" done ({:.1}s)", load_time.as_secs_f64());
 
+    // Initialize runtime compliance policy
+    poly_inference::compliance::init_runtime_policy(|term| {
+        model::tokenize(term).unwrap_or_default()
+    });
+
     // ── [2/7] Tokenize ────────────────────────────────────────────────
     let input_ids = model::tokenize(prompt).expect("tokenization failed");
     eprintln!("[2/7] Tokenized: {} tokens", input_ids.len());
@@ -271,6 +276,12 @@ fn run_server(addr: &str, model_name: &str) {
     eprintln!(" ({})", if device.is_cuda() { "CUDA" } else { "CPU" });
     model::load_model_by_name(model_name, device).expect("failed to load model");
     eprintln!(" done — {}", model::current_model_name());
+
+    // Initialize runtime compliance policy using the loaded tokenizer
+    poly_inference::compliance::init_runtime_policy(|term| {
+        model::tokenize(term).unwrap_or_default()
+    });
+    eprintln!("Compliance policy v2 initialized (tokenizer-aware blocklist)");
     eprintln!();
 
     // Start server

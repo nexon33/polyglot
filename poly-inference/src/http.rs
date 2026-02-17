@@ -16,12 +16,13 @@
 //! - Proof is always private (ZK) — verifier learns nothing
 //! - Plaintext tokens never appear in the HTTP request or response
 
+use std::io::Read;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
-use crate::compliance::{default_policy, PolicyChecker};
-use crate::compliance_proof::ComplianceAccumulator;
+use crate::compliance::{check_prompt, default_policy};
 use crate::server::InferenceBackend;
 use poly_client::encryption::EncryptionBackend;
 use poly_client::protocol::InferRequest;
@@ -87,6 +88,10 @@ pub struct ProofSummary {
     pub code_hash: String,
     pub blinding_commitment: Option<String>,
     pub verified: bool,
+    /// Hash of the input token sequence (for I/O binding verification).
+    pub input_hash: String,
+    /// Hash of the output token sequence (for I/O binding verification).
+    pub output_hash: String,
 }
 
 /// Compliance proof summary in the response.
@@ -308,60 +313,39 @@ fn handle_generate(
         );
     }
 
+    // Pre-inference safety gate: reject jailbreak and harmful prompts
+    if let Err(rejection) = check_prompt(&req.prompt) {
+        return json_error(403, &format!("prompt rejected: {}", rejection), json_header);
+    }
+
     // Tokenize
     let token_ids = match crate::model::tokenize(&req.prompt) {
         Ok(ids) => ids,
         Err(e) => return json_error(500, &format!("tokenization failed: {e}"), json_header),
     };
 
+    if token_ids.is_empty() {
+        return json_error(400, "prompt tokenized to zero tokens", json_header);
+    }
+
     let prompt_len = token_ids.len();
     let policy = default_policy();
     let policy_version = policy.version;
 
-    // Generate tokens + execution proof based on privacy mode.
-    // For transparent mode, compliance is enforced in-loop (per-token gate).
-    // For private modes, we run the private inference and then verify compliance post-hoc.
-    let (output_tokens, exec_proof, compliance_proof) = match mode {
-        "transparent" => {
-            // In-loop compliance: generate_compliant produces both tokens and compliance proof.
-            // The execution proof comes from the compliance accumulator's IVC chain.
-            let (tokens, comp_proof) = crate::inference::generate_compliant(
-                token_ids,
-                req.max_tokens,
-                req.temperature,
-                req.seed,
-                policy,
-            );
-            (tokens, comp_proof.ivc_proof.clone(), comp_proof)
-        }
-        "private" => {
-            // Full ZK: hidden code hash, blinding commitment.
-            let verified = crate::inference::generate_private(
-                token_ids,
-                req.max_tokens,
-                req.temperature,
-                req.seed,
-            );
-            let tokens = verified.value().clone();
-            let proof = verified.proof().clone();
-            // Post-hoc compliance: verify output tokens pass policy
-            let comp_proof = run_posthoc_compliance(&tokens[prompt_len..], policy);
-            (tokens, proof, comp_proof)
-        }
-        "private_inputs" => {
-            // Selective disclosure: inputs hidden, output + code visible.
-            let verified = crate::inference::generate_private_inputs(
-                token_ids,
-                req.max_tokens,
-                req.temperature,
-                req.seed,
-            );
-            let tokens = verified.value().clone();
-            let proof = verified.proof().clone();
-            let comp_proof = run_posthoc_compliance(&tokens[prompt_len..], policy);
-            (tokens, proof, comp_proof)
-        }
-        _ => unreachable!(), // validated above
+    // Generate tokens with in-loop per-token compliance gate for ALL modes.
+    // Every token is checked against the policy before being emitted.
+    // This prevents harmful tokens from ever being generated, regardless of
+    // the privacy mode requested. The execution proof comes from the compliant
+    // generation's IVC chain.
+    let (output_tokens, exec_proof, compliance_proof) = {
+        let (tokens, comp_proof) = crate::inference::generate_compliant(
+            token_ids.clone(),
+            req.max_tokens,
+            req.temperature,
+            req.seed,
+            policy,
+        );
+        (tokens, comp_proof.ivc_proof.clone(), comp_proof)
     };
 
     // Decode
@@ -369,8 +353,12 @@ fn handle_generate(
     let completion = crate::model::decode(&output_tokens[prompt_len..]);
     let generated_tokens = output_tokens.len() - prompt_len;
 
-    // Build execution proof summary
-    let proof_summary = proof_to_summary(&exec_proof);
+    // Build execution proof summary with I/O binding
+    let proof_summary = proof_to_summary(
+        &exec_proof,
+        &token_ids,
+        &output_tokens[prompt_len..],
+    );
 
     // Build compliance summary
     let comp_verified = compliance_proof.verify().unwrap_or(false);
@@ -468,10 +456,11 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     let policy = default_policy();
     let policy_version = policy.version;
 
-    // Route through the InferenceBackend with Mode::Private (always ZK for encrypted)
-    // Wrap decrypted tokens in MockCiphertext format for the backend interface
-    let mock_ct = poly_client::encryption::MockCiphertext { tokens: token_ids };
-    let infer_request = InferRequest {
+    // Route through InferenceBackend (uses ComplianceInferenceBackend in production,
+    // MockInferenceBackend in tests). The ComplianceInferenceBackend runs generate_compliant()
+    // which enforces per-token compliance in-loop.
+    let mock_ct = poly_client::encryption::MockCiphertext { tokens: token_ids.clone() };
+    let infer_request = poly_client::protocol::InferRequest {
         model_id: "encrypted-batch".into(),
         mode: poly_client::protocol::Mode::Private,
         encrypted_input: serde_json::to_vec(&mock_ct).unwrap(),
@@ -493,18 +482,28 @@ fn handle_generate_encrypted<B: InferenceBackend>(
         };
     let output_tokens = output_ct.tokens;
     let exec_proof = infer_response.proof;
-
-    // Post-hoc compliance check on generated tokens
-    let comp_proof = run_posthoc_compliance(&output_tokens[prompt_len..], policy);
     let generated_tokens = output_tokens.len() - prompt_len;
+
+    // Post-hoc compliance attestation (the ComplianceInferenceBackend already
+    // enforced per-token compliance in-loop via generate_compliant())
+    let checker = crate::compliance::PolicyChecker::new(policy.clone());
+    let mut acc = crate::compliance_proof::ComplianceAccumulator::new(checker);
+    for &token in &output_tokens[prompt_len..] {
+        let _ = acc.check_and_fold(token);
+    }
+    let comp_proof = acc.finalize().expect("compliance finalize");
 
     // Re-encrypt output token IDs with client's CKKS public key
     let output_ckks_ct = ckks.encrypt(&output_tokens, &client_pk);
     let output_ct_bytes = serde_json::to_vec(&output_ckks_ct).unwrap();
     let encrypted_output_hex = hex::encode(&output_ct_bytes);
 
-    // Build proof summary
-    let proof_summary = proof_to_summary(&exec_proof);
+    // Build proof summary with I/O binding
+    let proof_summary = proof_to_summary(
+        &exec_proof,
+        &token_ids,
+        &output_tokens[prompt_len..],
+    );
 
     // Build compliance summary
     let comp_verified = comp_proof.verify().unwrap_or(false);
@@ -550,33 +549,28 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     )
 }
 
-/// Run compliance checking post-hoc on already-generated tokens.
-///
-/// Used for private modes where the inference function doesn't have
-/// compliance baked in. Folds each token through the compliance accumulator
-/// to produce a verifiable compliance proof.
-fn run_posthoc_compliance(
-    generated_tokens: &[u32],
-    policy: crate::compliance::ContentPolicy,
-) -> crate::compliance_proof::ComplianceProof {
-    let checker = PolicyChecker::new(policy);
-    let mut acc = ComplianceAccumulator::new(checker);
-
-    for &token in generated_tokens {
-        let _ = acc.check_and_fold(token);
-    }
-
-    acc.finalize().expect("compliance finalize")
-}
 
 /// Convert a VerifiedProof into a JSON-friendly summary.
-fn proof_to_summary(proof: &VerifiedProof) -> ProofSummary {
+///
+/// `input_tokens` and `output_tokens` are hashed and included in the summary
+/// so external verifiers can bind the proof to specific I/O.
+fn proof_to_summary(
+    proof: &VerifiedProof,
+    input_tokens: &[u32],
+    output_tokens: &[u32],
+) -> ProofSummary {
+    use poly_verified::crypto::hash::hash_data;
     use poly_verified::ivc::hash_ivc::HashIvc;
     use poly_verified::ivc::IvcBackend;
 
-    let zero = [0u8; 32];
+    // Compute deterministic I/O hashes from actual token sequences
+    let input_bytes: Vec<u8> = input_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let output_bytes: Vec<u8> = output_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let input_hash = hash_data(&input_bytes);
+    let output_hash = hash_data(&output_bytes);
+
     let backend = HashIvc;
-    let ok = backend.verify(proof, &zero, &zero).unwrap_or(false);
+    let ok = backend.verify(proof, &input_hash, &output_hash).unwrap_or(false);
 
     match proof {
         VerifiedProof::HashIvc {
@@ -599,6 +593,8 @@ fn proof_to_summary(proof: &VerifiedProof) -> ProofSummary {
             },
             blinding_commitment: blinding_commitment.map(|b| hex::encode(b)),
             verified: ok,
+            input_hash: hex::encode(input_hash),
+            output_hash: hex::encode(output_hash),
         },
         VerifiedProof::Mock { .. } => ProofSummary {
             backend: "Mock".into(),
@@ -609,15 +605,33 @@ fn proof_to_summary(proof: &VerifiedProof) -> ProofSummary {
             code_hash: String::new(),
             blinding_commitment: None,
             verified: false,
+            input_hash: hex::encode(input_hash),
+            output_hash: hex::encode(output_hash),
         },
     }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
+/// Maximum request body size: 1 MB.
+const MAX_BODY_SIZE: usize = 1_048_576;
+
 fn read_body(request: &mut tiny_http::Request) -> std::io::Result<Vec<u8>> {
+    let content_length = request.body_length().unwrap_or(0);
+    if content_length > MAX_BODY_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("body too large: {} bytes (max {})", content_length, MAX_BODY_SIZE),
+        ));
+    }
     let mut body = Vec::new();
-    request.as_reader().read_to_end(&mut body)?;
+    request.as_reader().take(MAX_BODY_SIZE as u64 + 1).read_to_end(&mut body)?;
+    if body.len() > MAX_BODY_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("body too large: {} bytes (max {})", body.len(), MAX_BODY_SIZE),
+        ));
+    }
     Ok(body)
 }
 
