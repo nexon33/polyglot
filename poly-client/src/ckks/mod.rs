@@ -16,12 +16,17 @@
 
 pub mod ciphertext;
 pub mod encoding;
+pub mod encoding_f64;
+pub mod eval_key;
+pub mod fhe_layer;
+pub mod homomorphic;
 pub mod keys;
 pub mod params;
 pub mod poly;
 pub mod sampling;
 
 pub use ciphertext::CkksCiphertext;
+pub use eval_key::CkksEvalKey;
 pub use keys::{CkksPublicKey, CkksSecretKey};
 
 use crate::encryption::EncryptionBackend;

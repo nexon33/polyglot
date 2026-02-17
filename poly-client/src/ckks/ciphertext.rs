@@ -9,9 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use super::encoding::{decode, encode};
 use super::keys::{CkksPublicKey, CkksSecretKey};
-use super::params::N;
+use super::params::{DELTA, N};
 use super::poly::Poly;
 use super::sampling::{sample_gaussian, sample_ternary};
+
+fn default_scale() -> i64 {
+    DELTA
+}
 
 /// A CKKS ciphertext encoding up to N token IDs.
 /// For sequences longer than N, multiple chunks are stored.
@@ -21,6 +25,11 @@ pub struct CkksCiphertext {
     pub chunks: Vec<(Poly, Poly)>,
     /// Total number of encoded token IDs across all chunks.
     pub token_count: usize,
+    /// Current scaling factor. Fresh ciphertexts have scale = DELTA.
+    /// After ct*ct or ct*plain multiply, scale = DELTA^2.
+    /// Decryption divides by this scale to recover the plaintext.
+    #[serde(default = "default_scale")]
+    pub scale: i64,
 }
 
 /// Encrypt a sequence of token IDs under the given public key.
@@ -32,6 +41,7 @@ pub fn encrypt<R: Rng>(tokens: &[u32], pk: &CkksPublicKey, rng: &mut R) -> CkksC
         return CkksCiphertext {
             chunks: vec![],
             token_count: 0,
+            scale: DELTA,
         };
     }
 
@@ -58,6 +68,7 @@ pub fn encrypt<R: Rng>(tokens: &[u32], pk: &CkksPublicKey, rng: &mut R) -> CkksC
     CkksCiphertext {
         chunks,
         token_count: tokens.len(),
+        scale: DELTA,
     }
 }
 

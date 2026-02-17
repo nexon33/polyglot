@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "poly-demo-e2e"
 path = "src/demo_e2e.rs"
 
+[[bin]]
+name = "poly-demo-fhe"
+path = "src/demo_fhe.rs"
+
 [dependencies]
 candle-core = "0.9"
 candle-nn = "0.9"
@@ -23,13 +27,14 @@ candle-transformers = "0.9"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 hf-hub = "0.4"
 poly-verified = { path = "../poly-verified" }
-poly-client = { path = "../poly-client" }
+poly-client = { path = "../poly-client", features = ["ckks"] }
 polyglot-macros = { path = "../polyglot-macros" }
 sha2 = "0.10"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
+rand = "0.8"
 tiny_http = "0.12"
 ureq = "3"
 

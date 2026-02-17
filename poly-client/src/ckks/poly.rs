@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::params::{N, Q};
+use super::params::{DECOMP_BASE, N, NUM_DIGITS, Q};
 
 /// A polynomial in Z_q[X]/(X^N + 1). Always has exactly N coefficients.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +68,54 @@ impl Poly {
             out[i] = mod_reduce(v as i64);
         }
         Poly { coeffs: out }
+    }
+
+    /// Rounding division of each coefficient by a divisor.
+    ///
+    /// Rounds to the nearest integer (ties to even not needed — standard rounding).
+    /// Used by rescaling after ciphertext-ciphertext multiplication.
+    pub fn div_round(&self, divisor: i64) -> Poly {
+        let half = divisor.abs() / 2;
+        let mut out = vec![0i64; N];
+        for i in 0..N {
+            let c = self.coeffs[i];
+            // Round-to-nearest: (c + sign(c)*half) / divisor
+            let rounded = if c >= 0 {
+                (c + half) / divisor
+            } else {
+                -(((-c) + half) / divisor)
+            };
+            out[i] = mod_reduce(rounded);
+        }
+        Poly { coeffs: out }
+    }
+
+    /// Decompose each coefficient into base-T digits.
+    ///
+    /// Returns `NUM_DIGITS` polynomials where digit[d] contains the d-th
+    /// base-T digit of each coefficient. Used for relinearization:
+    /// instead of multiplying by the full value, we multiply each digit
+    /// by the corresponding evaluation key component.
+    pub fn decompose_base_t(&self) -> Vec<Poly> {
+        let t = DECOMP_BASE;
+        let mut digits = vec![Poly::zero(); NUM_DIGITS];
+
+        for i in 0..N {
+            // Work with the positive representative in [0, Q)
+            let mut val = self.coeffs[i];
+            if val < 0 {
+                val += Q;
+            }
+
+            for d in 0..NUM_DIGITS {
+                let digit = val % t;
+                val /= t;
+                // Keep digit in centered range for correct arithmetic
+                digits[d].coeffs[i] = mod_reduce(digit);
+            }
+        }
+
+        digits
     }
 
     /// Negacyclic polynomial multiplication in Z_q[X]/(X^N + 1).
@@ -209,5 +257,79 @@ mod tests {
         assert_eq!(doubled.coeffs[0], 2);
         assert_eq!(doubled.coeffs[1], 4);
         assert_eq!(doubled.coeffs[2], 6);
+    }
+
+    #[test]
+    fn div_round_exact() {
+        let a = Poly::from_coeffs(vec![100, 200, -300]);
+        let result = a.div_round(100);
+        assert_eq!(result.coeffs[0], 1);
+        assert_eq!(result.coeffs[1], 2);
+        assert_eq!(result.coeffs[2], -3);
+    }
+
+    #[test]
+    fn div_round_rounds_correctly() {
+        // 150 / 100 = 1.5, rounds to 2
+        // 149 / 100 = 1.49, rounds to 1
+        // -150 / 100 = -1.5, rounds to -2
+        let a = Poly::from_coeffs(vec![150, 149, -150, -149]);
+        let result = a.div_round(100);
+        assert_eq!(result.coeffs[0], 2);
+        assert_eq!(result.coeffs[1], 1);
+        assert_eq!(result.coeffs[2], -2);
+        assert_eq!(result.coeffs[3], -1);
+    }
+
+    #[test]
+    fn div_round_by_delta() {
+        use crate::ckks::params::DELTA;
+        // Encode a value as coeff * DELTA, then div_round should recover it
+        let val = 42i64;
+        let a = Poly::from_coeffs(vec![val * DELTA]);
+        let result = a.div_round(DELTA);
+        assert_eq!(result.coeffs[0], val);
+    }
+
+    #[test]
+    fn decompose_base_t_reconstruction() {
+        use crate::ckks::params::DECOMP_BASE;
+        // A value should be reconstructable from its digits: sum(digit[d] * T^d)
+        let a = Poly::from_coeffs(vec![123456789, -987654, 42]);
+        let digits = a.decompose_base_t();
+        assert_eq!(digits.len(), NUM_DIGITS);
+
+        // Reconstruct and verify
+        for i in 0..3 {
+            let original = {
+                let v = a.coeffs[i];
+                if v < 0 { v + Q } else { v }
+            };
+            let mut reconstructed: i64 = 0;
+            let mut power: i64 = 1;
+            for d in 0..NUM_DIGITS {
+                let digit = {
+                    let v = digits[d].coeffs[i];
+                    if v < 0 { v + Q } else { v }
+                };
+                reconstructed += digit * power;
+                power *= DECOMP_BASE;
+            }
+            assert_eq!(
+                reconstructed % Q, original % Q,
+                "reconstruction failed for coeff {}: {} != {}",
+                i, reconstructed % Q, original % Q
+            );
+        }
+    }
+
+    #[test]
+    fn decompose_base_t_digit_count() {
+        let a = Poly::from_coeffs(vec![1]);
+        let digits = a.decompose_base_t();
+        assert_eq!(digits.len(), NUM_DIGITS);
+        for d in &digits {
+            assert_eq!(d.coeffs.len(), N);
+        }
     }
 }

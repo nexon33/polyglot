@@ -15,3 +15,16 @@ pub const DELTA: i64 = 1i64 << 20; // 1048576
 
 /// Standard deviation for discrete Gaussian error sampling.
 pub const SIGMA: f64 = 3.2;
+
+// ── Decomposition parameters (for relinearization) ────────────────────
+
+/// Base for digit decomposition of ciphertext polynomials.
+/// Set equal to DELTA so each digit fits in the scaling factor range.
+pub const DECOMP_BASE: i64 = DELTA; // T = 2^20
+
+/// Number of digits for base-T decomposition of values mod Q.
+/// ceil(54 / 20) = 3 digits.
+pub const NUM_DIGITS: usize = 3;
+
+/// Bit width of each decomposition digit (log2(DECOMP_BASE)).
+pub const DECOMP_BITS: u32 = 20;
