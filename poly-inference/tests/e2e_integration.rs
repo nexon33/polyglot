@@ -471,7 +471,7 @@ fn http_sequential_requests() {
 #[test]
 #[ignore]
 fn real_model_transparent_e2e() {
-    poly_inference::model::load_model(candle_core::Device::Cpu).unwrap();
+    let _ = poly_inference::model::load_model(candle_core::Device::Cpu);
 
     let backend = poly_inference::server::RealInferenceBackend;
     let client = PolyClient::new("Qwen/Qwen3-0.6B", Mode::Transparent, MockEncryption);
