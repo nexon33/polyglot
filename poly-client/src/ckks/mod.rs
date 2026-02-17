@@ -21,7 +21,10 @@ pub mod eval_key;
 pub mod fhe_layer;
 pub mod homomorphic;
 pub mod keys;
+pub mod ntt;
 pub mod params;
+pub mod rns;
+pub mod rns_ckks;
 pub mod poly;
 pub mod sampling;
 
