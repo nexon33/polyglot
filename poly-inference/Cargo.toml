@@ -20,6 +20,10 @@ path = "src/demo_e2e.rs"
 name = "poly-demo-fhe"
 path = "src/demo_fhe.rs"
 
+[[bin]]
+name = "poly-demo-fhe-e2e"
+path = "src/demo_fhe_e2e.rs"
+
 [dependencies]
 candle-core = "0.9"
 candle-nn = "0.9"
