@@ -106,7 +106,7 @@ pub struct SmtProof {
 // Global State — 7 subtrees
 // ---------------------------------------------------------------------------
 
-/// The complete chain state, composed of 7 independent Sparse Merkle Trees.
+/// The complete chain state, composed of 8 independent Sparse Merkle Trees.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GlobalState {
     pub wallets: SparseMerkleTree,
@@ -116,6 +116,7 @@ pub struct GlobalState {
     pub backups: SparseMerkleTree,
     pub stp: SparseMerkleTree,
     pub applications: SparseMerkleTree,
+    pub swaps: SparseMerkleTree,
 }
 
 impl GlobalState {
@@ -129,12 +130,13 @@ impl GlobalState {
             backups: SparseMerkleTree::new(),
             stp: SparseMerkleTree::new(),
             applications: SparseMerkleTree::new(),
+            swaps: SparseMerkleTree::new(),
         }
     }
 
-    /// Combined state root: H(wallets_root || identities_root || ... || applications_root).
+    /// Combined state root: H(wallets_root || identities_root || ... || swaps_root).
     pub fn state_root(&self) -> Hash {
-        let mut data = Vec::with_capacity(7 * 32);
+        let mut data = Vec::with_capacity(8 * 32);
         data.extend_from_slice(&self.wallets.root());
         data.extend_from_slice(&self.identities.root());
         data.extend_from_slice(&self.compliance.root());
@@ -142,6 +144,7 @@ impl GlobalState {
         data.extend_from_slice(&self.backups.root());
         data.extend_from_slice(&self.stp.root());
         data.extend_from_slice(&self.applications.root());
+        data.extend_from_slice(&self.swaps.root());
         hash_with_domain(DOMAIN_BLOCK, &data)
     }
 
@@ -226,6 +229,22 @@ impl GlobalState {
 
     pub fn get_app_state(&self, app_key: &Hash) -> Option<Hash> {
         self.applications.get(app_key).copied()
+    }
+
+    // -----------------------------------------------------------------------
+    // Swap accessors
+    // -----------------------------------------------------------------------
+
+    pub fn set_swap(&mut self, swap_id: Hash, state_hash: Hash) {
+        self.swaps.set(swap_id, state_hash);
+    }
+
+    pub fn get_swap(&self, swap_id: &Hash) -> Option<Hash> {
+        self.swaps.get(swap_id).copied()
+    }
+
+    pub fn remove_swap(&mut self, swap_id: &Hash) {
+        self.swaps.delete(swap_id);
     }
 }
 

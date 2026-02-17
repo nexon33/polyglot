@@ -49,6 +49,7 @@ pub const DOMAIN_TRANSFER: u8 = 0x13;
 pub const DOMAIN_BLOCK: u8 = 0x14;
 pub const DOMAIN_FRAUD: u8 = 0x15;
 pub const DOMAIN_STP: u8 = 0x16;
+pub const DOMAIN_SWAP: u8 = 0x17;
 
 /// Domain-separated SHA-256 hash: H(domain_byte || data).
 pub fn hash_with_domain(domain: u8, data: &[u8]) -> Hash {

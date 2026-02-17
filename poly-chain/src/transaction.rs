@@ -17,6 +17,9 @@ pub enum Transaction {
     FraudProof(FraudProofTx),
     STPAction(STPActionTx),
     AppStateUpdate(AppStateUpdate),
+    AtomicSwapInit(AtomicSwapInit),
+    AtomicSwapClaim(AtomicSwapClaim),
+    AtomicSwapRefund(AtomicSwapRefund),
 }
 
 impl Transaction {
@@ -31,6 +34,9 @@ impl Transaction {
             Transaction::FraudProof(_) => 0x06,
             Transaction::STPAction(_) => 0x07,
             Transaction::AppStateUpdate(_) => 0x08,
+            Transaction::AtomicSwapInit(_) => 0x09,
+            Transaction::AtomicSwapClaim(_) => 0x0A,
+            Transaction::AtomicSwapRefund(_) => 0x0B,
         }
     }
 
@@ -50,6 +56,9 @@ impl Transaction {
             Transaction::FraudProof(_) => None, // fraud proofs are free (rewarded)
             Transaction::STPAction(tx) => tx.fee_payer(),
             Transaction::AppStateUpdate(tx) => Some(tx.account_id),
+            Transaction::AtomicSwapInit(tx) => Some(tx.responder), // responder pays
+            Transaction::AtomicSwapClaim(tx) => Some(tx.claimer),
+            Transaction::AtomicSwapRefund(tx) => Some(tx.refundee),
         }
     }
 }
@@ -200,6 +209,94 @@ pub struct AppStateUpdate {
     pub new_state_hash: Hash,
     pub nonce: Nonce,
     pub timestamp: Timestamp,
+    pub proof: VerifiedProof,
+    #[serde(with = "crate::primitives::serde_byte64")]
+    pub signature: [u8; 64],
+}
+
+// ---------------------------------------------------------------------------
+// Atomic Swap Status
+// ---------------------------------------------------------------------------
+
+/// Status of an active atomic swap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SwapStatus {
+    Active = 0x00,
+    Claimed = 0x01,
+    Refunded = 0x02,
+}
+
+/// Compute the state hash stored in the `swaps` SMT for an active swap.
+pub fn swap_state_hash(swap: &AtomicSwapInit, status: SwapStatus) -> Hash {
+    hash_with_domain(
+        DOMAIN_SWAP,
+        &[
+            swap.initiator.as_slice(),
+            swap.responder.as_slice(),
+            &swap.amount.to_le_bytes(),
+            swap.hash_lock.as_slice(),
+            &swap.timeout.to_le_bytes(),
+            &[status as u8],
+        ]
+        .concat(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Atomic Swap Init — create a hash-time-locked swap
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AtomicSwapInit {
+    /// Unique swap ID: H(initiator || responder || nonce).
+    pub swap_id: Hash,
+    /// Party A — claims by revealing the secret (e.g., document holder).
+    pub initiator: AccountId,
+    /// Party B — locks funds, gets refund on timeout (e.g., MANA payer).
+    pub responder: AccountId,
+    /// Amount of MANA locked by the responder.
+    pub amount: Amount,
+    /// Hash lock: H(secret). Claim requires revealing the preimage.
+    pub hash_lock: Hash,
+    /// Block height after which the responder can refund.
+    pub timeout: BlockHeight,
+    /// Output Merkle root from selective disclosure (optional).
+    pub disclosure_root: Option<Hash>,
+    /// Execution proof from verified inference (optional).
+    pub execution_proof: Option<VerifiedProof>,
+    pub nonce: Nonce,
+    pub timestamp: Timestamp,
+    pub proof: VerifiedProof,
+    #[serde(with = "crate::primitives::serde_byte64")]
+    pub signature: [u8; 64],
+}
+
+// ---------------------------------------------------------------------------
+// Atomic Swap Claim — reveal secret, receive funds
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AtomicSwapClaim {
+    pub swap_id: Hash,
+    /// The preimage: H(secret) must equal the swap's hash_lock.
+    pub secret: Hash,
+    /// Must be the initiator.
+    pub claimer: AccountId,
+    pub proof: VerifiedProof,
+    #[serde(with = "crate::primitives::serde_byte64")]
+    pub signature: [u8; 64],
+}
+
+// ---------------------------------------------------------------------------
+// Atomic Swap Refund — reclaim funds after timeout
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AtomicSwapRefund {
+    pub swap_id: Hash,
+    /// Must be the responder (who locked the funds).
+    pub refundee: AccountId,
     pub proof: VerifiedProof,
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],

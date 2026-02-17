@@ -41,6 +41,11 @@ impl FeeSchedule {
     pub fn app_state_update_fee() -> Amount {
         100 // 0.01 MANA
     }
+
+    /// Fee for creating an atomic swap.
+    pub fn atomic_swap_fee() -> Amount {
+        100 // 0.01 MANA
+    }
 }
 
 #[cfg(test)]

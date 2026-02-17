@@ -17,6 +17,7 @@
 //! - [`MockIvc`](ivc::mock_ivc::MockIvc) — Testing backend
 
 pub mod crypto;
+pub mod disclosure;
 pub mod error;
 pub mod fixed_point;
 pub mod ivc;
@@ -28,6 +29,9 @@ pub mod verified_type;
 
 /// Prelude: commonly used types for verified execution.
 pub mod prelude {
+    pub use crate::disclosure::{
+        create_disclosure, create_disclosure_range, verify_disclosure, DisclosedToken, Disclosure,
+    };
     pub use crate::error::VerifiedError;
     pub use crate::fixed_point::FixedPoint;
     pub use crate::ivc::hash_ivc::HashIvc;

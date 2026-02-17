@@ -39,7 +39,10 @@ pub mod prelude {
         ServiceContract,
     };
     pub use crate::state::GlobalState;
-    pub use crate::transaction::Transaction;
+    pub use crate::transaction::{
+        AtomicSwapClaim, AtomicSwapInit, AtomicSwapRefund, SwapStatus, Transaction,
+        swap_state_hash,
+    };
     pub use crate::validation::validate_transaction;
     pub use crate::wallet::{WalletState, WalletStateCommitment};
 }

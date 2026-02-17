@@ -1,6 +1,9 @@
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 
-use crate::error::VerifiedError;
+use crate::disclosure::{self, Disclosure};
+use crate::error::{self, VerifiedError};
 use crate::types::{PrivacyMode, VerifiedProof};
 
 /// A value produced by verified execution, carrying a mathematical proof
@@ -77,6 +80,34 @@ impl<T> Verified<T> {
             value: f(self.value),
             proof: self.proof,
         }
+    }
+}
+
+/// Selective disclosure methods for verified token sequences.
+impl Verified<Vec<u32>> {
+    /// Create a selective disclosure revealing only the specified token positions.
+    ///
+    /// Unrevealed positions carry leaf-hash commitments. The verifier can
+    /// confirm revealed tokens are genuine without seeing redacted ones.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let result: Verified<Vec<u32>> = generate_verified(input, 50, 700, 42);
+    /// let pharmacist_view = result.disclose(&[8, 9, 10])?;
+    /// let insurer_view = result.disclose(&[15])?;
+    /// ```
+    pub fn disclose(&self, indices: &[usize]) -> error::Result<Disclosure> {
+        disclosure::create_disclosure(self, indices)
+    }
+
+    /// Create a selective disclosure for a contiguous range of token positions.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let pharmacist_view = result.disclose_range(8..11)?;
+    /// ```
+    pub fn disclose_range(&self, range: Range<usize>) -> error::Result<Disclosure> {
+        disclosure::create_disclosure_range(self, range)
     }
 }
 

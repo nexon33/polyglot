@@ -45,6 +45,21 @@ pub enum ChainError {
     #[error("stp error: {0}")]
     STPError(String),
 
+    #[error("swap not found: {0}")]
+    SwapNotFound(String),
+
+    #[error("swap already exists: {0}")]
+    SwapAlreadyExists(String),
+
+    #[error("swap not expired yet")]
+    SwapNotExpired,
+
+    #[error("swap has expired")]
+    SwapExpired,
+
+    #[error("invalid hash preimage")]
+    InvalidPreimage,
+
     #[error("proof system error: {0}")]
     ProofSystem(#[from] poly_verified::error::ProofSystemError),
 }

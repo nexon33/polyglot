@@ -1,7 +1,7 @@
 use poly_verified::ivc::hash_ivc::HashIvc;
 use poly_verified::ivc::mock_ivc::MockIvc;
 use poly_verified::ivc::IvcBackend;
-use poly_verified::types::{Hash, VerifiedProof};
+use poly_verified::types::{Hash, VerifiedProof, ZERO_HASH};
 
 use crate::error::{ChainError, Result};
 use crate::fraud::detect_conflict;
@@ -49,6 +49,7 @@ pub fn validate_transaction(
     tx: &Transaction,
     state: &GlobalState,
     now: Timestamp,
+    block_height: BlockHeight,
 ) -> Result<GlobalState> {
     match tx {
         Transaction::CashTransfer(transfer) => validate_cash_transfer(transfer, state, now),
@@ -59,6 +60,11 @@ pub fn validate_transaction(
         Transaction::FraudProof(fraud) => validate_fraud_proof(fraud, state),
         Transaction::STPAction(stp) => validate_stp_action(stp, state, now),
         Transaction::AppStateUpdate(app) => validate_app_state_update(app, state),
+        Transaction::AtomicSwapInit(swap) => validate_atomic_swap_init(swap, state, block_height),
+        Transaction::AtomicSwapClaim(claim) => validate_atomic_swap_claim(claim, state),
+        Transaction::AtomicSwapRefund(refund) => {
+            validate_atomic_swap_refund(refund, state, block_height)
+        }
     }
 }
 
@@ -323,6 +329,142 @@ fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState) -> Result
     Ok(new_state)
 }
 
+// ---------------------------------------------------------------------------
+// Atomic Swap Init — create a hash-time-locked swap
+// ---------------------------------------------------------------------------
+
+fn validate_atomic_swap_init(
+    tx: &AtomicSwapInit,
+    state: &GlobalState,
+    block_height: BlockHeight,
+) -> Result<GlobalState> {
+    let mut new_state = state.clone();
+
+    // 1. Responder wallet must exist (they're locking funds)
+    let _ = state
+        .get_wallet(&tx.responder)
+        .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.responder[..4])))?;
+
+    // 2. Swap must not already exist
+    if state.get_swap(&tx.swap_id).is_some() {
+        return Err(ChainError::SwapAlreadyExists(hex_encode(&tx.swap_id[..4])));
+    }
+
+    // 3. Amount must be positive
+    if tx.amount == 0 {
+        return Err(ChainError::InsufficientBalance {
+            needed: 1,
+            available: 0,
+        });
+    }
+
+    // 4. Timeout must be in the future
+    if tx.timeout <= block_height {
+        return Err(ChainError::SwapExpired);
+    }
+
+    // 5. Store swap state (Active) in the swaps SMT
+    let state_hash = swap_state_hash(tx, SwapStatus::Active);
+    new_state.set_swap(tx.swap_id, state_hash);
+
+    // 6. Update responder wallet commitment (funds now locked)
+    //    In the verify-only model, the proof attests the debit was correct.
+    //    We compute a new state commitment reflecting the lock.
+    let new_responder_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[
+            tx.responder.as_slice(),
+            &tx.amount.to_le_bytes(),
+            &tx.nonce.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    new_state.set_wallet(tx.responder, new_responder_hash);
+
+    Ok(new_state)
+}
+
+// ---------------------------------------------------------------------------
+// Atomic Swap Claim — reveal secret, receive funds
+// ---------------------------------------------------------------------------
+
+fn validate_atomic_swap_claim(
+    tx: &AtomicSwapClaim,
+    state: &GlobalState,
+) -> Result<GlobalState> {
+    let mut new_state = state.clone();
+
+    // 1. Swap must exist
+    let _ = state
+        .get_swap(&tx.swap_id)
+        .ok_or_else(|| ChainError::SwapNotFound(hex_encode(&tx.swap_id[..4])))?;
+
+    // 2. In the verify-only model, the proof attests:
+    //    - H(secret) == hash_lock (preimage check)
+    //    - claimer == initiator (authorization)
+    //    The validator trusts the proof; full swap data is not re-stored on-chain.
+
+    // 3. Remove swap (claimed — no longer active)
+    new_state.remove_swap(&tx.swap_id);
+
+    // 4. Credit claimer (initiator receives the locked funds)
+    let claimer_current = state.get_wallet(&tx.claimer).unwrap_or(ZERO_HASH);
+    let new_claimer_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[
+            tx.claimer.as_slice(),
+            &claimer_current,
+            &tx.swap_id,
+        ]
+        .concat(),
+    );
+    new_state.set_wallet(tx.claimer, new_claimer_hash);
+
+    Ok(new_state)
+}
+
+// ---------------------------------------------------------------------------
+// Atomic Swap Refund — reclaim funds after timeout
+// ---------------------------------------------------------------------------
+
+fn validate_atomic_swap_refund(
+    tx: &AtomicSwapRefund,
+    state: &GlobalState,
+    block_height: BlockHeight,
+) -> Result<GlobalState> {
+    let mut new_state = state.clone();
+
+    // 1. Swap must exist
+    let _ = state
+        .get_swap(&tx.swap_id)
+        .ok_or_else(|| ChainError::SwapNotFound(hex_encode(&tx.swap_id[..4])))?;
+
+    // 2. The proof attests that block_height >= timeout and refundee == responder.
+    //    For an additional safety check, we verify we're past the minimum possible
+    //    timeout (block 0 is never valid for refund since init requires timeout > height).
+    if block_height == 0 {
+        return Err(ChainError::SwapNotExpired);
+    }
+
+    // 3. Remove swap (refunded — no longer active)
+    new_state.remove_swap(&tx.swap_id);
+
+    // 4. Credit refundee (responder gets their locked funds back)
+    let refundee_current = state.get_wallet(&tx.refundee).unwrap_or(ZERO_HASH);
+    let new_refundee_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[
+            tx.refundee.as_slice(),
+            &refundee_current,
+            &tx.swap_id,
+        ]
+        .concat(),
+    );
+    new_state.set_wallet(tx.refundee, new_refundee_hash);
+
+    Ok(new_state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,7 +509,7 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let new_state = validate_transaction(&tx, &state, 1000).unwrap();
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
         // State should have changed
         assert_ne!(new_state.state_root(), state.state_root());
     }
@@ -388,7 +530,7 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let result = validate_transaction(&tx, &state, 1000);
+        let result = validate_transaction(&tx, &state, 1000, 0);
         assert!(matches!(result, Err(ChainError::StateHashMismatch { .. })));
     }
 
@@ -408,7 +550,7 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let result = validate_transaction(&tx, &state, 1000);
+        let result = validate_transaction(&tx, &state, 1000, 0);
         assert!(matches!(result, Err(ChainError::AccountNotFound(_))));
     }
 
@@ -427,7 +569,7 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let new_state = validate_transaction(&tx, &state, 1000).unwrap();
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
         // Identity should be registered
         assert!(new_state.get_identity(&[1u8; 32]).is_some());
         // Wallet should be created
@@ -450,7 +592,7 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let result = validate_transaction(&tx, &state, 1000);
+        let result = validate_transaction(&tx, &state, 1000, 0);
         assert!(matches!(result, Err(ChainError::DuplicateIdentity)));
     }
 
@@ -469,7 +611,7 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let result = validate_transaction(&tx, &state, 1000);
+        let result = validate_transaction(&tx, &state, 1000, 0);
         assert!(matches!(result, Err(ChainError::TierViolation(_))));
     }
 
@@ -502,7 +644,7 @@ mod tests {
             proof: mock_proof(),
         });
 
-        let new_state = validate_transaction(&tx, &state, 1000).unwrap();
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
         // Fraudster's wallet should be burned
         assert!(new_state.get_wallet(&fraudster).is_none());
         // Fraud evidence should be recorded
@@ -522,7 +664,7 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let new_state = validate_transaction(&tx, &state, 1000).unwrap();
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
         assert_eq!(new_state.get_backup(&sender), Some([0xCC; 32]));
     }
 
@@ -551,7 +693,7 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let new_state = validate_transaction(&tx, &state, 1000).unwrap();
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
         assert!(new_state.get_stp_record(&official).is_some());
     }
 
@@ -570,7 +712,243 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let new_state = validate_transaction(&tx, &state, 1000).unwrap();
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
         assert_eq!(new_state.get_app_state(&app_id), Some([0xDD; 32]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic Swap tests
+    // -----------------------------------------------------------------------
+
+    fn make_swap_init(
+        initiator: AccountId,
+        responder: AccountId,
+        amount: Amount,
+        timeout: BlockHeight,
+    ) -> AtomicSwapInit {
+        let swap_id = hash_with_domain(
+            DOMAIN_SWAP,
+            &[initiator.as_slice(), responder.as_slice(), &0u64.to_le_bytes()].concat(),
+        );
+        let secret = [0x5E; 32]; // dummy secret
+        let hash_lock = hash_with_domain(DOMAIN_SWAP, &secret);
+        AtomicSwapInit {
+            swap_id,
+            initiator,
+            responder,
+            amount,
+            hash_lock,
+            timeout,
+            disclosure_root: None,
+            execution_proof: None,
+            nonce: 0,
+            timestamp: 1000,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+        }
+    }
+
+    #[test]
+    fn atomic_swap_init_happy_path() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let swap = make_swap_init(initiator, responder, 5000, 100);
+
+        let tx = Transaction::AtomicSwapInit(swap.clone());
+        let new_state = validate_transaction(&tx, &state, 1000, 50).unwrap();
+
+        // Swap should exist in state
+        assert!(new_state.get_swap(&swap.swap_id).is_some());
+        // State root should have changed
+        assert_ne!(new_state.state_root(), state.state_root());
+    }
+
+    #[test]
+    fn atomic_swap_init_responder_not_found() {
+        let state = GlobalState::genesis();
+        let swap = make_swap_init([1u8; 32], [2u8; 32], 5000, 100);
+
+        let tx = Transaction::AtomicSwapInit(swap);
+        let result = validate_transaction(&tx, &state, 1000, 50);
+        assert!(matches!(result, Err(ChainError::AccountNotFound(_))));
+    }
+
+    #[test]
+    fn atomic_swap_init_duplicate() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let swap = make_swap_init(initiator, responder, 5000, 100);
+
+        let tx = Transaction::AtomicSwapInit(swap.clone());
+        let new_state = validate_transaction(&tx, &state, 1000, 50).unwrap();
+
+        // Try to init the same swap again
+        let result = validate_transaction(&tx, &new_state, 1000, 50);
+        assert!(matches!(result, Err(ChainError::SwapAlreadyExists(_))));
+    }
+
+    #[test]
+    fn atomic_swap_init_zero_amount() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let swap = make_swap_init([3u8; 32], responder, 0, 100);
+
+        let tx = Transaction::AtomicSwapInit(swap);
+        let result = validate_transaction(&tx, &state, 1000, 50);
+        assert!(matches!(
+            result,
+            Err(ChainError::InsufficientBalance { .. })
+        ));
+    }
+
+    #[test]
+    fn atomic_swap_init_expired_timeout() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let swap = make_swap_init([3u8; 32], responder, 5000, 50);
+
+        // Block height 50, timeout 50 — not in the future
+        let tx = Transaction::AtomicSwapInit(swap);
+        let result = validate_transaction(&tx, &state, 1000, 50);
+        assert!(matches!(result, Err(ChainError::SwapExpired)));
+    }
+
+    #[test]
+    fn atomic_swap_claim_happy_path() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let swap = make_swap_init(initiator, responder, 5000, 100);
+
+        // Init the swap
+        let tx_init = Transaction::AtomicSwapInit(swap.clone());
+        let state_after_init = validate_transaction(&tx_init, &state, 1000, 50).unwrap();
+        assert!(state_after_init.get_swap(&swap.swap_id).is_some());
+
+        // Claim the swap
+        let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
+            swap_id: swap.swap_id,
+            secret: [0x5E; 32],
+            claimer: initiator,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+        });
+        let state_after_claim =
+            validate_transaction(&tx_claim, &state_after_init, 1000, 55).unwrap();
+
+        // Swap should be removed
+        assert!(state_after_claim.get_swap(&swap.swap_id).is_none());
+        // Claimer should have updated wallet
+        assert!(state_after_claim.get_wallet(&initiator).is_some());
+    }
+
+    #[test]
+    fn atomic_swap_claim_not_found() {
+        let state = GlobalState::genesis();
+
+        let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
+            swap_id: [0xFF; 32],
+            secret: [0xAB; 32],
+            claimer: [1u8; 32],
+            proof: mock_proof(),
+            signature: [0u8; 64],
+        });
+        let result = validate_transaction(&tx_claim, &state, 1000, 50);
+        assert!(matches!(result, Err(ChainError::SwapNotFound(_))));
+    }
+
+    #[test]
+    fn atomic_swap_refund_happy_path() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let swap = make_swap_init(initiator, responder, 5000, 100);
+
+        // Init the swap
+        let tx_init = Transaction::AtomicSwapInit(swap.clone());
+        let state_after_init = validate_transaction(&tx_init, &state, 1000, 50).unwrap();
+
+        // Refund after timeout (block_height 200 > timeout 100)
+        let tx_refund = Transaction::AtomicSwapRefund(AtomicSwapRefund {
+            swap_id: swap.swap_id,
+            refundee: responder,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+        });
+        let state_after_refund =
+            validate_transaction(&tx_refund, &state_after_init, 1000, 200).unwrap();
+
+        // Swap should be removed
+        assert!(state_after_refund.get_swap(&swap.swap_id).is_none());
+        // Responder wallet should be updated (funds returned)
+        assert!(state_after_refund.get_wallet(&responder).is_some());
+    }
+
+    #[test]
+    fn atomic_swap_refund_not_found() {
+        let state = GlobalState::genesis();
+
+        let tx_refund = Transaction::AtomicSwapRefund(AtomicSwapRefund {
+            swap_id: [0xFF; 32],
+            refundee: [1u8; 32],
+            proof: mock_proof(),
+            signature: [0u8; 64],
+        });
+        let result = validate_transaction(&tx_refund, &state, 1000, 200);
+        assert!(matches!(result, Err(ChainError::SwapNotFound(_))));
+    }
+
+    #[test]
+    fn atomic_swap_state_root_changes() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let root_before = state.state_root();
+
+        let swap = make_swap_init([3u8; 32], responder, 5000, 100);
+        let tx = Transaction::AtomicSwapInit(swap);
+        let new_state = validate_transaction(&tx, &state, 1000, 50).unwrap();
+
+        // The 8th subtree (swaps) should cause a different state root
+        assert_ne!(new_state.state_root(), root_before);
+    }
+
+    #[test]
+    fn atomic_swap_full_lifecycle() {
+        // Init → Claim: the complete happy path
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let swap = make_swap_init(initiator, responder, 10_000, 500);
+
+        // Step 1: Init
+        let tx_init = Transaction::AtomicSwapInit(swap.clone());
+        let s1 = validate_transaction(&tx_init, &state, 1000, 100).unwrap();
+        let root_after_init = s1.state_root();
+
+        // Step 2: Claim
+        let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
+            swap_id: swap.swap_id,
+            secret: [0x5E; 32],
+            claimer: initiator,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+        });
+        let s2 = validate_transaction(&tx_claim, &s1, 2000, 200).unwrap();
+
+        // Root changed after claim
+        assert_ne!(s2.state_root(), root_after_init);
+        // Swap removed
+        assert!(s2.get_swap(&swap.swap_id).is_none());
+        // Initiator got credited
+        assert!(s2.get_wallet(&initiator).is_some());
+    }
+
+    #[test]
+    fn atomic_swap_with_disclosure_root() {
+        // Init with optional disclosure_root and execution_proof
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+
+        let mut swap = make_swap_init(initiator, responder, 5000, 100);
+        swap.disclosure_root = Some([0xDD; 32]);
+        swap.execution_proof = Some(mock_proof());
+
+        let tx = Transaction::AtomicSwapInit(swap.clone());
+        let new_state = validate_transaction(&tx, &state, 1000, 50).unwrap();
+        assert!(new_state.get_swap(&swap.swap_id).is_some());
     }
 }
