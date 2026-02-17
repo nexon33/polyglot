@@ -2,22 +2,110 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
+use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use candle_transformers::models::quantized_qwen3;
 use candle_transformers::models::qwen3::{Config, Model, ModelForCausalLM};
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 
-pub static MODEL: OnceLock<Mutex<ModelForCausalLM>> = OnceLock::new();
+// ═══════════════════════════════════════════════════════════════════════════
+// Model abstraction — supports both full-precision and GGUF quantized models
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Unified model type that dispatches to either full-precision or quantized inference.
+pub enum ModelKind {
+    FullPrecision(ModelForCausalLM),
+    Quantized(quantized_qwen3::ModelWeights),
+}
+
+impl ModelKind {
+    pub fn forward(&mut self, input: &Tensor, offset: usize) -> candle_core::Result<Tensor> {
+        match self {
+            ModelKind::FullPrecision(m) => m.forward(input, offset),
+            ModelKind::Quantized(m) => m.forward(input, offset),
+        }
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        match self {
+            ModelKind::FullPrecision(m) => m.clear_kv_cache(),
+            ModelKind::Quantized(m) => m.clear_kv_cache(),
+        }
+    }
+
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, ModelKind::Quantized(_))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Model catalog
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct ModelSpec {
+    pub name: &'static str,
+    pub display_name: &'static str,
+    pub base_repo: &'static str,
+    pub weights_repo: &'static str,
+    pub weights_file: &'static str,
+    pub quantized: bool,
+    pub size_hint: &'static str,
+}
+
+pub const MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        name: "0.6b",
+        display_name: "Qwen3-0.6B (full precision)",
+        base_repo: "Qwen/Qwen3-0.6B",
+        weights_repo: "Qwen/Qwen3-0.6B",
+        weights_file: "model.safetensors",
+        quantized: false,
+        size_hint: "~1.2 GB",
+    },
+    ModelSpec {
+        name: "8b-q4",
+        display_name: "Qwen3-8B Q4_K_M (quantized)",
+        base_repo: "Qwen/Qwen3-8B",
+        weights_repo: "Qwen/Qwen3-8B-GGUF",
+        weights_file: "Qwen3-8B-Q4_K_M.gguf",
+        quantized: true,
+        size_hint: "~5 GB",
+    },
+    ModelSpec {
+        name: "32b-q4",
+        display_name: "Qwen3-32B Q4_K_M (quantized)",
+        base_repo: "Qwen/Qwen3-32B",
+        weights_repo: "Qwen/Qwen3-32B-GGUF",
+        weights_file: "Qwen3-32B-Q4_K_M.gguf",
+        quantized: true,
+        size_hint: "~20 GB VRAM",
+    },
+];
+
+pub fn get_model_spec(name: &str) -> Option<&'static ModelSpec> {
+    MODELS.iter().find(|m| m.name == name)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Global statics
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub static MODEL: OnceLock<Mutex<ModelKind>> = OnceLock::new();
+/// Base model (full-precision only) for hidden state extraction in FHE demos.
 pub static BASE_MODEL: OnceLock<Mutex<Model>> = OnceLock::new();
 pub static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
 pub static DEVICE: OnceLock<Device> = OnceLock::new();
 pub static WEIGHTS_PATH: OnceLock<PathBuf> = OnceLock::new();
 pub static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// Cached embed_tokens/lm_head weight tensor [vocab_size, hidden_dim] in F32.
+/// Only populated for full-precision models.
 pub static EMBED_TENSOR: OnceLock<Tensor> = OnceLock::new();
+/// Which model is currently loaded.
+pub static MODEL_NAME: OnceLock<String> = OnceLock::new();
 
-const MODEL_ID: &str = "Qwen/Qwen3-0.6B";
+const DEFAULT_MODEL: &str = "0.6b";
 
 /// Wrap a user message in Qwen3 chat template for instruct-tuned models.
 ///
@@ -32,55 +120,114 @@ pub fn format_chat_prompt(user_message: &str) -> String {
     )
 }
 
-pub fn load_model(device: Device) -> Result<()> {
+/// Load only the tokenizer (no model weights, no GPU).
+///
+/// Used by the CLI client which only needs to tokenize/decode — not run inference.
+/// Downloads the tokenizer from HuggingFace Hub if not cached.
+/// All Qwen3 models share the same tokenizer, so we always pull from the 0.6B repo.
+pub fn load_tokenizer_only() -> Result<()> {
+    if TOKENIZER.get().is_some() {
+        return Ok(()); // already loaded
+    }
     let api = Api::new()?;
-    let repo = api.model(MODEL_ID.to_string());
-
-    eprintln!("      Downloading from {MODEL_ID}...");
-    let config_path = repo.get("config.json")?;
+    let spec = get_model_spec(DEFAULT_MODEL).unwrap();
+    let repo = api.model(spec.base_repo.to_string());
     let tokenizer_path = repo.get("tokenizer.json")?;
-    let weights_path = repo.get("model.safetensors")?;
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow!("tokenizer load: {e}"))?;
+    TOKENIZER
+        .set(tokenizer)
+        .map_err(|_| anyhow!("tokenizer already loaded"))?;
+    Ok(())
+}
 
-    // Parse config
-    let config_text = std::fs::read_to_string(&config_path)?;
-    let config: Config = serde_json::from_str(&config_text)?;
+/// Load the default model (Qwen3-0.6B full precision).
+pub fn load_model(device: Device) -> Result<()> {
+    load_model_by_name(DEFAULT_MODEL, device)
+}
 
-    // Load tokenizer
+/// Load a model by name from the catalog.
+///
+/// Supported names: "0.6b", "8b-q4", "32b-q4"
+pub fn load_model_by_name(name: &str, device: Device) -> Result<()> {
+    let spec = get_model_spec(name)
+        .ok_or_else(|| anyhow!("unknown model {:?} — available: {}", name,
+            MODELS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")))?;
+
+    eprintln!("      Model: {} ({})", spec.display_name, spec.size_hint);
+
+    let api = Api::new()?;
+
+    // Download tokenizer from base repo
+    let base_repo = api.model(spec.base_repo.to_string());
+    eprintln!("      Downloading tokenizer from {}...", spec.base_repo);
+    let tokenizer_path = base_repo.get("tokenizer.json")?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("tokenizer load: {e}"))?;
 
-    // Load model weights
+    let model_kind = if spec.quantized {
+        load_quantized(spec, &api, &device)?
+    } else {
+        load_full_precision(spec, &api, &device)?
+    };
+
+    DEVICE.set(device).map_err(|_| anyhow!("device already set"))?;
+    MODEL.set(Mutex::new(model_kind)).map_err(|_| anyhow!("model already loaded"))?;
+    TOKENIZER.set(tokenizer).map_err(|_| anyhow!("tokenizer already loaded"))?;
+    MODEL_NAME.set(spec.display_name.to_string()).ok();
+
+    Ok(())
+}
+
+/// Return the display name of the currently loaded model.
+pub fn current_model_name() -> &'static str {
+    MODEL_NAME.get().map(|s| s.as_str()).unwrap_or("(not loaded)")
+}
+
+/// Load full-precision safetensors model (e.g., Qwen3-0.6B).
+fn load_full_precision(spec: &ModelSpec, api: &Api, device: &Device) -> Result<ModelKind> {
+    let repo = api.model(spec.weights_repo.to_string());
+    eprintln!("      Downloading weights from {}...", spec.weights_repo);
+    let config_path = repo.get("config.json")?;
+    let weights_path = repo.get(spec.weights_file)?;
+
+    let config_text = std::fs::read_to_string(&config_path)?;
+    let config: Config = serde_json::from_str(&config_text)?;
+
     let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], dtype, &device)? };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], dtype, device)? };
     let model = ModelForCausalLM::new(&config, vb)?;
 
-    // Cache paths and embedding tensor for direct access
+    // Cache paths and embedding tensor for FHE demos
     CONFIG_PATH.set(config_path).ok();
     WEIGHTS_PATH.set(weights_path.clone()).ok();
-    let raw_tensors = candle_core::safetensors::load(&weights_path, &device)?;
+    let raw_tensors = candle_core::safetensors::load(&weights_path, device)?;
     if let Some(embed) = raw_tensors.get("model.embed_tokens.weight") {
         let embed_f32 = embed.to_dtype(DType::F32)?;
         EMBED_TENSOR.set(embed_f32).ok();
     }
 
-    // Load base model (without lm_head) for hidden state extraction with KV cache
-    let vb2 = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], dtype, &device)? };
+    // Load base model for hidden state extraction (FHE demos)
+    let vb2 = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], dtype, device)? };
     let base_model = Model::new(&config, vb2)?;
+    BASE_MODEL.set(Mutex::new(base_model)).ok();
 
-    DEVICE
-        .set(device)
-        .map_err(|_| anyhow!("device already set"))?;
-    MODEL
-        .set(Mutex::new(model))
-        .map_err(|_| anyhow!("model already loaded"))?;
-    BASE_MODEL
-        .set(Mutex::new(base_model))
-        .map_err(|_| anyhow!("base model already loaded"))?;
-    TOKENIZER
-        .set(tokenizer)
-        .map_err(|_| anyhow!("tokenizer already loaded"))?;
+    Ok(ModelKind::FullPrecision(model))
+}
 
-    Ok(())
+/// Load GGUF quantized model (e.g., Qwen3-32B Q4_K_M).
+fn load_quantized(spec: &ModelSpec, api: &Api, device: &Device) -> Result<ModelKind> {
+    let repo = api.model(spec.weights_repo.to_string());
+    eprintln!("      Downloading GGUF from {} / {}...", spec.weights_repo, spec.weights_file);
+    let gguf_path = repo.get(spec.weights_file)?;
+
+    eprintln!("      Loading quantized model...");
+    let mut file = std::fs::File::open(&gguf_path)?;
+    let content = gguf_file::Content::read(&mut file)
+        .map_err(|e| anyhow!("GGUF read: {e}"))?;
+    let model = quantized_qwen3::ModelWeights::from_gguf(content, &mut file, device)?;
+
+    Ok(ModelKind::Quantized(model))
 }
 
 pub fn tokenize(text: &str) -> Result<Vec<u32>> {

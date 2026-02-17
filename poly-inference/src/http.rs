@@ -1,33 +1,195 @@
 //! HTTP transport for the inference server.
 //!
-//! Wraps `tiny_http` to serve inference requests over HTTP.
-//! Single endpoint: `POST /infer` with JSON body.
+//! Three endpoints:
+//! - `POST /infer`              — Full protocol (encrypted input, proof, encrypted output)
+//! - `POST /generate`           — Simple batch: prompt in, text + proof out
+//! - `POST /generate/encrypted` — Encrypted batch: CKKS-encrypted tokens in, encrypted tokens out
+//!
+//! The `/generate` endpoint supports privacy modes:
+//! - `"transparent"` (default) — verifier sees input hash, output hash, code hash
+//! - `"private"` — full ZK: verifier learns nothing except proof validity
+//! - `"private_inputs"` — selective disclosure: verifier sees output + code, inputs hidden
+//!
+//! The `/generate/encrypted` endpoint provides full end-to-end encryption:
+//! - Client encrypts token IDs with server's CKKS public key
+//! - Server decrypts, runs inference, re-encrypts output with client's CKKS public key
+//! - Proof is always private (ZK) — verifier learns nothing
+//! - Plaintext tokens never appear in the HTTP request or response
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
+use crate::compliance::{default_policy, PolicyChecker};
+use crate::compliance_proof::ComplianceAccumulator;
 use crate::server::InferenceBackend;
+use poly_client::encryption::EncryptionBackend;
 use poly_client::protocol::InferRequest;
+use poly_verified::types::VerifiedProof;
 
-/// HTTP inference server.
+// ─── Simple batch request/response types ─────────────────────────────────
+
+/// Simple generation request. Prompt, parameters, and optional privacy mode.
+///
+/// ```json
+/// {"prompt": "The capital of France is", "max_tokens": 10}
+/// {"prompt": "Medical record...", "max_tokens": 50, "mode": "private"}
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct GenerateRequest {
+    pub prompt: String,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: u32,
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+    /// Privacy mode for the execution proof.
+    /// - `"transparent"` (default): verifier sees input/output/code hashes
+    /// - `"private"`: full ZK — verifier learns nothing except proof validity
+    /// - `"private_inputs"`: selective disclosure — inputs hidden, output visible
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_max_tokens() -> u32 { 50 }
+fn default_temperature() -> u32 { 700 }
+fn default_seed() -> u64 { 42 }
+fn default_mode() -> String { "transparent".into() }
+
+/// Simple generation response. Text, tokens, execution proof, and compliance proof.
+#[derive(Debug, Serialize)]
+pub struct GenerateResponse {
+    /// The full generated text (prompt + completion).
+    pub text: String,
+    /// Just the completion (without prompt).
+    pub completion: String,
+    /// All token IDs (prompt + generated).
+    pub tokens: Vec<u32>,
+    /// Number of new tokens generated.
+    pub generated_tokens: usize,
+    /// Privacy mode used for the execution proof.
+    pub mode: String,
+    /// Execution proof (HashIvc).
+    pub proof: ProofSummary,
+    /// Compliance proof summary.
+    pub compliance: ComplianceSummary,
+}
+
+/// Execution proof summary.
+#[derive(Debug, Serialize)]
+pub struct ProofSummary {
+    pub backend: String,
+    pub privacy_mode: String,
+    pub chain_tip: String,
+    pub merkle_root: String,
+    pub step_count: u64,
+    pub code_hash: String,
+    pub blinding_commitment: Option<String>,
+    pub verified: bool,
+}
+
+/// Compliance proof summary in the response.
+#[derive(Debug, Serialize)]
+pub struct ComplianceSummary {
+    pub verified: bool,
+    pub total_tokens: u64,
+    pub compliant_tokens: u64,
+    pub all_compliant: bool,
+    pub policy_version: u32,
+    pub policy_hash: String,
+    pub ivc_chain_tip: String,
+    pub ivc_merkle_root: String,
+    pub ivc_steps: u64,
+}
+
+// ─── Encrypted batch request/response types ─────────────────────────────
+
+/// Encrypted generation request. Token IDs encrypted with CKKS.
+///
+/// The client encrypts their token IDs with the server's CKKS public key,
+/// and provides their own public key so the server can encrypt the response.
+///
+/// ```json
+/// {
+///   "encrypted_input": "<hex-encoded CkksCiphertext>",
+///   "client_public_key": "<hex-encoded CkksPublicKey>",
+///   "max_tokens": 50,
+///   "temperature": 700,
+///   "seed": 42
+/// }
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct EncryptedGenerateRequest {
+    /// Hex-encoded serialized `CkksCiphertext` containing encrypted token IDs.
+    pub encrypted_input: String,
+    /// Hex-encoded serialized `CkksPublicKey` for encrypting the response.
+    pub client_public_key: String,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: u32,
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+}
+
+/// Encrypted generation response. Output tokens encrypted with client's CKKS key.
+#[derive(Debug, Serialize)]
+pub struct EncryptedGenerateResponse {
+    /// Hex-encoded serialized `CkksCiphertext` containing encrypted output token IDs.
+    pub encrypted_output: String,
+    /// Number of new tokens generated.
+    pub generated_tokens: usize,
+    /// Total tokens (prompt + generated).
+    pub total_tokens: usize,
+    /// Execution proof (always private/ZK for encrypted mode).
+    pub proof: ProofSummary,
+    /// Compliance proof summary.
+    pub compliance: ComplianceSummary,
+}
+
+/// Server's CKKS public key (returned by GET /pubkey).
+#[derive(Debug, Serialize)]
+pub struct ServerPublicKey {
+    /// Hex-encoded serialized `CkksPublicKey`.
+    pub public_key: String,
+}
+
+// ─── HTTP Server ─────────────────────────────────────────────────────────
+
+use poly_client::ckks::{CkksCiphertext, CkksPublicKey, CkksSecretKey, CkksEncryption};
+
+/// HTTP inference server with CKKS key pair for encrypted inference.
 pub struct HttpServer {
     server: Server,
+    /// Server's CKKS public key (clients encrypt input with this).
+    server_pk: CkksPublicKey,
+    /// Server's CKKS secret key (server decrypts input with this).
+    server_sk: CkksSecretKey,
 }
 
 impl HttpServer {
     /// Create a new HTTP server bound to the given address.
     ///
+    /// Generates a fresh CKKS key pair for encrypted inference.
     /// Address format: "127.0.0.1:8080" or "0.0.0.0:3000".
     pub fn new(addr: &str) -> Result<Self> {
         let server =
             Server::http(addr).map_err(|e| anyhow::anyhow!("failed to bind {}: {}", addr, e))?;
-        Ok(Self { server })
+        let ckks = CkksEncryption;
+        let (pk, sk) = ckks.keygen();
+        Ok(Self { server, server_pk: pk, server_sk: sk })
     }
 
-    /// Serve inference requests indefinitely.
+    /// Get the server's CKKS public key (hex-encoded, for clients).
+    pub fn server_public_key_hex(&self) -> String {
+        hex::encode(serde_json::to_vec(&self.server_pk).unwrap())
+    }
+
+    /// Serve requests indefinitely (all endpoints).
     pub fn serve<B: InferenceBackend>(&self, backend: &B) {
         for mut request in self.server.incoming_requests() {
-            let response = handle_request(&mut request, backend);
+            let response = handle_request(&mut request, backend, &self.server_pk, &self.server_sk);
             let _ = request.respond(response);
         }
     }
@@ -38,7 +200,7 @@ impl HttpServer {
             .server
             .recv()
             .map_err(|e| anyhow::anyhow!("recv failed: {}", e))?;
-        let response = handle_request(&mut request, backend);
+        let response = handle_request(&mut request, backend, &self.server_pk, &self.server_sk);
         request
             .respond(response)
             .map_err(|e| anyhow::anyhow!("respond failed: {}", e))?;
@@ -51,72 +213,60 @@ impl HttpServer {
     }
 }
 
+// ─── Request routing ─────────────────────────────────────────────────────
+
 fn handle_request<B: InferenceBackend>(
     request: &mut tiny_http::Request,
     backend: &B,
+    server_pk: &CkksPublicKey,
+    server_sk: &CkksSecretKey,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     let json_header =
         Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
 
-    // Only POST /infer is valid
+    // GET /pubkey returns the server's CKKS public key
+    if request.url() == "/pubkey" {
+        let pk_hex = hex::encode(serde_json::to_vec(server_pk).unwrap());
+        let resp = ServerPublicKey { public_key: pk_hex };
+        let body = serde_json::to_vec(&resp).unwrap();
+        return Response::new(
+            StatusCode(200),
+            vec![json_header],
+            std::io::Cursor::new(body),
+            None,
+            None,
+        );
+    }
+
     if request.method() != &Method::Post {
-        return Response::new(
-            StatusCode(405),
-            vec![json_header],
-            std::io::Cursor::new(
-                serde_json::to_vec(&serde_json::json!({"error": "method not allowed"})).unwrap(),
-            ),
-            None,
-            None,
-        );
+        return json_error(405, "method not allowed", json_header);
     }
 
-    if request.url() != "/infer" {
-        return Response::new(
-            StatusCode(404),
-            vec![json_header],
-            std::io::Cursor::new(
-                serde_json::to_vec(&serde_json::json!({"error": "not found"})).unwrap(),
-            ),
-            None,
-            None,
-        );
+    match request.url() {
+        "/infer" => handle_infer(request, backend, json_header),
+        "/generate" => handle_generate(request, json_header),
+        "/generate/encrypted" => handle_generate_encrypted(request, backend, server_sk, json_header),
+        _ => json_error(404, "not found", json_header),
     }
+}
 
-    // Read and parse request body
-    let mut body = Vec::new();
-    if let Err(e) = request.as_reader().read_to_end(&mut body) {
-        return Response::new(
-            StatusCode(400),
-            vec![json_header],
-            std::io::Cursor::new(
-                serde_json::to_vec(&serde_json::json!({"error": format!("read error: {}", e)}))
-                    .unwrap(),
-            ),
-            None,
-            None,
-        );
-    }
+// ─── POST /infer — full protocol ─────────────────────────────────────────
+
+fn handle_infer<B: InferenceBackend>(
+    request: &mut tiny_http::Request,
+    backend: &B,
+    json_header: Header,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let body = match read_body(request) {
+        Ok(b) => b,
+        Err(e) => return json_error(400, &format!("read error: {e}"), json_header),
+    };
 
     let infer_request: InferRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
-        Err(e) => {
-            return Response::new(
-                StatusCode(400),
-                vec![json_header],
-                std::io::Cursor::new(
-                    serde_json::to_vec(
-                        &serde_json::json!({"error": format!("invalid JSON: {}", e)}),
-                    )
-                    .unwrap(),
-                ),
-                None,
-                None,
-            );
-        }
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}"), json_header),
     };
 
-    // Run inference
     match backend.infer(&infer_request) {
         Ok(response) => {
             let response_body = serde_json::to_vec(&response).unwrap();
@@ -128,17 +278,361 @@ fn handle_request<B: InferenceBackend>(
                 None,
             )
         }
-        Err(e) => Response::new(
-            StatusCode(500),
-            vec![json_header],
-            std::io::Cursor::new(
-                serde_json::to_vec(
-                    &serde_json::json!({"error": format!("inference failed: {}", e)}),
-                )
-                .unwrap(),
-            ),
-            None,
-            None,
-        ),
+        Err(e) => json_error(500, &format!("inference failed: {e}"), json_header),
     }
+}
+
+// ─── POST /generate — simple batch ───────────────────────────────────────
+
+fn handle_generate(
+    request: &mut tiny_http::Request,
+    json_header: Header,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let body = match read_body(request) {
+        Ok(b) => b,
+        Err(e) => return json_error(400, &format!("read error: {e}"), json_header),
+    };
+
+    let req: GenerateRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}"), json_header),
+    };
+
+    // Validate mode
+    let mode = req.mode.as_str();
+    if !matches!(mode, "transparent" | "private" | "private_inputs") {
+        return json_error(
+            400,
+            &format!("invalid mode {:?}: expected transparent, private, or private_inputs", mode),
+            json_header,
+        );
+    }
+
+    // Tokenize
+    let token_ids = match crate::model::tokenize(&req.prompt) {
+        Ok(ids) => ids,
+        Err(e) => return json_error(500, &format!("tokenization failed: {e}"), json_header),
+    };
+
+    let prompt_len = token_ids.len();
+    let policy = default_policy();
+    let policy_version = policy.version;
+
+    // Generate tokens + execution proof based on privacy mode.
+    // For transparent mode, compliance is enforced in-loop (per-token gate).
+    // For private modes, we run the private inference and then verify compliance post-hoc.
+    let (output_tokens, exec_proof, compliance_proof) = match mode {
+        "transparent" => {
+            // In-loop compliance: generate_compliant produces both tokens and compliance proof.
+            // The execution proof comes from the compliance accumulator's IVC chain.
+            let (tokens, comp_proof) = crate::inference::generate_compliant(
+                token_ids,
+                req.max_tokens,
+                req.temperature,
+                req.seed,
+                policy,
+            );
+            (tokens, comp_proof.ivc_proof.clone(), comp_proof)
+        }
+        "private" => {
+            // Full ZK: hidden code hash, blinding commitment.
+            let verified = crate::inference::generate_private(
+                token_ids,
+                req.max_tokens,
+                req.temperature,
+                req.seed,
+            );
+            let tokens = verified.value().clone();
+            let proof = verified.proof().clone();
+            // Post-hoc compliance: verify output tokens pass policy
+            let comp_proof = run_posthoc_compliance(&tokens[prompt_len..], policy);
+            (tokens, proof, comp_proof)
+        }
+        "private_inputs" => {
+            // Selective disclosure: inputs hidden, output + code visible.
+            let verified = crate::inference::generate_private_inputs(
+                token_ids,
+                req.max_tokens,
+                req.temperature,
+                req.seed,
+            );
+            let tokens = verified.value().clone();
+            let proof = verified.proof().clone();
+            let comp_proof = run_posthoc_compliance(&tokens[prompt_len..], policy);
+            (tokens, proof, comp_proof)
+        }
+        _ => unreachable!(), // validated above
+    };
+
+    // Decode
+    let text = crate::model::decode(&output_tokens);
+    let completion = crate::model::decode(&output_tokens[prompt_len..]);
+    let generated_tokens = output_tokens.len() - prompt_len;
+
+    // Build execution proof summary
+    let proof_summary = proof_to_summary(&exec_proof);
+
+    // Build compliance summary
+    let comp_verified = compliance_proof.verify().unwrap_or(false);
+    let (comp_tip, comp_root, comp_steps) = match &compliance_proof.ivc_proof {
+        VerifiedProof::HashIvc {
+            chain_tip,
+            merkle_root,
+            step_count,
+            ..
+        } => (
+            hex::encode(chain_tip),
+            hex::encode(merkle_root),
+            *step_count,
+        ),
+        _ => (String::new(), String::new(), 0),
+    };
+
+    let resp = GenerateResponse {
+        text,
+        completion,
+        tokens: output_tokens,
+        generated_tokens,
+        mode: req.mode,
+        proof: proof_summary,
+        compliance: ComplianceSummary {
+            verified: comp_verified,
+            total_tokens: compliance_proof.total_tokens,
+            compliant_tokens: compliance_proof.compliant_tokens,
+            all_compliant: compliance_proof.all_compliant(),
+            policy_version,
+            policy_hash: hex::encode(compliance_proof.policy_hash),
+            ivc_chain_tip: comp_tip,
+            ivc_merkle_root: comp_root,
+            ivc_steps: comp_steps,
+        },
+    };
+
+    let response_body = serde_json::to_vec(&resp).unwrap();
+    Response::new(
+        StatusCode(200),
+        vec![json_header],
+        std::io::Cursor::new(response_body),
+        None,
+        None,
+    )
+}
+
+// ─── POST /generate/encrypted — CKKS encrypted batch ────────────────────
+
+fn handle_generate_encrypted<B: InferenceBackend>(
+    request: &mut tiny_http::Request,
+    backend: &B,
+    server_sk: &CkksSecretKey,
+    json_header: Header,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let body = match read_body(request) {
+        Ok(b) => b,
+        Err(e) => return json_error(400, &format!("read error: {e}"), json_header),
+    };
+
+    let req: EncryptedGenerateRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}"), json_header),
+    };
+
+    // Decode hex → bytes → deserialize CKKS ciphertext
+    let ct_bytes = match hex::decode(&req.encrypted_input) {
+        Ok(b) => b,
+        Err(e) => return json_error(400, &format!("invalid hex in encrypted_input: {e}"), json_header),
+    };
+    let input_ct: CkksCiphertext = match serde_json::from_slice(&ct_bytes) {
+        Ok(ct) => ct,
+        Err(e) => return json_error(400, &format!("invalid CkksCiphertext: {e}"), json_header),
+    };
+
+    // Decode client's public key (for encrypting the response)
+    let client_pk_bytes = match hex::decode(&req.client_public_key) {
+        Ok(b) => b,
+        Err(e) => return json_error(400, &format!("invalid hex in client_public_key: {e}"), json_header),
+    };
+    let client_pk: CkksPublicKey = match serde_json::from_slice(&client_pk_bytes) {
+        Ok(pk) => pk,
+        Err(e) => return json_error(400, &format!("invalid CkksPublicKey: {e}"), json_header),
+    };
+
+    // Decrypt input token IDs using server's secret key
+    let ckks = CkksEncryption;
+    let token_ids = ckks.decrypt(&input_ct, server_sk);
+
+    if token_ids.is_empty() {
+        return json_error(400, "encrypted input decoded to zero tokens", json_header);
+    }
+
+    let prompt_len = token_ids.len();
+    let policy = default_policy();
+    let policy_version = policy.version;
+
+    // Route through the InferenceBackend with Mode::Private (always ZK for encrypted)
+    // Wrap decrypted tokens in MockCiphertext format for the backend interface
+    let mock_ct = poly_client::encryption::MockCiphertext { tokens: token_ids };
+    let infer_request = InferRequest {
+        model_id: "encrypted-batch".into(),
+        mode: poly_client::protocol::Mode::Private,
+        encrypted_input: serde_json::to_vec(&mock_ct).unwrap(),
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        seed: req.seed,
+    };
+
+    let infer_response = match backend.infer(&infer_request) {
+        Ok(resp) => resp,
+        Err(e) => return json_error(500, &format!("inference failed: {e}"), json_header),
+    };
+
+    // Extract output tokens from backend response
+    let output_ct: poly_client::encryption::MockCiphertext =
+        match serde_json::from_slice(&infer_response.encrypted_output) {
+            Ok(ct) => ct,
+            Err(e) => return json_error(500, &format!("output decode failed: {e}"), json_header),
+        };
+    let output_tokens = output_ct.tokens;
+    let exec_proof = infer_response.proof;
+
+    // Post-hoc compliance check on generated tokens
+    let comp_proof = run_posthoc_compliance(&output_tokens[prompt_len..], policy);
+    let generated_tokens = output_tokens.len() - prompt_len;
+
+    // Re-encrypt output token IDs with client's CKKS public key
+    let output_ckks_ct = ckks.encrypt(&output_tokens, &client_pk);
+    let output_ct_bytes = serde_json::to_vec(&output_ckks_ct).unwrap();
+    let encrypted_output_hex = hex::encode(&output_ct_bytes);
+
+    // Build proof summary
+    let proof_summary = proof_to_summary(&exec_proof);
+
+    // Build compliance summary
+    let comp_verified = comp_proof.verify().unwrap_or(false);
+    let (comp_tip, comp_root, comp_steps) = match &comp_proof.ivc_proof {
+        VerifiedProof::HashIvc {
+            chain_tip,
+            merkle_root,
+            step_count,
+            ..
+        } => (
+            hex::encode(chain_tip),
+            hex::encode(merkle_root),
+            *step_count,
+        ),
+        _ => (String::new(), String::new(), 0),
+    };
+
+    let resp = EncryptedGenerateResponse {
+        encrypted_output: encrypted_output_hex,
+        generated_tokens,
+        total_tokens: output_tokens.len(),
+        proof: proof_summary,
+        compliance: ComplianceSummary {
+            verified: comp_verified,
+            total_tokens: comp_proof.total_tokens,
+            compliant_tokens: comp_proof.compliant_tokens,
+            all_compliant: comp_proof.all_compliant(),
+            policy_version,
+            policy_hash: hex::encode(comp_proof.policy_hash),
+            ivc_chain_tip: comp_tip,
+            ivc_merkle_root: comp_root,
+            ivc_steps: comp_steps,
+        },
+    };
+
+    let response_body = serde_json::to_vec(&resp).unwrap();
+    Response::new(
+        StatusCode(200),
+        vec![json_header],
+        std::io::Cursor::new(response_body),
+        None,
+        None,
+    )
+}
+
+/// Run compliance checking post-hoc on already-generated tokens.
+///
+/// Used for private modes where the inference function doesn't have
+/// compliance baked in. Folds each token through the compliance accumulator
+/// to produce a verifiable compliance proof.
+fn run_posthoc_compliance(
+    generated_tokens: &[u32],
+    policy: crate::compliance::ContentPolicy,
+) -> crate::compliance_proof::ComplianceProof {
+    let checker = PolicyChecker::new(policy);
+    let mut acc = ComplianceAccumulator::new(checker);
+
+    for &token in generated_tokens {
+        let _ = acc.check_and_fold(token);
+    }
+
+    acc.finalize().expect("compliance finalize")
+}
+
+/// Convert a VerifiedProof into a JSON-friendly summary.
+fn proof_to_summary(proof: &VerifiedProof) -> ProofSummary {
+    use poly_verified::ivc::hash_ivc::HashIvc;
+    use poly_verified::ivc::IvcBackend;
+
+    let zero = [0u8; 32];
+    let backend = HashIvc;
+    let ok = backend.verify(proof, &zero, &zero).unwrap_or(false);
+
+    match proof {
+        VerifiedProof::HashIvc {
+            chain_tip,
+            merkle_root,
+            step_count,
+            code_hash,
+            privacy_mode,
+            blinding_commitment,
+        } => ProofSummary {
+            backend: "HashIvc".into(),
+            privacy_mode: format!("{:?}", privacy_mode),
+            chain_tip: hex::encode(chain_tip),
+            merkle_root: hex::encode(merkle_root),
+            step_count: *step_count,
+            code_hash: if *code_hash == [0u8; 32] {
+                "(hidden)".into()
+            } else {
+                hex::encode(code_hash)
+            },
+            blinding_commitment: blinding_commitment.map(|b| hex::encode(b)),
+            verified: ok,
+        },
+        VerifiedProof::Mock { .. } => ProofSummary {
+            backend: "Mock".into(),
+            privacy_mode: "mock".into(),
+            chain_tip: String::new(),
+            merkle_root: String::new(),
+            step_count: 0,
+            code_hash: String::new(),
+            blinding_commitment: None,
+            verified: false,
+        },
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+fn read_body(request: &mut tiny_http::Request) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    request.as_reader().read_to_end(&mut body)?;
+    Ok(body)
+}
+
+fn json_error(
+    status: u16,
+    message: &str,
+    json_header: Header,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::new(
+        StatusCode(status),
+        vec![json_header],
+        std::io::Cursor::new(
+            serde_json::to_vec(&serde_json::json!({"error": message})).unwrap(),
+        ),
+        None,
+        None,
+    )
 }

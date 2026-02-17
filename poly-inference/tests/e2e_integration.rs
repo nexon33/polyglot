@@ -465,6 +465,193 @@ fn http_sequential_requests() {
 }
 
 // ===========================================================================
+// POST /generate endpoint tests
+// ===========================================================================
+
+#[test]
+fn http_generate_bad_json() {
+    let server = HttpServer::new("127.0.0.1:0").unwrap();
+    let addr = server.addr();
+    let backend = MockInferenceBackend::default();
+
+    let handle = thread::spawn(move || {
+        server.handle_one(&backend).unwrap();
+    });
+
+    let url = format!("http://{}/generate", addr);
+    let resp = ureq::post(&url)
+        .content_type("application/json")
+        .send("not json");
+
+    // Should get 400 for invalid JSON
+    match resp {
+        Err(ureq::Error::StatusCode(400)) => {} // expected
+        other => panic!("expected 400, got: {:?}", other),
+    }
+
+    handle.join().unwrap();
+}
+
+#[test]
+fn http_generate_missing_prompt() {
+    let server = HttpServer::new("127.0.0.1:0").unwrap();
+    let addr = server.addr();
+    let backend = MockInferenceBackend::default();
+
+    let handle = thread::spawn(move || {
+        server.handle_one(&backend).unwrap();
+    });
+
+    let url = format!("http://{}/generate", addr);
+    let resp = ureq::post(&url)
+        .content_type("application/json")
+        .send(r#"{"max_tokens": 10}"#);
+
+    // Should get 400 — prompt is required
+    match resp {
+        Err(ureq::Error::StatusCode(400)) => {}
+        other => panic!("expected 400, got: {:?}", other),
+    }
+
+    handle.join().unwrap();
+}
+
+// ===========================================================================
+// POST /generate/encrypted endpoint tests
+// ===========================================================================
+
+#[test]
+fn http_get_pubkey() {
+    let server = HttpServer::new("127.0.0.1:0").unwrap();
+    let addr = server.addr();
+    let backend = MockInferenceBackend::default();
+
+    let handle = thread::spawn(move || {
+        server.handle_one(&backend).unwrap();
+    });
+
+    let url = format!("http://{}/pubkey", addr);
+    let mut resp = ureq::get(&url).call().unwrap();
+    let body = resp.body_mut().read_to_string().unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(parsed["public_key"].is_string());
+    let pk_hex = parsed["public_key"].as_str().unwrap();
+    assert!(!pk_hex.is_empty());
+
+    // Verify it's valid hex → valid CkksPublicKey
+    let pk_bytes = hex::decode(pk_hex).unwrap();
+    let _pk: poly_client::ckks::CkksPublicKey = serde_json::from_slice(&pk_bytes).unwrap();
+
+    handle.join().unwrap();
+}
+
+#[test]
+fn http_encrypted_roundtrip() {
+    use poly_client::encryption::EncryptionBackend;
+    use poly_client::ckks::CkksEncryption;
+
+    let server = HttpServer::new("127.0.0.1:0").unwrap();
+    let addr = server.addr();
+
+    // Get server's public key hex for encrypting our input
+    let server_pk_hex = server.server_public_key_hex();
+
+    // Client generates its own key pair (for response encryption)
+    let ckks = CkksEncryption;
+    let (client_pk, client_sk) = ckks.keygen();
+    let client_pk_hex = hex::encode(serde_json::to_vec(&client_pk).unwrap());
+
+    // Client encrypts some token IDs with server's public key
+    let server_pk_bytes = hex::decode(&server_pk_hex).unwrap();
+    let server_pk: poly_client::ckks::CkksPublicKey =
+        serde_json::from_slice(&server_pk_bytes).unwrap();
+    let input_tokens: Vec<u32> = vec![100, 200, 300];
+    let input_ct = ckks.encrypt(&input_tokens, &server_pk);
+    let input_ct_hex = hex::encode(serde_json::to_vec(&input_ct).unwrap());
+
+    let backend = MockInferenceBackend::default();
+    let handle = thread::spawn(move || {
+        server.handle_one(&backend).unwrap();
+    });
+
+    // POST /generate/encrypted
+    let url = format!("http://{}/generate/encrypted", addr);
+    let req_body = serde_json::json!({
+        "encrypted_input": input_ct_hex,
+        "client_public_key": client_pk_hex,
+        "max_tokens": 10,
+        "temperature": 700,
+        "seed": 42,
+    });
+
+    let mut resp = ureq::post(&url)
+        .content_type("application/json")
+        .send(&serde_json::to_string(&req_body).unwrap())
+        .unwrap();
+
+    let resp_body = resp.body_mut().read_to_string().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
+
+    // Response should have encrypted_output, proof, compliance
+    assert!(parsed["encrypted_output"].is_string());
+    assert!(parsed["proof"].is_object());
+    assert!(parsed["compliance"].is_object());
+    assert!(parsed["generated_tokens"].is_number());
+    assert!(parsed["total_tokens"].is_number());
+
+    // Proof should be private (ZK)
+    assert_eq!(parsed["proof"]["privacy_mode"].as_str().unwrap(), "Private");
+    assert!(parsed["proof"]["verified"].as_bool().unwrap());
+
+    // Decrypt the output
+    let output_ct_hex = parsed["encrypted_output"].as_str().unwrap();
+    let output_ct_bytes = hex::decode(output_ct_hex).unwrap();
+    let output_ct: poly_client::ckks::CkksCiphertext =
+        serde_json::from_slice(&output_ct_bytes).unwrap();
+    let output_tokens = ckks.decrypt(&output_ct, &client_sk);
+
+    // Output should contain input tokens + generated tokens
+    let total = parsed["total_tokens"].as_u64().unwrap() as usize;
+    assert_eq!(output_tokens.len(), total);
+    // First tokens should be the input
+    assert_eq!(&output_tokens[..3], &[100, 200, 300]);
+    // Should have generated new tokens
+    assert!(output_tokens.len() > 3);
+
+    handle.join().unwrap();
+}
+
+#[test]
+fn http_encrypted_bad_ciphertext() {
+    let server = HttpServer::new("127.0.0.1:0").unwrap();
+    let addr = server.addr();
+    let backend = MockInferenceBackend::default();
+
+    let handle = thread::spawn(move || {
+        server.handle_one(&backend).unwrap();
+    });
+
+    let url = format!("http://{}/generate/encrypted", addr);
+    let req_body = serde_json::json!({
+        "encrypted_input": "not_valid_hex!!!",
+        "client_public_key": "deadbeef",
+        "max_tokens": 10,
+    });
+
+    let resp = ureq::post(&url)
+        .content_type("application/json")
+        .send(&serde_json::to_string(&req_body).unwrap());
+
+    match resp {
+        Err(ureq::Error::StatusCode(400)) => {}
+        other => panic!("expected 400, got: {:?}", other),
+    }
+
+    handle.join().unwrap();
+}
+
+// ===========================================================================
 // Real model tests (heavy, require model download)
 // ===========================================================================
 

@@ -16,6 +16,40 @@ fn is_eos(token_id: u32) -> bool {
     EOS_TOKENS.contains(&token_id)
 }
 
+/// Extract last-position logits as a 1D [vocab_size] tensor.
+///
+/// Handles different output shapes from full-precision vs quantized models:
+/// - [batch, seq_len, vocab_size] → narrow last position → squeeze → [vocab_size]
+/// - [batch, vocab_size] → squeeze batch → [vocab_size]
+/// - [vocab_size] → as-is
+fn last_position_logits(logits: &Tensor) -> Tensor {
+    match logits.rank() {
+        3 => {
+            // [batch, seq_len, vocab_size] — full-precision model
+            let seq_len = logits.dim(1).unwrap();
+            logits
+                .narrow(1, seq_len - 1, 1).unwrap()
+                .squeeze(1).unwrap()
+                .squeeze(0).unwrap()
+                .to_dtype(DType::F32).unwrap()
+        }
+        2 => {
+            // [batch, vocab_size] or [seq_len, vocab_size]
+            // Take the last row (last position / last batch element)
+            let n = logits.dim(0).unwrap();
+            logits
+                .narrow(0, n - 1, 1).unwrap()
+                .squeeze(0).unwrap()
+                .to_dtype(DType::F32).unwrap()
+        }
+        1 => {
+            // Already [vocab_size]
+            logits.to_dtype(DType::F32).unwrap()
+        }
+        r => panic!("unexpected logits rank: {r}"),
+    }
+}
+
 /// Core generation logic. Extracted as a macro to avoid duplicating
 /// the body between generate() and generate_verified().
 macro_rules! generate_body {
@@ -41,17 +75,7 @@ macro_rules! generate_body {
             .unsqueeze(0)
             .unwrap();
         let logits = model.forward(&input_tensor, 0).unwrap();
-        // logits shape: [1, seq_len, vocab_size] — take last position
-        let seq_len = logits.dim(1).unwrap();
-        let logits = logits
-            .narrow(1, seq_len - 1, 1)
-            .unwrap()
-            .squeeze(1)
-            .unwrap()
-            .squeeze(0)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap();
+        let logits = last_position_logits(&logits);
 
         let mut next_token = logits_processor.sample(&logits).unwrap();
         if is_eos(next_token) {
@@ -67,13 +91,7 @@ macro_rules! generate_body {
                 .unsqueeze(0)
                 .unwrap();
             let logits = model.forward(&input, pos).unwrap();
-            let logits = logits
-                .squeeze(0)
-                .unwrap()
-                .squeeze(0)
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap();
+            let logits = last_position_logits(&logits);
 
             next_token = logits_processor.sample(&logits).unwrap();
             if is_eos(next_token) {
@@ -169,16 +187,7 @@ pub fn generate_compliant(
         .unsqueeze(0)
         .unwrap();
     let logits = model.forward(&input_tensor, 0).unwrap();
-    let seq_len = logits.dim(1).unwrap();
-    let logits = logits
-        .narrow(1, seq_len - 1, 1)
-        .unwrap()
-        .squeeze(1)
-        .unwrap()
-        .squeeze(0)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap();
+    let logits = last_position_logits(&logits);
 
     let mut next_token = logits_processor.sample(&logits).unwrap();
     if is_eos(next_token) {
@@ -211,13 +220,7 @@ pub fn generate_compliant(
             .unsqueeze(0)
             .unwrap();
         let logits = model.forward(&input, pos).unwrap();
-        let logits = logits
-            .squeeze(0)
-            .unwrap()
-            .squeeze(0)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap();
+        let logits = last_position_logits(&logits);
 
         next_token = logits_processor.sample(&logits).unwrap();
         if is_eos(next_token) {

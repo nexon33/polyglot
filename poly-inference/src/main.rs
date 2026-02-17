@@ -1,4 +1,6 @@
 use poly_inference::{inference, model};
+use poly_inference::http::HttpServer;
+use poly_inference::server::ComplianceInferenceBackend;
 
 use std::time::Instant;
 
@@ -67,23 +69,46 @@ fn time_verified(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let prompt = args.get(1).map(|s| s.as_str()).unwrap_or("The capital of France is");
-    let max_tokens: u32 = args
+
+    // Parse --model flag (can appear anywhere)
+    let mut model_name = "0.6b".to_string();
+    let mut filtered_args: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--model" {
+            i += 1;
+            if let Some(name) = args.get(i) {
+                model_name = name.clone();
+            }
+        } else {
+            filtered_args.push(args[i].clone());
+        }
+        i += 1;
+    }
+
+    // --serve [addr]: run as HTTP server with POST /generate endpoint
+    if filtered_args.get(1).map(|s| s.as_str()) == Some("--serve") {
+        let addr = filtered_args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1:3000");
+        run_server(addr, &model_name);
+        return;
+    }
+
+    let prompt = filtered_args.get(1).map(|s| s.as_str()).unwrap_or("The capital of France is");
+    let max_tokens: u32 = filtered_args
         .get(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    let temperature: u32 = args
+    let temperature: u32 = filtered_args
         .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(700);
-    let seed: u64 = args
+    let seed: u64 = filtered_args
         .get(4)
         .and_then(|s| s.parse().ok())
         .unwrap_or(42);
 
     eprintln!();
-    eprintln!("=== Poly Verified Inference \u{2014} Qwen3 0.6B ===");
-    eprintln!("Model:       Qwen/Qwen3-0.6B");
+    eprintln!("=== Poly Verified Inference ===");
     eprintln!("Prompt:      \"{}\"", prompt);
     eprintln!("Max tokens:  {}", max_tokens);
     eprintln!("Temperature: {:.1}", temperature as f64 / 1000.0);
@@ -95,7 +120,7 @@ fn main() {
     let t0 = Instant::now();
     let device = candle_core::Device::cuda_if_available(0).unwrap_or(candle_core::Device::Cpu);
     eprintln!("      Device: {}", if device.is_cuda() { "CUDA (GPU)" } else { "CPU" });
-    model::load_model(device).expect("failed to load model");
+    model::load_model_by_name(&model_name, device).expect("failed to load model");
     let load_time = t0.elapsed();
     eprintln!(" done ({:.1}s)", load_time.as_secs_f64());
 
@@ -189,7 +214,7 @@ fn main() {
 
     // JSON to stdout
     let json = serde_json::json!({
-        "model": "Qwen/Qwen3-0.6B",
+        "model": model::current_model_name(),
         "prompt": prompt,
         "determinism": all_match,
         "runs": {
@@ -229,4 +254,64 @@ fn proof_json(proof: &VerifiedProof) -> serde_json::Value {
         }
         VerifiedProof::Mock { .. } => serde_json::json!({"mock": true}),
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// --serve mode: HTTP server with POST /generate
+// ═══════════════════════════════════════════════════════════════════════
+
+fn run_server(addr: &str, model_name: &str) {
+    eprintln!();
+    eprintln!("=== Poly Inference Server ===");
+    eprintln!();
+
+    // Load model
+    eprint!("Loading model...");
+    let device = candle_core::Device::cuda_if_available(0).unwrap_or(candle_core::Device::Cpu);
+    eprintln!(" ({})", if device.is_cuda() { "CUDA" } else { "CPU" });
+    model::load_model_by_name(model_name, device).expect("failed to load model");
+    eprintln!(" done — {}", model::current_model_name());
+    eprintln!();
+
+    // Start server
+    let backend = ComplianceInferenceBackend::with_default_policy();
+    let server = HttpServer::new(addr).expect("failed to start server");
+    let bound = server.addr();
+
+    eprintln!("Listening on http://{}", bound);
+    eprintln!("CKKS public key: {}...{}", &server.server_public_key_hex()[..16], &server.server_public_key_hex()[server.server_public_key_hex().len()-8..]);
+    eprintln!();
+    eprintln!("Endpoints:");
+    eprintln!("  POST /generate            - Simple batch: prompt in, text + proof out");
+    eprintln!("  POST /generate/encrypted  - Encrypted batch: CKKS tokens in, CKKS tokens out");
+    eprintln!("  POST /infer               - Full protocol: encrypted input, proof, encrypted output");
+    eprintln!("  GET  /pubkey              - Server's CKKS public key (for encrypted mode)");
+    eprintln!();
+    eprintln!("Privacy modes for /generate:");
+    eprintln!("  transparent     - (default) verifier sees input/output/code hashes");
+    eprintln!("  private         - full ZK: verifier learns nothing except proof validity");
+    eprintln!("  private_inputs  - selective disclosure: inputs hidden, output visible");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  # Simple batch (plaintext)");
+    eprintln!("  curl -X POST http://{}/generate \\", bound);
+    eprintln!("    -H 'Content-Type: application/json' \\");
+    eprintln!("    -d '{{\"prompt\": \"The capital of France is\", \"max_tokens\": 10}}'");
+    eprintln!();
+    eprintln!("  # Private mode (ZK proof)");
+    eprintln!("  curl -X POST http://{}/generate \\", bound);
+    eprintln!("    -H 'Content-Type: application/json' \\");
+    eprintln!("    -d '{{\"prompt\": \"Patient record...\", \"max_tokens\": 50, \"mode\": \"private\"}}'");
+    eprintln!();
+    eprintln!("  # Get server's CKKS public key (for encrypted mode)");
+    eprintln!("  curl http://{}/pubkey", bound);
+    eprintln!();
+    eprintln!("  # Encrypted batch (CKKS end-to-end encryption)");
+    eprintln!("  # 1. GET /pubkey to get server's public key");
+    eprintln!("  # 2. Encrypt token IDs with server's CKKS public key");
+    eprintln!("  # 3. POST /generate/encrypted with encrypted_input + your public key");
+    eprintln!("  # 4. Decrypt response with your CKKS secret key");
+    eprintln!();
+
+    server.serve(&backend);
 }
