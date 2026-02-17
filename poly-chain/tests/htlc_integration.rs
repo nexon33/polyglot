@@ -87,6 +87,35 @@ fn init_swap(state: &GlobalState, swap: &AtomicSwapInit, block_height: BlockHeig
     validate_transaction(&tx, state, 1000, block_height).unwrap()
 }
 
+fn make_claim(swap: &AtomicSwapInit) -> AtomicSwapClaim {
+    AtomicSwapClaim {
+        swap_id: swap.swap_id,
+        secret: [0x5E; 32],
+        claimer: swap.initiator,
+        original_initiator: swap.initiator,
+        original_responder: swap.responder,
+        original_amount: swap.amount,
+        original_hash_lock: swap.hash_lock,
+        original_timeout: swap.timeout,
+        proof: mock_proof(),
+        signature: [0u8; 64],
+    }
+}
+
+fn make_refund(swap: &AtomicSwapInit) -> AtomicSwapRefund {
+    AtomicSwapRefund {
+        swap_id: swap.swap_id,
+        refundee: swap.responder,
+        original_initiator: swap.initiator,
+        original_responder: swap.responder,
+        original_amount: swap.amount,
+        original_hash_lock: swap.hash_lock,
+        original_timeout: swap.timeout,
+        proof: mock_proof(),
+        signature: [0u8; 64],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Race conditions: claim/refund ordering
 // ---------------------------------------------------------------------------
@@ -100,23 +129,12 @@ fn claim_after_refund_fails() {
     let s1 = init_swap(&state, &swap, 50);
 
     // Refund at block 200 (after timeout)
-    let tx_refund = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-        swap_id: swap.swap_id,
-        refundee: bob,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_refund = Transaction::AtomicSwapRefund(make_refund(&swap));
     let s2 = validate_transaction(&tx_refund, &s1, 1000, 200).unwrap();
     assert!(s2.get_swap(&swap.swap_id).is_none());
 
     // Now try to claim — should fail because swap was already refunded
-    let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap.swap_id,
-        secret: [0x5E; 32],
-        claimer: alice,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_claim = Transaction::AtomicSwapClaim(make_claim(&swap));
     let result = validate_transaction(&tx_claim, &s2, 1000, 205);
     assert!(matches!(result, Err(ChainError::SwapNotFound(_))));
 }
@@ -130,23 +148,12 @@ fn refund_after_claim_fails() {
     let s1 = init_swap(&state, &swap, 50);
 
     // Claim at block 75
-    let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap.swap_id,
-        secret: [0x5E; 32],
-        claimer: alice,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_claim = Transaction::AtomicSwapClaim(make_claim(&swap));
     let s2 = validate_transaction(&tx_claim, &s1, 1000, 75).unwrap();
     assert!(s2.get_swap(&swap.swap_id).is_none());
 
     // Now try to refund — should fail because swap was already claimed
-    let tx_refund = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-        swap_id: swap.swap_id,
-        refundee: bob,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_refund = Transaction::AtomicSwapRefund(make_refund(&swap));
     let result = validate_transaction(&tx_refund, &s2, 1000, 200);
     assert!(matches!(result, Err(ChainError::SwapNotFound(_))));
 }
@@ -158,13 +165,7 @@ fn double_claim_fails() {
     let s1 = init_swap(&state, &swap, 50);
 
     // First claim succeeds
-    let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap.swap_id,
-        secret: [0x5E; 32],
-        claimer: alice,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_claim = Transaction::AtomicSwapClaim(make_claim(&swap));
     let s2 = validate_transaction(&tx_claim, &s1, 1000, 75).unwrap();
 
     // Second claim on same swap fails
@@ -178,12 +179,7 @@ fn double_refund_fails() {
     let swap = make_swap(alice, bob, 5000, 100, 0);
     let s1 = init_swap(&state, &swap, 50);
 
-    let tx_refund = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-        swap_id: swap.swap_id,
-        refundee: bob,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_refund = Transaction::AtomicSwapRefund(make_refund(&swap));
 
     // First refund succeeds
     let s2 = validate_transaction(&tx_refund, &s1, 1000, 200).unwrap();
@@ -222,13 +218,7 @@ fn multiple_concurrent_swaps() {
     assert!(s3.get_swap(&swap3.swap_id).is_some());
 
     // Claim swap1
-    let tx_claim1 = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap1.swap_id,
-        secret: [0x5E; 32],
-        claimer: alice,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_claim1 = Transaction::AtomicSwapClaim(make_claim(&swap1));
     let s4 = validate_transaction(&tx_claim1, &s3, 1000, 50).unwrap();
 
     // Swap1 gone, others still active
@@ -237,12 +227,7 @@ fn multiple_concurrent_swaps() {
     assert!(s4.get_swap(&swap3.swap_id).is_some());
 
     // Refund swap2 after timeout
-    let tx_refund2 = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-        swap_id: swap2.swap_id,
-        refundee: bob,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_refund2 = Transaction::AtomicSwapRefund(make_refund(&swap2));
     let s5 = validate_transaction(&tx_refund2, &s4, 1000, 250).unwrap();
 
     // Swap2 gone, swap3 still active
@@ -250,13 +235,7 @@ fn multiple_concurrent_swaps() {
     assert!(s5.get_swap(&swap3.swap_id).is_some());
 
     // Claim swap3 (bob is initiator here)
-    let tx_claim3 = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap3.swap_id,
-        secret: [0x5E; 32],
-        claimer: bob,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_claim3 = Transaction::AtomicSwapClaim(make_claim(&swap3));
     let s6 = validate_transaction(&tx_claim3, &s5, 1000, 260).unwrap();
 
     // All swaps resolved
@@ -284,24 +263,13 @@ fn many_swaps_stress_test() {
 
     // Claim first 25
     for swap in &swaps[..25] {
-        let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-            swap_id: swap.swap_id,
-            secret: [0x5E; 32],
-            claimer: alice,
-            proof: mock_proof(),
-            signature: [0u8; 64],
-        });
+        let tx_claim = Transaction::AtomicSwapClaim(make_claim(swap));
         state = validate_transaction(&tx_claim, &state, 1000, 500).unwrap();
     }
 
     // Refund remaining 25
     for swap in &swaps[25..] {
-        let tx_refund = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-            swap_id: swap.swap_id,
-            refundee: bob,
-            proof: mock_proof(),
-            signature: [0u8; 64],
-        });
+        let tx_refund = Transaction::AtomicSwapRefund(make_refund(swap));
         state = validate_transaction(&tx_refund, &state, 1000, 2000).unwrap();
     }
 
@@ -384,13 +352,7 @@ fn state_root_deterministic_across_swap_operations() {
     assert_eq!(s1a.state_root(), s1b.state_root());
 
     // Claim on both
-    let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap.swap_id,
-        secret: [0x5E; 32],
-        claimer: alice,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_claim = Transaction::AtomicSwapClaim(make_claim(&swap));
     let s2a = validate_transaction(&tx_claim, &s1a, 1000, 75).unwrap();
     let s2b = validate_transaction(&tx_claim, &s1b, 1000, 75).unwrap();
     assert_eq!(s2a.state_root(), s2b.state_root());
@@ -403,22 +365,11 @@ fn claim_vs_refund_produce_different_states() {
     let s1 = init_swap(&state, &swap, 50);
 
     // Path A: claim
-    let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap.swap_id,
-        secret: [0x5E; 32],
-        claimer: alice,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_claim = Transaction::AtomicSwapClaim(make_claim(&swap));
     let claimed = validate_transaction(&tx_claim, &s1, 1000, 75).unwrap();
 
     // Path B: refund
-    let tx_refund = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-        swap_id: swap.swap_id,
-        refundee: bob,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    let tx_refund = Transaction::AtomicSwapRefund(make_refund(&swap));
     let refunded = validate_transaction(&tx_refund, &s1, 1000, 200).unwrap();
 
     // Different outcomes → different state roots
@@ -494,13 +445,9 @@ fn swap_with_disclosure_and_hash_ivc_proof() {
     assert!(s1.get_swap(&swap.swap_id).is_some());
 
     // Claim still works
-    let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap.swap_id,
-        secret: [0x5E; 32],
-        claimer: alice,
-        proof: hash_ivc_proof(),
-        signature: [0u8; 64],
-    });
+    let mut claim = make_claim(&swap);
+    claim.proof = hash_ivc_proof();
+    let tx_claim = Transaction::AtomicSwapClaim(claim);
     let s2 = validate_transaction(&tx_claim, &s1, 1000, 75).unwrap();
     assert!(s2.get_swap(&swap.swap_id).is_none());
 }
@@ -515,21 +462,8 @@ fn swap_tx_tags_unique() {
     let swap = make_swap(alice, bob, 5000, 100, 0);
 
     let init_tag = Transaction::AtomicSwapInit(swap.clone()).tag();
-    let claim_tag = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap.swap_id,
-        secret: [0x5E; 32],
-        claimer: alice,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    })
-    .tag();
-    let refund_tag = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-        swap_id: swap.swap_id,
-        refundee: bob,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    })
-    .tag();
+    let claim_tag = Transaction::AtomicSwapClaim(make_claim(&swap)).tag();
+    let refund_tag = Transaction::AtomicSwapRefund(make_refund(&swap)).tag();
 
     assert_eq!(init_tag, 0x09);
     assert_eq!(claim_tag, 0x0A);
@@ -548,24 +482,11 @@ fn swap_fee_payers_correct() {
     assert_eq!(init_payer, Some(bob));
 
     // Claim: claimer pays
-    let claim_payer = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap.swap_id,
-        secret: [0x5E; 32],
-        claimer: alice,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    })
-    .fee_payer();
+    let claim_payer = Transaction::AtomicSwapClaim(make_claim(&swap)).fee_payer();
     assert_eq!(claim_payer, Some(alice));
 
     // Refund: refundee pays
-    let refund_payer = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-        swap_id: swap.swap_id,
-        refundee: bob,
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    })
-    .fee_payer();
+    let refund_payer = Transaction::AtomicSwapRefund(make_refund(&swap)).fee_payer();
     assert_eq!(refund_payer, Some(bob));
 }
 
@@ -600,18 +521,12 @@ fn swaps_subtree_independent_from_wallets() {
     assert_eq!(swap_hash_before, swap_hash_after);
 
     // Swap operations don't affect unrelated wallets
-    let alice_wallet_before = s1.get_wallet(&alice);
-    let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-        swap_id: swap.swap_id,
-        secret: [0x5E; 32],
-        claimer: [0xFF; 32], // different claimer, not alice
-        proof: mock_proof(),
-        signature: [0u8; 64],
-    });
+    // Claiming credits alice (initiator), so check bob's wallet is unchanged
+    let bob_wallet_before = s1.get_wallet(&bob);
+    let tx_claim = Transaction::AtomicSwapClaim(make_claim(&swap));
     let s3 = validate_transaction(&tx_claim, &s1, 1000, 75).unwrap();
-    // Alice's wallet should still be the same (claim credits 0xFF, not alice)
-    let alice_wallet_after = s3.get_wallet(&alice);
-    assert_eq!(alice_wallet_before, alice_wallet_after);
+    let bob_wallet_after = s3.get_wallet(&bob);
+    assert_eq!(bob_wallet_before, bob_wallet_after);
 }
 
 // ---------------------------------------------------------------------------

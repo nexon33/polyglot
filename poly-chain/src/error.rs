@@ -60,6 +60,12 @@ pub enum ChainError {
     #[error("invalid hash preimage")]
     InvalidPreimage,
 
+    #[error("self-transfer not allowed")]
+    SelfTransfer,
+
+    #[error("zero amount transfer")]
+    ZeroAmount,
+
     #[error("proof system error: {0}")]
     ProofSystem(#[from] poly_verified::error::ProofSystemError),
 }

@@ -32,6 +32,10 @@ pub struct ComplianceReport {
     pub rolling_total: Amount,
     pub sender_identity_hash: Hash,
     pub recipient_identity_hash: Hash,
+    /// Sender account ID — ties the report to a specific transaction.
+    pub sender_account: Hash,
+    /// Sender nonce — ensures uniqueness per transaction.
+    pub nonce: Nonce,
     pub timestamp: Timestamp,
     /// ISO 3166-1 numeric country code of the sender.
     pub jurisdiction: u16,
@@ -44,11 +48,13 @@ impl ComplianceReport {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(91);
+        let mut buf = Vec::with_capacity(131);
         buf.extend_from_slice(&self.amount.to_le_bytes());           // 8
         buf.extend_from_slice(&self.rolling_total.to_le_bytes());    // 8
         buf.extend_from_slice(&self.sender_identity_hash);            // 32
         buf.extend_from_slice(&self.recipient_identity_hash);         // 32
+        buf.extend_from_slice(&self.sender_account);                  // 32
+        buf.extend_from_slice(&self.nonce.to_le_bytes());            // 8
         buf.extend_from_slice(&self.timestamp.to_le_bytes());        // 8
         buf.extend_from_slice(&self.jurisdiction.to_le_bytes());     // 2
         buf.push(match self.report_type {                            // 1
@@ -63,6 +69,9 @@ impl ComplianceReport {
 ///
 /// Anti-structuring: checks both the single transfer amount AND the
 /// rolling 24h total (which includes the current transfer).
+///
+/// `sender_account` and `nonce` are included in the report to ensure
+/// each report has a unique hash (prevents report collision/overwrite).
 pub fn check_compliance(
     amount: Amount,
     rolling_total_after: Amount,
@@ -71,6 +80,8 @@ pub fn check_compliance(
     timestamp: Timestamp,
     sender_identity_hash: Hash,
     recipient_identity_hash: Hash,
+    sender_account: Hash,
+    nonce: Nonce,
 ) -> ComplianceStatus {
     let threshold = tier.reporting_threshold();
 
@@ -81,6 +92,8 @@ pub fn check_compliance(
             rolling_total: rolling_total_after,
             sender_identity_hash,
             recipient_identity_hash,
+            sender_account,
+            nonce,
             timestamp,
             jurisdiction,
             report_type: ReportType::Single,
@@ -94,6 +107,8 @@ pub fn check_compliance(
             rolling_total: rolling_total_after,
             sender_identity_hash,
             recipient_identity_hash,
+            sender_account,
+            nonce,
             timestamp,
             jurisdiction,
             report_type: ReportType::RollingTotal,
@@ -110,13 +125,8 @@ mod tests {
     #[test]
     fn below_threshold_no_report() {
         let status = check_compliance(
-            100,        // small amount
-            100,        // rolling total
-            Tier::Identified,
-            840,
-            1000,
-            [1u8; 32],
-            [2u8; 32],
+            100, 100, Tier::Identified, 840, 1000,
+            [1u8; 32], [2u8; 32], [0xAA; 32], 0,
         );
         assert!(matches!(status, ComplianceStatus::BelowThreshold));
     }
@@ -125,18 +135,15 @@ mod tests {
     fn single_transfer_triggers_report() {
         let threshold = Tier::Identified.reporting_threshold();
         let status = check_compliance(
-            threshold,
-            threshold,
-            Tier::Identified,
-            840,
-            1000,
-            [1u8; 32],
-            [2u8; 32],
+            threshold, threshold, Tier::Identified, 840, 1000,
+            [1u8; 32], [2u8; 32], [0xAA; 32], 0,
         );
         match status {
             ComplianceStatus::ReportGenerated(report) => {
                 assert_eq!(report.report_type, ReportType::Single);
                 assert_eq!(report.amount, threshold);
+                assert_eq!(report.sender_account, [0xAA; 32]);
+                assert_eq!(report.nonce, 0);
             }
             _ => panic!("expected report"),
         }
@@ -145,15 +152,9 @@ mod tests {
     #[test]
     fn rolling_total_triggers_report() {
         let threshold = Tier::Anonymous.reporting_threshold();
-        // Small individual transfers but rolling total exceeds
         let status = check_compliance(
-            100,             // small single transfer
-            threshold + 100, // rolling total over threshold
-            Tier::Anonymous,
-            840,
-            1000,
-            [1u8; 32],
-            [2u8; 32],
+            100, threshold + 100, Tier::Anonymous, 840, 1000,
+            [1u8; 32], [2u8; 32], [0xAA; 32], 5,
         );
         match status {
             ComplianceStatus::ReportGenerated(report) => {
@@ -166,18 +167,37 @@ mod tests {
     #[test]
     fn officials_lower_threshold() {
         let official_threshold = Tier::PublicOfficial.reporting_threshold();
-        let _identified_threshold = Tier::Identified.reporting_threshold();
-        // Amount between the two thresholds
         let amount = official_threshold;
 
         let official_status = check_compliance(
-            amount, amount, Tier::PublicOfficial, 840, 1000, [1u8; 32], [2u8; 32],
+            amount, amount, Tier::PublicOfficial, 840, 1000,
+            [1u8; 32], [2u8; 32], [0xAA; 32], 0,
         );
         let identified_status = check_compliance(
-            amount, amount, Tier::Identified, 840, 1000, [1u8; 32], [2u8; 32],
+            amount, amount, Tier::Identified, 840, 1000,
+            [1u8; 32], [2u8; 32], [0xAA; 32], 0,
         );
 
         assert!(matches!(official_status, ComplianceStatus::ReportGenerated(_)));
         assert!(matches!(identified_status, ComplianceStatus::BelowThreshold));
+    }
+
+    #[test]
+    fn reports_unique_per_nonce() {
+        let threshold = Tier::Identified.reporting_threshold();
+        let s1 = check_compliance(
+            threshold, threshold, Tier::Identified, 840, 1000,
+            [1u8; 32], [2u8; 32], [0xAA; 32], 0,
+        );
+        let s2 = check_compliance(
+            threshold, threshold, Tier::Identified, 840, 1000,
+            [1u8; 32], [2u8; 32], [0xAA; 32], 1, // different nonce
+        );
+        match (s1, s2) {
+            (ComplianceStatus::ReportGenerated(r1), ComplianceStatus::ReportGenerated(r2)) => {
+                assert_ne!(r1.report_hash(), r2.report_hash());
+            }
+            _ => panic!("expected two reports"),
+        }
     }
 }

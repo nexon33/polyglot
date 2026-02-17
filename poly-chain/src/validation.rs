@@ -5,6 +5,7 @@ use poly_verified::types::{Hash, VerifiedProof, ZERO_HASH};
 
 use crate::compliance::{check_compliance, ComplianceStatus};
 use crate::error::{ChainError, Result};
+use crate::fee::FeeSchedule;
 use crate::fraud::detect_conflict;
 use crate::identity::{IdentityRecord, Tier};
 use crate::primitives::*;
@@ -80,6 +81,16 @@ fn validate_cash_transfer(
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
 
+    // 0. Reject self-transfers (from == to corrupts wallet state)
+    if tx.from == tx.to {
+        return Err(ChainError::SelfTransfer);
+    }
+
+    // 0b. Reject zero-amount transfers (state spam)
+    if tx.amount == 0 {
+        return Err(ChainError::ZeroAmount);
+    }
+
     // 1. Check sender wallet exists
     let sender_state_hash = state
         .get_wallet(&tx.from)
@@ -93,9 +104,30 @@ fn validate_cash_transfer(
         });
     }
 
-    // 1b. Reject frozen accounts (proof attests frozen status is correct)
+    // 1b. Reject frozen sender (proof attests frozen status is correct)
     if tx.sender_frozen {
         return Err(ChainError::AccountFrozen(hex_encode(&tx.from[..4])));
+    }
+
+    // 1c. Reject frozen recipient
+    if tx.recipient_frozen {
+        return Err(ChainError::AccountFrozen(hex_encode(&tx.to[..4])));
+    }
+
+    // 1d. Rolling total sanity: must be >= amount (impossible otherwise)
+    if tx.rolling_24h_total_after < tx.amount {
+        return Err(ChainError::ComplianceViolation(
+            "rolling_24h_total_after < amount".into(),
+        ));
+    }
+
+    // 1e. Enforce minimum fee
+    if tx.fee < FeeSchedule::base_fee() {
+        return Err(ChainError::ComplianceViolation(format!(
+            "fee {} below minimum {}",
+            tx.fee,
+            FeeSchedule::base_fee()
+        )));
     }
 
     // 2. Verify proof (the circuit verified the computation was correct)
@@ -147,6 +179,8 @@ fn validate_cash_transfer(
         tx.timestamp,
         tx.sender_identity_hash,
         tx.recipient_identity_hash,
+        tx.from,
+        tx.nonce,
     );
     if let ComplianceStatus::ReportGenerated(report) = compliance_status {
         let report_hash = report.report_hash();
@@ -264,11 +298,24 @@ fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState) -> Result<Gl
 fn validate_fraud_proof(tx: &FraudProofTx, state: &GlobalState) -> Result<GlobalState> {
     let mut new_state = state.clone();
 
-    // Verify the two observations conflict
+    // 0. fraudulent_key must match the observed_key in both observations
+    if tx.evidence.fraudulent_key != tx.evidence.observation_a.observed_key
+        || tx.evidence.fraudulent_key != tx.evidence.observation_b.observed_key
+    {
+        return Err(ChainError::FraudDetected(
+            "fraudulent_key does not match observed keys".into(),
+        ));
+    }
+
+    // 1. Verify the two observations conflict
     let _conflict = detect_conflict(&tx.evidence.observation_a, &tx.evidence.observation_b)
         .ok_or_else(|| ChainError::FraudDetected("no conflict detected".into()))?;
 
-    // Burn the fraudulent key — remove wallet
+    // NOTE: Phase 1 limitation — observer signatures are not verified here.
+    // In production, both observation_a.observer_signature and observation_b.observer_signature
+    // must be verified against the observer's public key before accepting the fraud proof.
+
+    // 2. Burn the fraudulent key — remove wallet
     new_state.remove_wallet(&tx.evidence.fraudulent_key);
 
     // Record fraud evidence on chain
@@ -361,6 +408,11 @@ fn validate_atomic_swap_init(
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
 
+    // 0. Reject self-swaps (initiator == responder)
+    if tx.initiator == tx.responder {
+        return Err(ChainError::SelfTransfer);
+    }
+
     // 1. Responder wallet must exist (they're locking funds)
     let _ = state
         .get_wallet(&tx.responder)
@@ -416,19 +468,43 @@ fn validate_atomic_swap_claim(
     let mut new_state = state.clone();
 
     // 1. Swap must exist
-    let _ = state
+    let stored_hash = state
         .get_swap(&tx.swap_id)
         .ok_or_else(|| ChainError::SwapNotFound(hex_encode(&tx.swap_id[..4])))?;
 
-    // 2. In the verify-only model, the proof attests:
-    //    - H(secret) == hash_lock (preimage check)
-    //    - claimer == initiator (authorization)
-    //    The validator trusts the proof; full swap data is not re-stored on-chain.
+    // 2. Verify the provided original swap params match the stored commitment.
+    //    The SMT stores swap_state_hash(params, Active). Reconstruct and compare.
+    let expected_hash = swap_state_hash_from_parts(
+        &tx.original_initiator,
+        &tx.original_responder,
+        tx.original_amount,
+        &tx.original_hash_lock,
+        tx.original_timeout,
+        SwapStatus::Active,
+    );
+    if stored_hash != expected_hash {
+        return Err(ChainError::InvalidProof(
+            "swap params do not match stored commitment".into(),
+        ));
+    }
 
-    // 3. Remove swap (claimed — no longer active)
+    // 3. Claimer must be the original initiator
+    if tx.claimer != tx.original_initiator {
+        return Err(ChainError::InvalidProof(
+            "claimer is not the swap initiator".into(),
+        ));
+    }
+
+    // 4. Verify hash preimage: H(secret) must equal hash_lock
+    let secret_hash = hash_with_domain(DOMAIN_SWAP, tx.secret.as_slice());
+    if secret_hash != tx.original_hash_lock {
+        return Err(ChainError::InvalidPreimage);
+    }
+
+    // 5. Remove swap (claimed — no longer active)
     new_state.remove_swap(&tx.swap_id);
 
-    // 4. Credit claimer (initiator receives the locked funds)
+    // 6. Credit claimer (initiator receives the locked funds)
     let claimer_current = state.get_wallet(&tx.claimer).unwrap_or(ZERO_HASH);
     let new_claimer_hash = hash_with_domain(
         DOMAIN_WALLET_STATE,
@@ -456,21 +532,41 @@ fn validate_atomic_swap_refund(
     let mut new_state = state.clone();
 
     // 1. Swap must exist
-    let _ = state
+    let stored_hash = state
         .get_swap(&tx.swap_id)
         .ok_or_else(|| ChainError::SwapNotFound(hex_encode(&tx.swap_id[..4])))?;
 
-    // 2. The proof attests that block_height >= timeout and refundee == responder.
-    //    For an additional safety check, we verify we're past the minimum possible
-    //    timeout (block 0 is never valid for refund since init requires timeout > height).
-    if block_height == 0 {
+    // 2. Verify the provided original swap params match the stored commitment.
+    let expected_hash = swap_state_hash_from_parts(
+        &tx.original_initiator,
+        &tx.original_responder,
+        tx.original_amount,
+        &tx.original_hash_lock,
+        tx.original_timeout,
+        SwapStatus::Active,
+    );
+    if stored_hash != expected_hash {
+        return Err(ChainError::InvalidProof(
+            "swap params do not match stored commitment".into(),
+        ));
+    }
+
+    // 3. Refundee must be the original responder
+    if tx.refundee != tx.original_responder {
+        return Err(ChainError::InvalidProof(
+            "refundee is not the swap responder".into(),
+        ));
+    }
+
+    // 4. Timeout must have been reached
+    if block_height < tx.original_timeout {
         return Err(ChainError::SwapNotExpired);
     }
 
-    // 3. Remove swap (refunded — no longer active)
+    // 5. Remove swap (refunded — no longer active)
     new_state.remove_swap(&tx.swap_id);
 
-    // 4. Credit refundee (responder gets their locked funds back)
+    // 6. Credit refundee (responder gets their locked funds back)
     let refundee_current = state.get_wallet(&tx.refundee).unwrap_or(ZERO_HASH);
     let new_refundee_hash = hash_with_domain(
         DOMAIN_WALLET_STATE,
@@ -489,6 +585,7 @@ fn validate_atomic_swap_refund(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fraud::{ConflictType, FraudEvidence, StateObservation};
     use poly_verified::types::{PrivacyMode, ZERO_HASH};
 
     fn mock_proof() -> VerifiedProof {
@@ -532,7 +629,8 @@ mod tests {
             sender_identity_hash: [0xAA; 32],
             recipient_identity_hash: [0xBB; 32],
             sender_frozen: false,
-            rolling_24h_total_after: 0,
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
             jurisdiction: 840,
         });
 
@@ -559,6 +657,7 @@ mod tests {
             sender_identity_hash: [0xAA; 32],
             recipient_identity_hash: [0xBB; 32],
             sender_frozen: false,
+            recipient_frozen: false,
             rolling_24h_total_after: 0,
             jurisdiction: 840,
         });
@@ -585,6 +684,7 @@ mod tests {
             sender_identity_hash: [0xAA; 32],
             recipient_identity_hash: [0xBB; 32],
             sender_frozen: false,
+            recipient_frozen: false,
             rolling_24h_total_after: 0,
             jurisdiction: 840,
         });
@@ -787,6 +887,37 @@ mod tests {
         }
     }
 
+    /// Build a claim transaction from a swap init, providing correct original params.
+    fn make_swap_claim(swap: &AtomicSwapInit) -> AtomicSwapClaim {
+        AtomicSwapClaim {
+            swap_id: swap.swap_id,
+            secret: [0x5E; 32], // matches hash_lock from make_swap_init
+            claimer: swap.initiator,
+            original_initiator: swap.initiator,
+            original_responder: swap.responder,
+            original_amount: swap.amount,
+            original_hash_lock: swap.hash_lock,
+            original_timeout: swap.timeout,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+        }
+    }
+
+    /// Build a refund transaction from a swap init, providing correct original params.
+    fn make_swap_refund(swap: &AtomicSwapInit) -> AtomicSwapRefund {
+        AtomicSwapRefund {
+            swap_id: swap.swap_id,
+            refundee: swap.responder,
+            original_initiator: swap.initiator,
+            original_responder: swap.responder,
+            original_amount: swap.amount,
+            original_hash_lock: swap.hash_lock,
+            original_timeout: swap.timeout,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+        }
+    }
+
     #[test]
     fn atomic_swap_init_happy_path() {
         let (state, _sender, responder) = setup_state_with_wallets();
@@ -862,13 +993,7 @@ mod tests {
         assert!(state_after_init.get_swap(&swap.swap_id).is_some());
 
         // Claim the swap
-        let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-            swap_id: swap.swap_id,
-            secret: [0x5E; 32],
-            claimer: initiator,
-            proof: mock_proof(),
-            signature: [0u8; 64],
-        });
+        let tx_claim = Transaction::AtomicSwapClaim(make_swap_claim(&swap));
         let state_after_claim =
             validate_transaction(&tx_claim, &state_after_init, 1000, 55).unwrap();
 
@@ -881,14 +1006,12 @@ mod tests {
     #[test]
     fn atomic_swap_claim_not_found() {
         let state = GlobalState::genesis();
+        // Use a fake swap that doesn't exist — only swap_id matters for "not found"
+        let fake_swap = make_swap_init([1u8; 32], [2u8; 32], 100, 50);
+        let mut claim = make_swap_claim(&fake_swap);
+        claim.swap_id = [0xFF; 32]; // non-existent
 
-        let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-            swap_id: [0xFF; 32],
-            secret: [0xAB; 32],
-            claimer: [1u8; 32],
-            proof: mock_proof(),
-            signature: [0u8; 64],
-        });
+        let tx_claim = Transaction::AtomicSwapClaim(claim);
         let result = validate_transaction(&tx_claim, &state, 1000, 50);
         assert!(matches!(result, Err(ChainError::SwapNotFound(_))));
     }
@@ -904,12 +1027,7 @@ mod tests {
         let state_after_init = validate_transaction(&tx_init, &state, 1000, 50).unwrap();
 
         // Refund after timeout (block_height 200 > timeout 100)
-        let tx_refund = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-            swap_id: swap.swap_id,
-            refundee: responder,
-            proof: mock_proof(),
-            signature: [0u8; 64],
-        });
+        let tx_refund = Transaction::AtomicSwapRefund(make_swap_refund(&swap));
         let state_after_refund =
             validate_transaction(&tx_refund, &state_after_init, 1000, 200).unwrap();
 
@@ -922,13 +1040,11 @@ mod tests {
     #[test]
     fn atomic_swap_refund_not_found() {
         let state = GlobalState::genesis();
+        let fake_swap = make_swap_init([1u8; 32], [2u8; 32], 100, 50);
+        let mut refund = make_swap_refund(&fake_swap);
+        refund.swap_id = [0xFF; 32]; // non-existent
 
-        let tx_refund = Transaction::AtomicSwapRefund(AtomicSwapRefund {
-            swap_id: [0xFF; 32],
-            refundee: [1u8; 32],
-            proof: mock_proof(),
-            signature: [0u8; 64],
-        });
+        let tx_refund = Transaction::AtomicSwapRefund(refund);
         let result = validate_transaction(&tx_refund, &state, 1000, 200);
         assert!(matches!(result, Err(ChainError::SwapNotFound(_))));
     }
@@ -959,13 +1075,7 @@ mod tests {
         let root_after_init = s1.state_root();
 
         // Step 2: Claim
-        let tx_claim = Transaction::AtomicSwapClaim(AtomicSwapClaim {
-            swap_id: swap.swap_id,
-            secret: [0x5E; 32],
-            claimer: initiator,
-            proof: mock_proof(),
-            signature: [0u8; 64],
-        });
+        let tx_claim = Transaction::AtomicSwapClaim(make_swap_claim(&swap));
         let s2 = validate_transaction(&tx_claim, &s1, 2000, 200).unwrap();
 
         // Root changed after claim
@@ -1014,6 +1124,7 @@ mod tests {
             sender_identity_hash: [0xAA; 32],
             recipient_identity_hash: [0xBB; 32],
             sender_frozen: true, // frozen!
+            recipient_frozen: false,
             rolling_24h_total_after: 0,
             jurisdiction: 840,
         });
@@ -1042,6 +1153,7 @@ mod tests {
             sender_identity_hash: [0xAA; 32],
             recipient_identity_hash: [0xBB; 32],
             sender_frozen: false,
+            recipient_frozen: false,
             rolling_24h_total_after: threshold,
             jurisdiction: 840,
         });
@@ -1060,7 +1172,7 @@ mod tests {
             from: sender,
             to: recipient,
             amount: 100, // well below any threshold
-            fee: 10,
+            fee: 100,
             nonce: 0,
             timestamp: 1000,
             state_pre: sender_state_hash,
@@ -1070,6 +1182,7 @@ mod tests {
             sender_identity_hash: [0xAA; 32],
             recipient_identity_hash: [0xBB; 32],
             sender_frozen: false,
+            recipient_frozen: false,
             rolling_24h_total_after: 100,
             jurisdiction: 840,
         });
@@ -1090,7 +1203,7 @@ mod tests {
             from: sender,
             to: recipient,
             amount: 100, // small
-            fee: 10,
+            fee: 100,
             nonce: 0,
             timestamp: 1000,
             state_pre: sender_state_hash,
@@ -1100,6 +1213,7 @@ mod tests {
             sender_identity_hash: [0xAA; 32],
             recipient_identity_hash: [0xBB; 32],
             sender_frozen: false,
+            recipient_frozen: false,
             rolling_24h_total_after: threshold + 100, // over threshold
             jurisdiction: 840,
         });
@@ -1107,5 +1221,1102 @@ mod tests {
         let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
         // Anti-structuring: rolling total triggered a report
         assert!(!new_state.compliance.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Attack tests — verify hardened compliance rejects exploits
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attack_structuring_bypasses_rolling_total() {
+        // KNOWN LIMITATION (Phase 1): rolling_24h_total_after is self-reported.
+        // Until ZK proofs are verified, a client can lie about cumulative totals.
+        // This test documents the limitation — it will flip once proofs are enforced.
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let threshold = Tier::Identified.reporting_threshold();
+
+        let mut current_state = state.clone();
+        for i in 0..10u64 {
+            let sender_hash = current_state.get_wallet(&sender).unwrap();
+            let tx = Transaction::CashTransfer(CashTransfer {
+                from: sender,
+                to: recipient,
+                amount: threshold - 1,
+                fee: 100,
+                nonce: i,
+                timestamp: 1000 + i,
+                state_pre: sender_hash,
+                proof: mock_proof(),
+                signature: [0u8; 64],
+                sender_tier: Tier::Identified,
+                sender_identity_hash: [0xAA; 32],
+                recipient_identity_hash: [0xBB; 32],
+                sender_frozen: false,
+                recipient_frozen: false,
+                rolling_24h_total_after: threshold - 1, // LIE: should be cumulative
+                jurisdiction: 840,
+            });
+            current_state = validate_transaction(&tx, &current_state, 1000 + i, 0).unwrap();
+        }
+        // KNOWN: No reports despite moving 10*(threshold-1) — needs proof verification
+        assert!(current_state.compliance.is_empty());
+    }
+
+    #[test]
+    fn attack_tier_spoofing_avoids_reporting() {
+        // KNOWN LIMITATION (Phase 1): sender_tier is self-reported.
+        // Needs ZK proof verification to enforce real tier.
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+        let amount = 50_000_000;
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified, // LIE: actually Anonymous
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: amount,
+            jurisdiction: 840,
+        });
+
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+        // KNOWN: No report — needs proof verification to enforce real tier
+        assert!(new_state.compliance.is_empty());
+    }
+
+    #[test]
+    fn attack_frozen_account_lies_about_status() {
+        // KNOWN LIMITATION (Phase 1): sender_frozen is self-reported.
+        // Needs ZK proof verification to enforce real frozen status.
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false, // LIE: actually frozen
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+
+        // KNOWN: Succeeds because frozen status is self-reported — needs proof verification
+        assert!(validate_transaction(&tx, &state, 1000, 0).is_ok());
+    }
+
+    #[test]
+    fn attack_self_transfer_blocked() {
+        // FIXED: Self-transfers are now rejected
+        let (state, sender, _recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: sender, // self-transfer!
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xAA; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(matches!(result, Err(ChainError::SelfTransfer)));
+    }
+
+    #[test]
+    fn attack_compliance_report_collision_fixed() {
+        // FIXED: Reports now include sender_account + nonce, so each is unique.
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let threshold = Tier::Identified.reporting_threshold();
+
+        // First transfer
+        let sender_hash = state.get_wallet(&sender).unwrap();
+        let tx1 = CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: threshold,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: threshold,
+            jurisdiction: 840,
+        };
+        let state1 = validate_cash_transfer(&tx1, &state, 1000).unwrap();
+        assert_eq!(state1.compliance.len(), 1);
+
+        // Second transfer, same params but different nonce
+        let sender_hash2 = state1.get_wallet(&sender).unwrap();
+        let tx2 = CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: threshold,
+            fee: 100,
+            nonce: 1,
+            timestamp: 1000,
+            state_pre: sender_hash2,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: threshold,
+            jurisdiction: 840,
+        };
+        let state2 = validate_cash_transfer(&tx2, &state1, 1000).unwrap();
+
+        // FIXED: 2 distinct reports (nonce makes report_hash unique)
+        assert_eq!(state2.compliance.len(), 2);
+    }
+
+    #[test]
+    fn attack_zero_amount_transfer_blocked() {
+        // FIXED: Zero-amount transfers are now rejected
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 0,
+            fee: 0,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
+        });
+
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(matches!(result, Err(ChainError::ZeroAmount)));
+    }
+
+    #[test]
+    fn attack_rolling_total_below_amount_rejected() {
+        // FIXED: rolling_24h_total_after < amount is now rejected
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1_000_000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Anonymous,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 0, // impossible: < amount
+            jurisdiction: 840,
+        });
+
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(matches!(result, Err(ChainError::ComplianceViolation(_))));
+    }
+
+    #[test]
+    fn attack_recipient_frozen_blocked() {
+        // FIXED: Frozen recipients now rejected
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: true, // frozen recipient
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(matches!(result, Err(ChainError::AccountFrozen(_))));
+    }
+
+    // ===================================================================
+    // ROUND 2 ATTACK TESTS — Fixes verified
+    // ===================================================================
+
+    // --- FIXED: Atomic Swap Refund Before Timeout Rejected ---
+    #[test]
+    fn attack_swap_refund_before_timeout_rejected() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let swap = make_swap_init(initiator, responder, 5000, 100);
+
+        let init_tx = Transaction::AtomicSwapInit(swap.clone());
+        let state = validate_transaction(&init_tx, &state, 0, 1).unwrap();
+
+        // Try refund at block 2 — timeout is 100
+        let refund = make_swap_refund(&swap);
+        let refund_tx = Transaction::AtomicSwapRefund(refund);
+        let result = validate_transaction(&refund_tx, &state, 1000, 2);
+        assert!(matches!(result, Err(ChainError::SwapNotExpired)));
+    }
+
+    // --- FIXED: Atomic Swap Claim With Wrong Secret Rejected ---
+    #[test]
+    fn attack_swap_claim_wrong_secret_rejected() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let swap = make_swap_init(initiator, responder, 5000, 100);
+
+        let init_tx = Transaction::AtomicSwapInit(swap.clone());
+        let state = validate_transaction(&init_tx, &state, 0, 1).unwrap();
+
+        // Try to claim with wrong secret
+        let mut claim = make_swap_claim(&swap);
+        claim.secret = [0xFF; 32]; // wrong preimage!
+        let claim_tx = Transaction::AtomicSwapClaim(claim);
+        let result = validate_transaction(&claim_tx, &state, 1000, 2);
+        assert!(matches!(result, Err(ChainError::InvalidPreimage)));
+    }
+
+    // --- FIXED: Atomic Swap Claim By Wrong Party Rejected ---
+    #[test]
+    fn attack_swap_claim_wrong_claimer_rejected() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let eve = [0xEE; 32];
+        let swap = make_swap_init(initiator, responder, 5000, 100);
+
+        let init_tx = Transaction::AtomicSwapInit(swap.clone());
+        let state = validate_transaction(&init_tx, &state, 0, 1).unwrap();
+
+        // Eve tries to claim — she's not the initiator
+        let mut claim = make_swap_claim(&swap);
+        claim.claimer = eve;
+        let claim_tx = Transaction::AtomicSwapClaim(claim);
+        let result = validate_transaction(&claim_tx, &state, 1000, 2);
+        assert!(matches!(result, Err(ChainError::InvalidProof(_))));
+    }
+
+    // --- FIXED: Atomic Swap Refund By Wrong Party Rejected ---
+    #[test]
+    fn attack_swap_refund_wrong_refundee_rejected() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let eve = [0xEE; 32];
+        let swap = make_swap_init(initiator, responder, 5000, 10);
+
+        let init_tx = Transaction::AtomicSwapInit(swap.clone());
+        let state = validate_transaction(&init_tx, &state, 0, 1).unwrap();
+
+        // Eve tries to refund — she's not the responder
+        let mut refund = make_swap_refund(&swap);
+        refund.refundee = eve;
+        let refund_tx = Transaction::AtomicSwapRefund(refund);
+        let result = validate_transaction(&refund_tx, &state, 1000, 50);
+        assert!(matches!(result, Err(ChainError::InvalidProof(_))));
+    }
+
+    // --- CRITICAL: WalletSync Overwrites Any Wallet Without Authorization ---
+    // Anyone can submit a WalletSync for any account and set its state to anything.
+    #[test]
+    fn attack_wallet_sync_unauthorized_overwrite() {
+        let mut state = GlobalState::genesis();
+        let alice = [0xAA; 32];
+
+        // Alice has a real wallet
+        let wallet = WalletState::new([0u8; 32], Tier::Identified, 0);
+        let original_hash = wallet.state_hash();
+        state.set_wallet(alice, original_hash);
+
+        // Eve (not Alice!) submits WalletSync to overwrite Alice's wallet state
+        let evil_hash = [0xFF; 32]; // attacker-controlled state
+        let sync_tx = Transaction::WalletSync(WalletSync {
+            account_id: alice,
+            new_state_hash: evil_hash,
+            nonce: 0,
+            timestamp: 1000,
+            proof: mock_proof(),
+            signature: [0u8; 64], // no signature check!
+        });
+        let new_state = validate_transaction(&sync_tx, &state, 1000, 0).unwrap();
+
+        // BUG: Alice's wallet is now under attacker's control
+        assert_eq!(new_state.get_wallet(&alice), Some(evil_hash));
+        assert_ne!(new_state.get_wallet(&alice), Some(original_hash));
+    }
+
+    // --- HIGH: Fraud Proof With Fabricated Observations Burns Any Wallet ---
+    // Observer signatures are never verified, so anyone can fabricate evidence.
+    #[test]
+    fn attack_fraud_proof_fabricated_observations() {
+        let mut state = GlobalState::genesis();
+        let victim = [0xAA; 32];
+
+        // Victim has a wallet with real funds
+        let wallet = WalletState::new([0u8; 32], Tier::Identified, 0);
+        state.set_wallet(victim, wallet.state_hash());
+        assert!(state.get_wallet(&victim).is_some());
+
+        // Eve fabricates two conflicting observations — signatures are garbage
+        let fraud_tx = Transaction::FraudProof(FraudProofTx {
+            evidence: FraudEvidence {
+                fraudulent_key: victim,
+                observation_a: StateObservation {
+                    observer: [0xBB; 32],
+                    observed_key: victim,
+                    observed_state_hash: [0x11; 32],
+                    observed_nonce: 5,
+                    observer_signature: [0u8; 64], // not a real signature!
+                },
+                observation_b: StateObservation {
+                    observer: [0xCC; 32],
+                    observed_key: victim,
+                    observed_state_hash: [0x22; 32], // different state, same nonce
+                    observed_nonce: 5,
+                    observer_signature: [0u8; 64], // not a real signature!
+                },
+                conflict_type: ConflictType::DoubleSpend,
+            },
+            submitter: [0xEE; 32], // Eve
+            proof: mock_proof(),
+        });
+        let new_state = validate_transaction(&fraud_tx, &state, 1000, 0).unwrap();
+
+        // BUG: Victim's wallet is burned! With zero-effort fabricated evidence.
+        assert!(new_state.get_wallet(&victim).is_none());
+    }
+
+    // --- FIXED: Fraud Proof Mismatched Key Rejected ---
+    #[test]
+    fn attack_fraud_proof_mismatched_key_rejected() {
+        let mut state = GlobalState::genesis();
+        let target_x = [0x11; 32];
+        let innocent_y = [0x22; 32];
+
+        let wallet = WalletState::new([0u8; 32], Tier::Identified, 0);
+        state.set_wallet(target_x, wallet.state_hash());
+        state.set_wallet(innocent_y, wallet.state_hash());
+
+        // Observations target X, but fraudulent_key is Y — should be rejected
+        let fraud_tx = Transaction::FraudProof(FraudProofTx {
+            evidence: FraudEvidence {
+                fraudulent_key: innocent_y,
+                observation_a: StateObservation {
+                    observer: [0xBB; 32],
+                    observed_key: target_x,
+                    observed_state_hash: [0xAA; 32],
+                    observed_nonce: 5,
+                    observer_signature: [0u8; 64],
+                },
+                observation_b: StateObservation {
+                    observer: [0xCC; 32],
+                    observed_key: target_x,
+                    observed_state_hash: [0xBB; 32],
+                    observed_nonce: 5,
+                    observer_signature: [0u8; 64],
+                },
+                conflict_type: ConflictType::DoubleSpend,
+            },
+            submitter: [0xEE; 32],
+            proof: mock_proof(),
+        });
+        let result = validate_transaction(&fraud_tx, &state, 1000, 0);
+        assert!(matches!(result, Err(ChainError::FraudDetected(_))));
+        // Innocent Y wallet is still intact
+    }
+
+    // --- FIXED: Zero-Fee Transfers Rejected ---
+    #[test]
+    fn attack_zero_fee_transfer_rejected() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: 0, // below FeeSchedule::base_fee() (100)
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(matches!(result, Err(ChainError::ComplianceViolation(_))));
+    }
+
+    // --- MEDIUM: Recipient Wallet State Overwritten Without Merging ---
+    // Two consecutive transfers to the same recipient: the second overwrites
+    // the first's state commitment, effectively erasing the first transfer.
+    #[test]
+    fn attack_recipient_wallet_overwrite() {
+        let (mut state, sender, recipient) = setup_state_with_wallets();
+        let sender2 = [0xDD; 32];
+        let wallet2 = WalletState::new([0u8; 32], Tier::Identified, 0);
+        state.set_wallet(sender2, wallet2.state_hash());
+
+        let sender_hash = state.get_wallet(&sender).unwrap();
+        let sender2_hash = state.get_wallet(&sender2).unwrap();
+
+        // Transfer 1: sender -> recipient (1000)
+        let tx1 = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+        let state_after_1 = validate_transaction(&tx1, &state, 1000, 0).unwrap();
+        let recipient_hash_after_1 = state_after_1.get_wallet(&recipient).unwrap();
+
+        // Transfer 2: sender2 -> recipient (2000) — DIFFERENT inputs
+        let tx2 = Transaction::CashTransfer(CashTransfer {
+            from: sender2,
+            to: recipient,
+            amount: 2000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1001,
+            state_pre: sender2_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xDD; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 2000,
+            jurisdiction: 840,
+        });
+        let state_after_2 = validate_transaction(&tx2, &state_after_1, 1001, 0).unwrap();
+        let recipient_hash_after_2 = state_after_2.get_wallet(&recipient).unwrap();
+
+        // BUG: The recipient's state after tx2 does NOT incorporate tx1's state.
+        // The second transfer overwrites the wallet commitment entirely.
+        // If the recipient state was properly accumulated, the hashes would
+        // both contribute. But the second write erases the first.
+        assert_ne!(
+            recipient_hash_after_1, recipient_hash_after_2,
+            "state changed (good), but the first transfer's contribution is lost"
+        );
+    }
+
+    // --- FIXED: Atomic Swap Self-Swap Rejected ---
+    #[test]
+    fn attack_atomic_swap_self_swap_rejected() {
+        let mut state = GlobalState::genesis();
+        let alice = [0xAA; 32];
+        let wallet = WalletState::new([0u8; 32], Tier::Identified, 0);
+        state.set_wallet(alice, wallet.state_hash());
+
+        let init_tx = Transaction::AtomicSwapInit(AtomicSwapInit {
+            swap_id: [0x05; 32],
+            initiator: alice,
+            responder: alice, // same person!
+            amount: 5000,
+            hash_lock: [0xCC; 32],
+            timeout: 100,
+            disclosure_root: None,
+            execution_proof: None,
+            nonce: 0,
+            timestamp: 1000,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+        });
+        let result = validate_transaction(&init_tx, &state, 0, 1);
+        assert!(matches!(result, Err(ChainError::SelfTransfer)));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // COMPLIANCE INTEGRATION ATTACK TESTS
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Attack: Set sender_frozen = true to bypass the frozen check.
+    /// Wait — sender_frozen=true should REJECT, not bypass.
+    /// This tests that the frozen check actually works.
+    #[test]
+    fn attack_compliance_frozen_account_rejected() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: true, // FROZEN!
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(
+            matches!(result, Err(ChainError::AccountFrozen(_))),
+            "VULNERABILITY: frozen sender not rejected, got {:?}",
+            result
+        );
+    }
+
+    /// Attack: Frozen recipient should also be rejected.
+    #[test]
+    fn attack_compliance_frozen_recipient_rejected() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: true, // FROZEN!
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(
+            matches!(result, Err(ChainError::AccountFrozen(_))),
+            "VULNERABILITY: frozen recipient not rejected, got {:?}",
+            result
+        );
+    }
+
+    /// Attack: Transfer exactly at reporting threshold triggers compliance report.
+    #[test]
+    fn attack_compliance_threshold_exact_triggers_report() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+        let threshold = Tier::Identified.reporting_threshold();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: threshold,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: threshold,
+            jurisdiction: 840,
+        });
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+
+        // Compliance subtree should have a report
+        assert!(
+            !new_state.compliance.is_empty(),
+            "VULNERABILITY: threshold-amount transfer did not generate compliance report"
+        );
+    }
+
+    /// Attack: Transfer just below threshold should NOT trigger a report.
+    #[test]
+    fn attack_compliance_below_threshold_no_report() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+        let threshold = Tier::Identified.reporting_threshold();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: threshold - 1,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: threshold - 1,
+            jurisdiction: 840,
+        });
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+
+        assert!(
+            new_state.compliance.is_empty(),
+            "Below-threshold transfer should not generate compliance report"
+        );
+    }
+
+    /// Attack: Anti-structuring — small transfer but rolling total exceeds threshold.
+    #[test]
+    fn attack_compliance_anti_structuring() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+        let threshold = Tier::Identified.reporting_threshold();
+
+        // Small transfer (100), but rolling total is above threshold
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 100,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: threshold + 100, // exceeds threshold
+            jurisdiction: 840,
+        });
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+
+        assert!(
+            !new_state.compliance.is_empty(),
+            "VULNERABILITY: anti-structuring not detected (rolling total exceeded threshold)"
+        );
+    }
+
+    /// Attack: PublicOfficial has lower threshold — test that smaller amounts trigger report.
+    #[test]
+    fn attack_compliance_public_official_lower_threshold() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        // PublicOfficial threshold = 50_000_000, Identified = 100_000_000
+        let amount = Tier::PublicOfficial.reporting_threshold();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::PublicOfficial, // official!
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: amount,
+            jurisdiction: 840,
+        });
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+
+        assert!(
+            !new_state.compliance.is_empty(),
+            "PublicOfficial at their threshold should trigger report"
+        );
+    }
+
+    /// Attack: Same amount for Identified tier should NOT trigger report.
+    #[test]
+    fn attack_compliance_identified_higher_threshold() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let amount = Tier::PublicOfficial.reporting_threshold();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified, // NOT an official
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: amount,
+            jurisdiction: 840,
+        });
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+
+        assert!(
+            new_state.compliance.is_empty(),
+            "Identified tier at official threshold should NOT trigger report"
+        );
+    }
+
+    /// Attack: Lie about rolling_24h_total_after < amount (invalid).
+    /// The validator should reject this as a sanity check violation.
+    #[test]
+    fn attack_compliance_rolling_total_less_than_amount() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 5000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 100, // less than amount! impossible
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(
+            matches!(result, Err(ChainError::ComplianceViolation(_))),
+            "VULNERABILITY: rolling total < amount was accepted"
+        );
+    }
+
+    /// Attack: Fee below minimum is rejected.
+    #[test]
+    fn attack_compliance_fee_below_minimum() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: FeeSchedule::base_fee() - 1, // below minimum
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(
+            matches!(result, Err(ChainError::ComplianceViolation(_))),
+            "VULNERABILITY: sub-minimum fee accepted"
+        );
+    }
+
+    /// Attack: Fee at exact minimum should be accepted.
+    #[test]
+    fn attack_compliance_fee_at_minimum_accepted() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: FeeSchedule::base_fee(), // exactly at minimum
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(result.is_ok(), "Fee at exact minimum should be accepted");
+    }
+
+    /// Attack: Zero amount transfer should be rejected.
+    #[test]
+    fn attack_compliance_zero_amount_rejected() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 0,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(
+            matches!(result, Err(ChainError::ZeroAmount)),
+            "VULNERABILITY: zero amount transfer accepted"
+        );
+    }
+
+    /// Attack: Self-transfer should be rejected.
+    #[test]
+    fn attack_compliance_self_transfer_rejected() {
+        let (state, sender, _recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: sender, // same person!
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xAA; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(
+            matches!(result, Err(ChainError::SelfTransfer)),
+            "VULNERABILITY: self-transfer accepted"
+        );
+    }
+
+    /// Attack: Amount + fee overflow (u64::MAX values).
+    #[test]
+    fn attack_compliance_overflow_protection() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: u64::MAX,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: u64::MAX,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        // checked_add(u64::MAX, 100) overflows → error
+        assert!(
+            result.is_err(),
+            "VULNERABILITY: amount + fee overflow not detected"
+        );
+    }
+
+    /// Attack: Anonymous tier has very low threshold — test it triggers report.
+    #[test]
+    fn attack_compliance_anonymous_low_threshold() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_hash = state.get_wallet(&sender).unwrap();
+        let threshold = Tier::Anonymous.reporting_threshold(); // 1_000_000
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: threshold,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Anonymous,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: threshold,
+            jurisdiction: 840,
+        });
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+        assert!(
+            !new_state.compliance.is_empty(),
+            "Anonymous at threshold should trigger compliance report"
+        );
+    }
+
+    /// Attack: State pre-image mismatch is rejected.
+    #[test]
+    fn attack_compliance_state_pre_mismatch() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: [0xFF; 32], // wrong pre-state!
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(
+            matches!(result, Err(ChainError::StateHashMismatch { .. })),
+            "VULNERABILITY: wrong state_pre accepted"
+        );
+    }
+
+    /// Attack: Non-existent sender account should fail.
+    #[test]
+    fn attack_compliance_nonexistent_sender() {
+        let (state, _sender, recipient) = setup_state_with_wallets();
+
+        let fake_sender = [0xFF; 32]; // not registered
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: fake_sender,
+            to: recipient,
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: ZERO_HASH,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 1000,
+            jurisdiction: 840,
+        });
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(
+            matches!(result, Err(ChainError::AccountNotFound(_))),
+            "VULNERABILITY: non-existent sender accepted"
+        );
     }
 }
