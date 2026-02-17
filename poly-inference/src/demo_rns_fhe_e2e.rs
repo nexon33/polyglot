@@ -51,7 +51,9 @@ fn main() {
     // [A1] Load model
     eprint!("  [A1] Loading Qwen3-0.6B...");
     let t = Instant::now();
-    poly_inference::model::load_model(candle_core::Device::Cpu)
+    let device = candle_core::Device::cuda_if_available(0).unwrap_or(candle_core::Device::Cpu);
+    eprintln!(" ({})", if device.is_cuda() { "CUDA" } else { "CPU" });
+    poly_inference::model::load_model(device)
         .expect("failed to load model");
     let model_load_ms = t.elapsed().as_secs_f64() * 1000.0;
     eprintln!(" done ({:.1}s)", model_load_ms / 1000.0);

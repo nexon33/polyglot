@@ -93,7 +93,8 @@ fn main() {
     // ── [1/7] Load model ──────────────────────────────────────────────
     eprint!("[1/7] Loading model...");
     let t0 = Instant::now();
-    let device = candle_core::Device::Cpu;
+    let device = candle_core::Device::cuda_if_available(0).unwrap_or(candle_core::Device::Cpu);
+    eprintln!("      Device: {}", if device.is_cuda() { "CUDA (GPU)" } else { "CPU" });
     model::load_model(device).expect("failed to load model");
     let load_time = t0.elapsed();
     eprintln!(" done ({:.1}s)", load_time.as_secs_f64());
