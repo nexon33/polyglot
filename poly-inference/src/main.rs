@@ -1,5 +1,4 @@
-mod inference;
-mod model;
+use poly_inference::{inference, model};
 
 use std::time::Instant;
 
