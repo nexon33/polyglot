@@ -14,6 +14,8 @@
 //! - Digit decomposition with base T = 2^18 for low-noise relinearization
 //! - CRT reconstruction via Garner's algorithm in i128 (supports up to 3 primes)
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use super::ntt::{mod_inv, mod_pow, NttContext, NTT_PRIMES};
@@ -21,10 +23,15 @@ use super::params::N;
 use super::rns::{create_ntt_contexts, RnsPoly};
 use super::simd;
 
-/// Decomposition base: 2^DECOMP_BITS per digit.
+/// Decomposition base for relinearization: 2^18 per digit.
 /// With ~36-bit primes and 3 primes (Q ≈ 2^108), this gives ceil(108/18) = 6 digits.
 /// Relin noise ≈ 6 * N * 2^18 * σ ≈ 2^35, well below signal at DELTA^2 ≈ 2^60.
-const DECOMP_BITS: u32 = 18;
+const DECOMP_BITS_RELIN: u32 = 18;
+
+/// Decomposition base for rotation key-switching: 2^4 per digit.
+/// Rotation operates at scale Δ (not Δ²), so we need finer decomposition.
+/// ceil(108/4) = 27 digits. Noise ≈ 27 * N * 2^4 * σ ≈ 2^20, well below Δ = 2^30.
+const DECOMP_BITS_ROT: u32 = 4;
 
 // ═══════════════════════════════════════════════════════════════════════
 // RNS-based CKKS Ciphertext
@@ -57,6 +64,28 @@ pub struct RnsCiphertextTriple {
     pub scale: i64,
     pub level: usize,
 }
+
+/// Rotation key for a single rotation amount (key-switching key).
+///
+/// Encrypts σ_m(s) under s using digit decomposition, where σ_m is the
+/// Galois automorphism corresponding to the desired rotation.
+pub struct RnsRotationKey {
+    /// (b_d, a_d) pairs — one per decomposition digit.
+    /// key_i encrypts σ_m(s) · T^i under s.
+    pub keys: Vec<(RnsPoly, RnsPoly)>,
+    /// The Galois element m such that σ_m(X) = X^m.
+    pub galois_element: usize,
+}
+
+/// Collection of rotation keys for multiple rotation amounts.
+pub struct RnsRotationKeySet {
+    /// Maps rotation amount (signed) to its rotation key.
+    pub keys: HashMap<i32, RnsRotationKey>,
+}
+
+/// Galois group generator for N = 4096 (2N = 8192).
+/// 5 has order 2048 = N/2 in (Z/8192)*, generating all slot rotations.
+const GALOIS_GEN: usize = 5;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Context: holds NTT tables and parameters
@@ -99,13 +128,12 @@ impl RnsCkksContext {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Compute number of base-T digits needed for the given number of primes.
-fn num_decomp_digits(num_primes: usize) -> usize {
-    // Total modulus bits ≈ sum of prime bit-widths
+fn num_decomp_digits(num_primes: usize, decomp_bits: u32) -> usize {
     let total_bits: u32 = NTT_PRIMES[..num_primes]
         .iter()
         .map(|&q| 64 - (q as u64).leading_zeros())
         .sum();
-    ((total_bits + DECOMP_BITS - 1) / DECOMP_BITS) as usize
+    ((total_bits + decomp_bits - 1) / decomp_bits) as usize
 }
 
 /// Garner's CRT reconstruction returning i128 (no truncation to i64).
@@ -170,10 +198,10 @@ fn garner_wide(residues: &[i64], primes: &[i64]) -> i128 {
 ///
 /// Pipeline: CRT reconstruct → base-T digit extract → back to RNS.
 /// Each output digit polynomial has coefficients in [0, T).
-fn decompose_for_relin(d2: &RnsPoly) -> Vec<RnsPoly> {
+fn decompose_digits(d2: &RnsPoly, decomp_bits: u32) -> Vec<RnsPoly> {
     let primes = &NTT_PRIMES[..d2.num_primes];
-    let nd = num_decomp_digits(d2.num_primes);
-    let base = 1i128 << DECOMP_BITS;
+    let nd = num_decomp_digits(d2.num_primes, decomp_bits);
+    let base = 1i128 << decomp_bits;
 
     // Compute Q for making values positive
     let mut q_total: i128 = 1;
@@ -266,8 +294,8 @@ pub fn rns_gen_eval_key<R: rand::Rng>(
 ) -> RnsEvalKey {
     let s_squared = s.mul(s, &ctx.ntt);
     let num_primes = ctx.num_primes;
-    let nd = num_decomp_digits(num_primes);
-    let base = 1i64 << DECOMP_BITS;
+    let nd = num_decomp_digits(num_primes, DECOMP_BITS_RELIN);
+    let base = 1i64 << DECOMP_BITS_RELIN;
 
     let mut keys = Vec::with_capacity(nd);
 
@@ -493,7 +521,7 @@ pub fn rns_relinearize(
     evk: &RnsEvalKey,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
-    let digits = decompose_for_relin(&triple.d2);
+    let digits = decompose_digits(&triple.d2, DECOMP_BITS_RELIN);
     let np = triple.d0.num_primes;
 
     let mut c0 = triple.d0;
@@ -547,6 +575,236 @@ pub fn rns_rescale(ct: &RnsCiphertext) -> RnsCiphertext {
         scale: ct.scale / q_last,
         level: ct.level + 1,
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Slot Rotations (Galois automorphisms + key-switching)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Compute the Galois element for rotating slots by `rotation` positions.
+///
+/// Rotation by r corresponds to automorphism σ_{g^r mod 2N} where g = 5.
+/// Negative rotations use g^{-r} = (g^{-1})^r.
+pub fn rotation_to_galois(rotation: i32) -> usize {
+    let two_n = 2 * N;
+    let slots = N / 2;
+
+    // Normalize rotation to [0, slots)
+    let r = ((rotation % slots as i32) + slots as i32) as usize % slots;
+    if r == 0 {
+        return 1; // identity
+    }
+
+    // g^r mod 2N
+    let mut result = 1usize;
+    for _ in 0..r {
+        result = (result * GALOIS_GEN) % two_n;
+    }
+    result
+}
+
+/// Generate a rotation key for a single rotation amount.
+///
+/// The key encrypts σ_m(s) · T^i under s for each decomposition digit i.
+/// This is structurally identical to eval key generation but with σ_m(s)
+/// instead of s².
+pub fn rns_gen_rotation_key<R: rand::Rng>(
+    s: &RnsPoly,
+    rotation: i32,
+    ctx: &RnsCkksContext,
+    rng: &mut R,
+) -> RnsRotationKey {
+    let galois_element = rotation_to_galois(rotation);
+    let s_automorphed = s.apply_automorphism(galois_element);
+    let num_primes = ctx.num_primes;
+    let nd = num_decomp_digits(num_primes, DECOMP_BITS_ROT);
+    let base = 1i64 << DECOMP_BITS_ROT;
+
+    let mut keys = Vec::with_capacity(nd);
+    for i in 0..nd {
+        // Compute T^i mod each prime
+        let t_power: Vec<i64> = NTT_PRIMES[..num_primes]
+            .iter()
+            .map(|&q| mod_pow(base, i as u64, q))
+            .collect();
+
+        // σ_m(s) · T^i
+        let s_auto_ti = rns_channel_scalar_mul(&s_automorphed, &t_power);
+
+        // evk_i: b_i = -(a_i·s + e_i) + σ_m(s)·T^i, a_i = random
+        let a = rns_sample_uniform(rng, num_primes);
+        let e = rns_sample_gaussian(rng, num_primes);
+        let a_s = a.mul(s, &ctx.ntt);
+        let b = a_s.add(&e).neg().add(&s_auto_ti);
+        keys.push((b, a));
+    }
+
+    RnsRotationKey {
+        keys,
+        galois_element,
+    }
+}
+
+/// Generate rotation keys for a set of rotation amounts.
+pub fn rns_gen_rotation_keys<R: rand::Rng>(
+    s: &RnsPoly,
+    rotations: &[i32],
+    ctx: &RnsCkksContext,
+    rng: &mut R,
+) -> RnsRotationKeySet {
+    let mut keys = HashMap::new();
+    for &r in rotations {
+        keys.insert(r, rns_gen_rotation_key(s, r, ctx, rng));
+    }
+    RnsRotationKeySet { keys }
+}
+
+/// Rotate SIMD slots by `rotation` positions (positive = left shift).
+///
+/// Pipeline:
+/// 1. Apply automorphism σ_m to both c0 and c1
+/// 2. Key-switch c1 from σ_m(s) back to s using rotation key
+///
+/// The key-switching step is identical to relinearization: decompose
+/// σ_m(c1) into digits, multiply by rotation key pairs, accumulate.
+pub fn rns_rotate(
+    ct: &RnsCiphertext,
+    rotation: i32,
+    rot_keys: &RnsRotationKeySet,
+    ctx: &RnsCkksContext,
+) -> RnsCiphertext {
+    let slots = N / 2;
+    let r = ((rotation % slots as i32) + slots as i32) as usize % slots;
+    if r == 0 {
+        return ct.clone();
+    }
+
+    let rot_key = rot_keys
+        .keys
+        .get(&rotation)
+        .unwrap_or_else(|| panic!("no rotation key for rotation {}", rotation));
+
+    let galois = rot_key.galois_element;
+
+    // Apply automorphism to both ciphertext components
+    let c0_auto = ct.c0.apply_automorphism(galois);
+    let c1_auto = ct.c1.apply_automorphism(galois);
+
+    // Key-switch c1_auto from σ_m(s) to s
+    // (identical to relinearization but on c1_auto instead of d2)
+    let digits = decompose_digits(&c1_auto, DECOMP_BITS_ROT);
+    let np = c0_auto.num_primes;
+
+    let mut c0_new = c0_auto;
+    let mut c1_new = RnsPoly::zero(np);
+
+    for (i, digit) in digits.iter().enumerate() {
+        let (ref ks_b, ref ks_a) = rot_key.keys[i];
+        let ks_b_t = rns_truncate(ks_b, np);
+        let ks_a_t = rns_truncate(ks_a, np);
+
+        c0_new = c0_new.add(&digit.mul(&ks_b_t, &ctx.ntt));
+        c1_new = c1_new.add(&digit.mul(&ks_a_t, &ctx.ntt));
+    }
+
+    RnsCiphertext {
+        c0: c0_new,
+        c1: c1_new,
+        scale: ct.scale,
+        level: ct.level,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Plaintext SIMD multiply
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Multiply a ciphertext by a SIMD-packed plaintext vector.
+///
+/// Encodes `values` into a polynomial at scale Δ, then multiplies both
+/// ciphertext components. Result scale = ct.scale × Δ (needs rescaling).
+///
+/// This is much cheaper than ct×ct multiplication:
+/// - Only 2 polynomial multiplications (vs 4)
+/// - No relinearization needed (result is still degree 1)
+/// - No key-switching noise
+pub fn rns_ct_mul_plain_simd(
+    ct: &RnsCiphertext,
+    values: &[f64],
+    ctx: &RnsCkksContext,
+) -> RnsCiphertext {
+    let coeffs = simd::encode_simd(values, ctx.delta as f64);
+    let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
+
+    RnsCiphertext {
+        c0: ct.c0.mul(&p, &ctx.ntt),
+        c1: ct.c1.mul(&p, &ctx.ntt),
+        scale: ct.scale * ctx.delta,
+        level: ct.level,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Matrix-vector multiply via diagonal method
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Replicate a d-element vector across all NUM_SLOTS positions.
+///
+/// Required for `rns_matvec`: the encrypted input must be replicated
+/// so that SIMD rotations wrap around correctly at d-element boundaries.
+pub fn replicate_vector(values: &[f64], d: usize) -> Vec<f64> {
+    let mut replicated = vec![0.0; simd::NUM_SLOTS];
+    for i in 0..simd::NUM_SLOTS {
+        replicated[i] = values[i % d];
+    }
+    replicated
+}
+
+/// Compute W·x where W is a d×d matrix and x is encrypted in SIMD slots.
+///
+/// Uses the diagonal method:
+///     W·x = Σ_{k=0}^{d-1} diag_k(W) ⊙ rotate(x, k)
+///
+/// where diag_k(W)[i] = W[i%d][(i%d+k)%d] is the k-th generalized diagonal,
+/// tiled across all slots so that rotation wrap-around is correct.
+///
+/// **Important:** The input ciphertext must contain a *replicated* vector
+/// (use `replicate_vector` before encryption). The result is at scale Δ²
+/// (needs rescaling by the caller).
+///
+/// # Arguments
+/// * `ct_x` - Encrypted replicated input vector
+/// * `matrix` - Row-major d×d matrix (matrix[i*d + j] = W[i][j])
+/// * `d` - Dimension of the matrix
+/// * `rot_keys` - Rotation keys for rotations 1..d-1
+/// * `ctx` - CKKS context
+pub fn rns_matvec(
+    ct_x: &RnsCiphertext,
+    matrix: &[f64],
+    d: usize,
+    rot_keys: &RnsRotationKeySet,
+    ctx: &RnsCkksContext,
+) -> RnsCiphertext {
+    assert_eq!(matrix.len(), d * d, "matrix must be d×d");
+
+    // k = 0: no rotation needed
+    // Tile the diagonal across all slots for correct wrap-around
+    let diag_0: Vec<f64> = (0..simd::NUM_SLOTS)
+        .map(|i| matrix[(i % d) * d + (i % d)])
+        .collect();
+    let mut result = rns_ct_mul_plain_simd(ct_x, &diag_0, ctx);
+
+    // k = 1..d-1: rotate then multiply by tiled diagonal
+    for k in 1..d {
+        let diag_k: Vec<f64> = (0..simd::NUM_SLOTS)
+            .map(|i| matrix[(i % d) * d + ((i % d) + k) % d])
+            .collect();
+        let ct_rot = rns_rotate(ct_x, k as i32, rot_keys, ctx);
+        let term = rns_ct_mul_plain_simd(&ct_rot, &diag_k, ctx);
+        result = rns_ct_add(&result, &term);
+    }
+
+    result
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -911,9 +1169,9 @@ mod tests {
         let ct2 = rns_encrypt_f64(4.0, &pk_b, &pk_a, &ctx, &mut rng);
         let triple = rns_ct_mul(&ct1, &ct2, &ctx);
 
-        let digits = decompose_for_relin(&triple.d2);
+        let digits = decompose_digits(&triple.d2, DECOMP_BITS_RELIN);
         let nd = digits.len();
-        let base = 1i64 << DECOMP_BITS;
+        let base = 1i64 << DECOMP_BITS_RELIN;
 
         // Reconstruct: sum_i digit_i * T^i should equal d2
         let mut reconstructed = RnsPoly::from_coeffs(&[0i64], triple.d2.num_primes);
@@ -934,6 +1192,293 @@ mod tests {
                 original[j], recon[j],
                 "coefficient {} mismatch: {} vs {}",
                 j, original[j], recon[j]
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Rotation tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn rotation_galois_element() {
+        // rotation 0 → identity (m=1)
+        assert_eq!(rotation_to_galois(0), 1);
+
+        // rotation 1 → g = 5
+        assert_eq!(rotation_to_galois(1), 5);
+
+        // rotation 2 → g² = 25
+        assert_eq!(rotation_to_galois(2), (5 * 5) % (2 * N));
+    }
+
+    #[test]
+    fn rotation_plaintext_automorphism() {
+        // Test automorphism on plaintext (no encryption) to verify slot permutation
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let delta = (1u64 << 30) as f64;
+        let coeffs = simd::encode_simd(&values, delta);
+
+        // Apply automorphism σ_5 (rotation by 1) to the plaintext polynomial
+        let p = RnsPoly::from_coeffs(&coeffs, 1);
+        let p_rot = p.apply_automorphism(rotation_to_galois(1));
+        let rot_coeffs = p_rot.to_coeffs();
+
+        // Decode the rotated polynomial
+        let decoded = simd::decode_simd(&rot_coeffs, delta, 5);
+
+        println!("Original: {:?}", values);
+        println!("Decoded after σ_5: {:?}", decoded);
+
+        // After rotation by 1: slot[i] should get value from slot[i+1]
+        // So decoded[0] ≈ 2.0, decoded[1] ≈ 3.0, etc.
+        assert!(
+            (decoded[0] - 2.0).abs() < 0.01,
+            "plaintext rot: slot 0 expected ~2.0, got {}",
+            decoded[0]
+        );
+        assert!(
+            (decoded[1] - 3.0).abs() < 0.01,
+            "plaintext rot: slot 1 expected ~3.0, got {}",
+            decoded[1]
+        );
+    }
+
+    #[test]
+    fn rotation_by_1() {
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+        let rot_keys = rns_gen_rotation_keys(&s, &[1], &ctx, &mut rng);
+
+        // Encrypt [1, 2, 3, 4, 5, 0, 0, ...]
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let ct = rns_encrypt_simd(&values, &pk_b, &pk_a, &ctx, &mut rng);
+
+        // Rotate by 1: expect [2, 3, 4, 5, 0, ..., 0, 1]
+        let ct_rot = rns_rotate(&ct, 1, &rot_keys, &ctx);
+        let decrypted = rns_decrypt_simd(&ct_rot, &s, &ctx, 5);
+
+        // After rotation by 1: slot[i] gets value from slot[i+1]
+        assert!(
+            (decrypted[0] - 2.0).abs() < 0.5,
+            "slot 0 after rot1: expected ~2.0, got {}",
+            decrypted[0]
+        );
+        assert!(
+            (decrypted[1] - 3.0).abs() < 0.5,
+            "slot 1 after rot1: expected ~3.0, got {}",
+            decrypted[1]
+        );
+        assert!(
+            (decrypted[2] - 4.0).abs() < 0.5,
+            "slot 2 after rot1: expected ~4.0, got {}",
+            decrypted[2]
+        );
+        assert!(
+            (decrypted[3] - 5.0).abs() < 0.5,
+            "slot 3 after rot1: expected ~5.0, got {}",
+            decrypted[3]
+        );
+    }
+
+    #[test]
+    fn rotation_by_2() {
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+        let rot_keys = rns_gen_rotation_keys(&s, &[2], &ctx, &mut rng);
+
+        let values = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let ct = rns_encrypt_simd(&values, &pk_b, &pk_a, &ctx, &mut rng);
+
+        let ct_rot = rns_rotate(&ct, 2, &rot_keys, &ctx);
+        let decrypted = rns_decrypt_simd(&ct_rot, &s, &ctx, 4);
+
+        // After rotation by 2: slot[i] gets value from slot[i+2]
+        assert!(
+            (decrypted[0] - 30.0).abs() < 0.5,
+            "slot 0 after rot2: expected ~30, got {}",
+            decrypted[0]
+        );
+        assert!(
+            (decrypted[1] - 40.0).abs() < 0.5,
+            "slot 1 after rot2: expected ~40, got {}",
+            decrypted[1]
+        );
+        assert!(
+            (decrypted[2] - 50.0).abs() < 0.5,
+            "slot 2 after rot2: expected ~50, got {}",
+            decrypted[2]
+        );
+        assert!(
+            (decrypted[3] - 60.0).abs() < 0.5,
+            "slot 3 after rot2: expected ~60, got {}",
+            decrypted[3]
+        );
+    }
+
+    #[test]
+    fn rotation_identity() {
+        // Rotation by 0 should return the same ciphertext
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+        let rot_keys = rns_gen_rotation_keys(&s, &[0], &ctx, &mut rng);
+
+        let values = vec![1.0, 2.0, 3.0];
+        let ct = rns_encrypt_simd(&values, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_rot = rns_rotate(&ct, 0, &rot_keys, &ctx);
+        let decrypted = rns_decrypt_simd(&ct_rot, &s, &ctx, 3);
+
+        for (i, &v) in values.iter().enumerate() {
+            assert!(
+                (decrypted[i] - v).abs() < 0.01,
+                "slot {} after rot0: expected {}, got {}",
+                i, v, decrypted[i]
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Plaintext SIMD multiply tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn plaintext_simd_multiply() {
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+        let ct_vals = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let plain_vals = vec![4.0, 5.0, 6.0, 7.0, 8.0];
+
+        let ct = rns_encrypt_simd(&ct_vals, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_prod = rns_ct_mul_plain_simd(&ct, &plain_vals, &ctx);
+
+        // Scale is now Δ², need to rescale
+        assert_eq!(ct_prod.scale, ctx.delta * ctx.delta);
+        let ct_rescaled = rns_rescale(&ct_prod);
+
+        let decrypted = rns_decrypt_simd(&ct_rescaled, &s, &ctx, 5);
+
+        for i in 0..5 {
+            let expected = ct_vals[i] * plain_vals[i];
+            assert!(
+                (decrypted[i] - expected).abs() < 1.0,
+                "slot {} plain_mul: expected {}, got {}",
+                i, expected, decrypted[i]
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_simd_multiply_identity() {
+        // Multiply by all-ones plaintext → should return original values
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+        let ct_vals = vec![3.0, -1.5, 7.0, 0.5];
+        let ones = vec![1.0, 1.0, 1.0, 1.0];
+
+        let ct = rns_encrypt_simd(&ct_vals, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_prod = rns_ct_mul_plain_simd(&ct, &ones, &ctx);
+        let ct_rescaled = rns_rescale(&ct_prod);
+
+        let decrypted = rns_decrypt_simd(&ct_rescaled, &s, &ctx, 4);
+
+        for i in 0..4 {
+            assert!(
+                (decrypted[i] - ct_vals[i]).abs() < 1.0,
+                "slot {} plain_mul_id: expected {}, got {}",
+                i, ct_vals[i], decrypted[i]
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Matrix-vector multiply tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn matvec_identity_matrix() {
+        // I · x = x
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+        let d = 4;
+        // Identity matrix (row-major)
+        let mut identity = vec![0.0f64; d * d];
+        for i in 0..d {
+            identity[i * d + i] = 1.0;
+        }
+
+        let x = vec![1.0, 2.0, 3.0, 4.0];
+        let x_rep = replicate_vector(&x, d);
+        let rotations: Vec<i32> = (1..d as i32).collect();
+        let rot_keys = rns_gen_rotation_keys(&s, &rotations, &ctx, &mut rng);
+
+        let ct_x = rns_encrypt_simd(&x_rep, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_result = rns_matvec(&ct_x, &identity, d, &rot_keys, &ctx);
+        let ct_result = rns_rescale(&ct_result);
+
+        let decrypted = rns_decrypt_simd(&ct_result, &s, &ctx, d);
+
+        for i in 0..d {
+            assert!(
+                (decrypted[i] - x[i]).abs() < 1.0,
+                "slot {} identity matvec: expected {}, got {}",
+                i, x[i], decrypted[i]
+            );
+        }
+    }
+
+    #[test]
+    fn matvec_4x4() {
+        // Arbitrary 4×4 matrix-vector product
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+        let d = 4;
+        // W = [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]]
+        let w = vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+        let x = vec![1.0, 2.0, 3.0, 4.0];
+        let x_rep = replicate_vector(&x, d);
+
+        // Expected: W·x
+        let mut expected = vec![0.0f64; d];
+        for i in 0..d {
+            for j in 0..d {
+                expected[i] += w[i * d + j] * x[j];
+            }
+        }
+        // expected = [30, 70, 110, 150]
+
+        let rotations: Vec<i32> = (1..d as i32).collect();
+        let rot_keys = rns_gen_rotation_keys(&s, &rotations, &ctx, &mut rng);
+
+        let ct_x = rns_encrypt_simd(&x_rep, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_result = rns_matvec(&ct_x, &w, d, &rot_keys, &ctx);
+        let ct_result = rns_rescale(&ct_result);
+
+        let decrypted = rns_decrypt_simd(&ct_result, &s, &ctx, d);
+
+        println!("Expected: {:?}", expected);
+        println!("Got:      {:?}", decrypted);
+
+        for i in 0..d {
+            assert!(
+                (decrypted[i] - expected[i]).abs() < 2.0,
+                "slot {} matvec: expected {}, got {}",
+                i, expected[i], decrypted[i]
             );
         }
     }

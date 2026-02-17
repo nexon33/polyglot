@@ -218,6 +218,39 @@ impl RnsPoly {
         }
     }
 
+    /// Apply Galois automorphism σ_m: X → X^m in the ring Z[X]/(X^N+1).
+    ///
+    /// For each coefficient a_j at position j, the monomial X^j maps to X^{m*j}.
+    /// In the quotient ring: X^k = (-1)^{floor(k/N)} · X^{k mod N} since X^N = -1.
+    ///
+    /// `m` must be odd and coprime to 2N. This is a permutation (no collision)
+    /// because gcd(m, 2N) = 1 guarantees j → m*j mod 2N is a bijection.
+    pub fn apply_automorphism(&self, m: usize) -> RnsPoly {
+        let two_n = 2 * N;
+        debug_assert!(m % 2 == 1, "automorphism index must be odd");
+        debug_assert!(m < two_n, "automorphism index must be < 2N");
+
+        let mut residues = Vec::with_capacity(self.num_primes);
+        for ch in 0..self.num_primes {
+            let q = NTT_PRIMES[ch];
+            let mut out = vec![0i64; N];
+            for j in 0..N {
+                let idx = (m * j) % two_n;
+                if idx < N {
+                    out[idx] = self.residues[ch][j];
+                } else {
+                    // X^N = -1, so X^idx = -X^{idx-N}
+                    out[idx - N] = (q - self.residues[ch][j]) % q;
+                }
+            }
+            residues.push(out);
+        }
+        RnsPoly {
+            residues,
+            num_primes: self.num_primes,
+        }
+    }
+
     /// Drop the last prime (rescaling step).
     ///
     /// After multiplication doubles the scale, we divide by the last prime
@@ -508,6 +541,89 @@ mod tests {
             .collect();
         let reconstructed = garner_reconstruct(&residues, &NTT_PRIMES[..3]);
         assert_eq!(reconstructed, val);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Automorphism tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn automorphism_identity() {
+        // σ_1: X → X (identity automorphism)
+        let coeffs = vec![1, 2, 3, -4, 5];
+        let p = RnsPoly::from_coeffs(&coeffs, 3);
+        let q = p.apply_automorphism(1);
+        let result = q.to_coeffs();
+        for i in 0..5 {
+            assert_eq!(result[i], coeffs[i], "identity failed at {}", i);
+        }
+    }
+
+    #[test]
+    fn automorphism_x_to_x3() {
+        // σ_3: X → X^3
+        // Polynomial: a_0 + a_1·X
+        // After: a_0 + a_1·X^3
+        let p = RnsPoly::from_coeffs(&[10, 20], 3);
+        let q = p.apply_automorphism(3);
+        let result = q.to_coeffs();
+        // coeff[0] = 10, coeff[3] = 20, rest = 0
+        assert_eq!(result[0], 10);
+        assert_eq!(result[3], 20);
+        assert_eq!(result[1], 0);
+        assert_eq!(result[2], 0);
+    }
+
+    #[test]
+    fn automorphism_negacyclic_wrap() {
+        // σ_3 on X^{N-1}: (X^3)^{N-1} = X^{3N-3} = X^N · X^{2N-3} = -X^{2N-3}
+        // 2N-3 mod N = N-3, and there's one factor of X^N so sign = -1
+        // More precisely: 3*(N-1) = 3N - 3.
+        // (3N-3) mod 2N = N - 3 (since 3N-3 - 2N = N-3 < N, and N-3 < N).
+        // Wait: 3*(N-1) = 3N - 3. (3N-3) % (2N) = N - 3. Since N-3 < N, no sign flip.
+        // Actually: idx = 3*(N-1) % (2*N) = (3*4095) % 8192 = 12285 % 8192 = 4093
+        // 4093 < N=4096, so output[4093] = input[N-1], no sign flip
+        let mut coeffs = vec![0i64; N];
+        coeffs[N - 1] = 7;
+        let p = RnsPoly::from_coeffs(&coeffs, 2);
+        let q = p.apply_automorphism(3);
+        let result = q.to_coeffs();
+        let expected_idx = (3 * (N - 1)) % (2 * N);
+        if expected_idx < N {
+            assert_eq!(result[expected_idx], 7);
+        } else {
+            assert_eq!(result[expected_idx - N], -7);
+        }
+    }
+
+    #[test]
+    fn automorphism_roundtrip() {
+        // σ_m then σ_{m^{-1}} should return original polynomial
+        // m = 5, m^{-1} mod 2N = 5^{-1} mod 8192
+        // 5 * x ≡ 1 (mod 8192)
+        // x = 5^{-1} mod 8192
+        let two_n = 2 * N;
+        let m = 5usize;
+        // Compute m_inv such that m * m_inv ≡ 1 (mod 2N)
+        let m_inv = {
+            let mut inv = 1usize;
+            for candidate in (1..two_n).step_by(2) {
+                if (m * candidate) % two_n == 1 {
+                    inv = candidate;
+                    break;
+                }
+            }
+            inv
+        };
+        assert_eq!((m * m_inv) % two_n, 1, "failed to find inverse");
+
+        let coeffs: Vec<i64> = (0..N as i64).map(|i| (i * 7 + 3) % 100 - 50).collect();
+        let p = RnsPoly::from_coeffs(&coeffs, 3);
+        let q = p.apply_automorphism(m).apply_automorphism(m_inv);
+        let result = q.to_coeffs();
+        for i in 0..N {
+            assert_eq!(result[i], coeffs[i], "roundtrip failed at {}", i);
+        }
     }
 
     #[test]

@@ -423,6 +423,122 @@ fn simd_elementwise_multiply_and_verify() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Rotation + Matrix-Vector Multiply Integration Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn rotation_multiple_amounts() {
+    // Test rotations by 1, 2, and 3 in a single key set
+    let mut rng = test_rng();
+    let ctx = RnsCkksContext::new(3);
+    let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+    let rot_keys = rns_gen_rotation_keys(&s, &[1, 2, 3], &ctx, &mut rng);
+
+    let values: Vec<f64> = (1..=8).map(|i| i as f64).collect();
+    let ct = rns_encrypt_simd(&values, &pk_b, &pk_a, &ctx, &mut rng);
+
+    for rot in 1..=3i32 {
+        let ct_rot = rns_rotate(&ct, rot, &rot_keys, &ctx);
+        let decrypted = rns_decrypt_simd(&ct_rot, &s, &ctx, 5);
+
+        for i in 0..5 {
+            let expected = values[(i + rot as usize) % values.len()];
+            // Some wrap-around values go to slot 2048-k, not checked here
+            if i + rot as usize >= values.len() {
+                continue;
+            }
+            assert!(
+                (decrypted[i] - expected).abs() < 0.5,
+                "rot {} slot {}: expected {}, got {}",
+                rot, i, expected, decrypted[i]
+            );
+        }
+    }
+    println!("\n=== Rotation by 1, 2, 3: all correct ===");
+}
+
+#[test]
+fn matvec_8x8_neural_layer() {
+    // 8×8 matrix-vector multiply: simulates a small neural network layer
+    let mut rng = test_rng();
+    let ctx = RnsCkksContext::new(3);
+    let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+    let d = 8;
+    // Random-ish weight matrix (values in [-1, 1])
+    let w: Vec<f64> = (0..d * d)
+        .map(|i| (i as f64 * 0.37).sin() * 0.5)
+        .collect();
+    let x: Vec<f64> = (0..d).map(|i| (i as f64 + 1.0) * 0.25).collect();
+
+    // Compute expected result
+    let mut expected = vec![0.0f64; d];
+    for i in 0..d {
+        for j in 0..d {
+            expected[i] += w[i * d + j] * x[j];
+        }
+    }
+
+    let rotations: Vec<i32> = (1..d as i32).collect();
+    let rot_keys = rns_gen_rotation_keys(&s, &rotations, &ctx, &mut rng);
+
+    let t_start = Instant::now();
+    let x_rep = replicate_vector(&x, d);
+    let ct_x = rns_encrypt_simd(&x_rep, &pk_b, &pk_a, &ctx, &mut rng);
+    let ct_result = rns_matvec(&ct_x, &w, d, &rot_keys, &ctx);
+    let ct_result = rns_rescale(&ct_result);
+    let elapsed = t_start.elapsed();
+
+    let decrypted = rns_decrypt_simd(&ct_result, &s, &ctx, d);
+
+    let max_err = expected.iter().zip(decrypted.iter())
+        .map(|(e, d)| (e - d).abs())
+        .fold(0.0f64, f64::max);
+
+    println!("\n=== 8×8 Neural Layer via Encrypted Matvec ===");
+    println!("  Expected: {:?}", expected.iter().map(|v| format!("{:.3}", v)).collect::<Vec<_>>());
+    println!("  Got:      {:?}", decrypted.iter().map(|v| format!("{:.3}", v)).collect::<Vec<_>>());
+    println!("  Max error: {:.2e}", max_err);
+    println!("  Time:      {:.1} ms", elapsed.as_secs_f64() * 1000.0);
+
+    assert!(
+        max_err < 2.0,
+        "8×8 matvec max error {} too large",
+        max_err
+    );
+}
+
+#[test]
+fn plaintext_simd_multiply_integration() {
+    // Multiply encrypted vector by plaintext weights (no ct-ct mul needed)
+    let mut rng = test_rng();
+    let ctx = RnsCkksContext::new(3);
+    let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+    let activations: Vec<f64> = (0..64).map(|i| (i as f64 * 0.05).tanh()).collect();
+    let weights: Vec<f64> = (0..64).map(|i| (i as f64 - 32.0) * 0.1).collect();
+
+    let ct = rns_encrypt_simd(&activations, &pk_b, &pk_a, &ctx, &mut rng);
+    let ct_prod = rns_ct_mul_plain_simd(&ct, &weights, &ctx);
+    let ct_result = rns_rescale(&ct_prod);
+
+    let decrypted = rns_decrypt_simd(&ct_result, &s, &ctx, 64);
+
+    let max_err = activations.iter().zip(weights.iter()).zip(decrypted.iter())
+        .map(|((&a, &w), &d)| (a * w - d).abs())
+        .fold(0.0f64, f64::max);
+
+    println!("\n=== Plaintext SIMD Multiply (64 slots) ===");
+    println!("  Max error: {:.2e}", max_err);
+
+    assert!(
+        max_err < 1.0,
+        "plaintext SIMD mul max error {} too large",
+        max_err
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Verify Phase 1 tests still pass with Phase 2 code
 // ═══════════════════════════════════════════════════════════════════════
 

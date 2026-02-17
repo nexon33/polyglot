@@ -148,16 +148,48 @@ fn ifft(a: &mut [Complex]) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// CKKS SIMD Encoding / Decoding
+// Galois-aligned slot permutation
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Galois generator: 5 has order N/2 = 2048 in (Z/2N)*.
+/// σ_5 rotates slots by 1 position when using Galois-aligned indexing.
+const GALOIS_GEN: usize = 5;
+
+/// Compute the Galois-aligned slot → FFT position mapping.
+///
+/// Slot i maps to root ψ^{g^i mod 2N}, which is FFT position (g^i - 1)/2.
+/// This ensures σ_g (X → X^g) cyclically shifts slots by 1 position.
+fn slot_permutation() -> (Vec<usize>, Vec<usize>) {
+    let two_n = 2 * N;
+    let mut slot_to_fft = vec![0usize; NUM_SLOTS];
+    let mut fft_to_slot = vec![NUM_SLOTS; N]; // sentinel for unmapped
+
+    let mut root_idx = 1usize; // g^0 = 1
+    for i in 0..NUM_SLOTS {
+        // root_idx = g^i mod 2N (always odd)
+        let fft_pos = (root_idx - 1) / 2;
+        slot_to_fft[i] = fft_pos;
+        fft_to_slot[fft_pos] = i;
+        root_idx = (root_idx * GALOIS_GEN) % two_n;
+    }
+
+    (slot_to_fft, fft_to_slot)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CKKS SIMD Encoding / Decoding (Galois-aligned)
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Encode up to N/2 real values into N polynomial coefficients.
 ///
-/// Uses the inverse canonical embedding:
-/// 1. Form conjugate-symmetric evaluation vector
-/// 2. IFFT to get twisted coefficients
-/// 3. Untwist by ψ^{-j}
-/// 4. Scale by `delta` and round
+/// Uses the inverse canonical embedding with Galois-aligned slot ordering:
+/// 1. Map slot values to FFT positions via g^i permutation
+/// 2. Form conjugate-symmetric evaluation vector
+/// 3. IFFT to get twisted coefficients
+/// 4. Untwist by ψ^{-j}
+/// 5. Scale by `delta` and round
+///
+/// The Galois alignment ensures σ_g (X → X^5) cyclically shifts slots by 1.
 pub fn encode_simd(values: &[f64], delta: f64) -> Vec<i64> {
     assert!(
         values.len() <= NUM_SLOTS,
@@ -166,23 +198,25 @@ pub fn encode_simd(values: &[f64], delta: f64) -> Vec<i64> {
         NUM_SLOTS
     );
 
-    // Pad to NUM_SLOTS
     let mut padded = vec![0.0f64; NUM_SLOTS];
     padded[..values.len()].copy_from_slice(values);
 
-    // Form conjugate-symmetric evaluation vector of length N.
-    // For real inputs: z_k = v_k, z_{N-1-k} = v_k (conjugate = same for reals)
+    let (slot_to_fft, _) = slot_permutation();
+
+    // Form conjugate-symmetric evaluation vector using Galois-aligned positions
     let mut z = vec![Complex::zero(); N];
-    for k in 0..NUM_SLOTS {
-        z[k] = Complex::from_real(padded[k]);
-        z[N - 1 - k] = Complex::from_real(padded[k]);
+    for i in 0..NUM_SLOTS {
+        let fft_pos = slot_to_fft[i];
+        let conj_pos = N - 1 - fft_pos;
+        z[fft_pos] = Complex::from_real(padded[i]);
+        z[conj_pos] = Complex::from_real(padded[i]);
     }
 
     // IFFT: get twisted coefficients b = IFFT(z)
     ifft(&mut z);
 
     // Untwist: p_j = b_j · ψ^{-j} where ψ = e^{2πi/(2N)}
-    let psi_angle = PI / N as f64; // 2π/(2N) = π/N
+    let psi_angle = PI / N as f64;
     for j in 0..N {
         let angle = -(j as f64) * psi_angle;
         let psi_neg_j = Complex::new(angle.cos(), angle.sin());
@@ -195,10 +229,10 @@ pub fn encode_simd(values: &[f64], delta: f64) -> Vec<i64> {
 
 /// Decode N polynomial coefficients back to real values.
 ///
-/// Uses the forward canonical embedding:
+/// Uses the forward canonical embedding with Galois-aligned slot ordering:
 /// 1. Twist by ψ^j
-/// 2. FFT
-/// 3. Take real parts of first `count` entries
+/// 2. FFT to get evaluations
+/// 3. Read real parts from Galois-aligned FFT positions
 pub fn decode_simd(coeffs: &[i64], scale: f64, count: usize) -> Vec<f64> {
     assert!(count <= NUM_SLOTS, "count {} > NUM_SLOTS {}", count, NUM_SLOTS);
 
@@ -220,8 +254,9 @@ pub fn decode_simd(coeffs: &[i64], scale: f64, count: usize) -> Vec<f64> {
     // FFT to get evaluations at roots of X^N+1
     fft(&mut b);
 
-    // Take real parts of first `count` entries
-    b[..count].iter().map(|c| c.re).collect()
+    // Read values from Galois-aligned positions
+    let (slot_to_fft, _) = slot_permutation();
+    (0..count).map(|i| b[slot_to_fft[i]].re).collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════
