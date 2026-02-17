@@ -25,6 +25,7 @@ pub mod ntt;
 pub mod params;
 pub mod rns;
 pub mod rns_ckks;
+pub mod simd;
 pub mod poly;
 pub mod sampling;
 

@@ -7,6 +7,7 @@ use poly_client::ckks::ntt::{NttContext, NTT_PRIMES};
 use poly_client::ckks::params::N;
 use poly_client::ckks::rns::RnsPoly;
 use poly_client::ckks::rns_ckks::*;
+use poly_client::ckks::simd::NUM_SLOTS;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::time::Instant;
@@ -291,6 +292,133 @@ fn benchmark_rns_multiply() {
         iters,
         elapsed.as_secs_f64() * 1000.0,
         elapsed.as_secs_f64() * 1000.0 / iters as f64
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SIMD: throughput comparison (1 value vs 2048 values per ciphertext)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn simd_throughput_comparison() {
+    let mut rng = test_rng();
+    let ctx = RnsCkksContext::new(3);
+    let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+    let evk = rns_gen_eval_key(&s, &ctx, &mut rng);
+
+    println!("\n=== SIMD Throughput: 1 value/ct vs {} values/ct ===", NUM_SLOTS);
+
+    // Scalar mode: encrypt 8 values as 8 separate ciphertexts, multiply pairwise
+    let scalar_start = Instant::now();
+    let n_pairs = 4;
+    for i in 0..n_pairs {
+        let ct_a = rns_encrypt_f64((i + 1) as f64, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_b = rns_encrypt_f64((i + 5) as f64, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_prod = rns_ct_mul_relin(&ct_a, &ct_b, &evk, &ctx);
+        let _ = rns_rescale(&ct_prod);
+    }
+    let scalar_time = scalar_start.elapsed();
+    let scalar_per_value = scalar_time.as_secs_f64() * 1000.0 / n_pairs as f64;
+
+    // SIMD mode: encrypt all 2048 values in one ciphertext, one multiply
+    let a_vals: Vec<f64> = (0..NUM_SLOTS).map(|i| (i % 10 + 1) as f64).collect();
+    let b_vals: Vec<f64> = (0..NUM_SLOTS).map(|i| (i % 10 + 5) as f64).collect();
+
+    let simd_start = Instant::now();
+    let ct_a = rns_encrypt_simd(&a_vals, &pk_b, &pk_a, &ctx, &mut rng);
+    let ct_b = rns_encrypt_simd(&b_vals, &pk_b, &pk_a, &ctx, &mut rng);
+    let ct_prod = rns_ct_mul_relin(&ct_a, &ct_b, &evk, &ctx);
+    let ct_result = rns_rescale(&ct_prod);
+    let simd_time = simd_start.elapsed();
+    let simd_per_value = simd_time.as_secs_f64() * 1000.0 / NUM_SLOTS as f64;
+
+    // Verify SIMD result correctness (spot check first 8 slots)
+    let decrypted = rns_decrypt_simd(&ct_result, &s, &ctx, 8);
+    for i in 0..8 {
+        let expected = a_vals[i] * b_vals[i];
+        assert!(
+            (decrypted[i] - expected).abs() < 1.0,
+            "SIMD slot {} mul: expected {}, got {}",
+            i, expected, decrypted[i]
+        );
+    }
+
+    let throughput_ratio = scalar_per_value / simd_per_value;
+
+    println!("  Scalar: {} muls in {:>6.1} ms ({:.3} ms/value)",
+        n_pairs, scalar_time.as_secs_f64() * 1000.0, scalar_per_value);
+    println!("  SIMD:   {} muls in {:>6.1} ms ({:.6} ms/value)",
+        NUM_SLOTS, simd_time.as_secs_f64() * 1000.0, simd_per_value);
+    println!("  Throughput improvement: {:.0}x", throughput_ratio);
+    println!();
+
+    // SIMD should have much better per-value throughput
+    assert!(
+        throughput_ratio > 10.0,
+        "SIMD throughput improvement ({:.1}x) should be > 10x",
+        throughput_ratio
+    );
+}
+
+#[test]
+fn simd_elementwise_add_large() {
+    let mut rng = test_rng();
+    let ctx = RnsCkksContext::new(3);
+    let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+    // Fill all 2048 slots with different values and add
+    let a: Vec<f64> = (0..NUM_SLOTS).map(|i| (i as f64 * 0.01).sin()).collect();
+    let b: Vec<f64> = (0..NUM_SLOTS).map(|i| (i as f64 * 0.01).cos()).collect();
+
+    let ct_a = rns_encrypt_simd(&a, &pk_b, &pk_a, &ctx, &mut rng);
+    let ct_b = rns_encrypt_simd(&b, &pk_b, &pk_a, &ctx, &mut rng);
+    let ct_sum = rns_ct_add(&ct_a, &ct_b);
+
+    let decrypted = rns_decrypt_simd(&ct_sum, &s, &ctx, NUM_SLOTS);
+
+    let max_err = a.iter().zip(b.iter()).zip(decrypted.iter())
+        .map(|((&ai, &bi), &di)| (ai + bi - di).abs())
+        .fold(0.0f64, f64::max);
+
+    println!("\n=== SIMD Element-wise Add (2048 slots) ===");
+    println!("  Max error: {:.2e}", max_err);
+
+    assert!(max_err < 0.01, "SIMD add max error {} too large", max_err);
+}
+
+#[test]
+fn simd_elementwise_multiply_and_verify() {
+    let mut rng = test_rng();
+    let ctx = RnsCkksContext::new(3);
+    let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+    let evk = rns_gen_eval_key(&s, &ctx, &mut rng);
+
+    // 64 slots: simulates a 64-neuron layer multiplication
+    let weights: Vec<f64> = (0..64).map(|i| (i as f64 - 32.0) * 0.1).collect();
+    let activations: Vec<f64> = (0..64).map(|i| (i as f64 * 0.05).tanh()).collect();
+
+    let ct_w = rns_encrypt_simd(&weights, &pk_b, &pk_a, &ctx, &mut rng);
+    let ct_a = rns_encrypt_simd(&activations, &pk_b, &pk_a, &ctx, &mut rng);
+
+    let ct_prod = rns_ct_mul_relin(&ct_w, &ct_a, &evk, &ctx);
+    let ct_prod = rns_rescale(&ct_prod);
+
+    let decrypted = rns_decrypt_simd(&ct_prod, &s, &ctx, 64);
+
+    let mut max_err = 0.0f64;
+    for i in 0..64 {
+        let expected = weights[i] * activations[i];
+        let err = (decrypted[i] - expected).abs();
+        max_err = max_err.max(err);
+    }
+
+    println!("\n=== SIMD 64-Neuron Layer Multiply ===");
+    println!("  Max error across 64 slots: {:.2e}", max_err);
+
+    assert!(
+        max_err < 1.0,
+        "64-neuron multiply max error {} too large",
+        max_err
     );
 }
 

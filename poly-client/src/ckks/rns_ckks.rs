@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::ntt::{mod_inv, mod_pow, NttContext, NTT_PRIMES};
 use super::params::N;
 use super::rns::{create_ntt_contexts, RnsPoly};
+use super::simd;
 
 /// Decomposition base: 2^DECOMP_BITS per digit.
 /// With ~36-bit primes and 3 primes (Q ≈ 2^108), this gives ceil(108/18) = 6 digits.
@@ -347,6 +348,67 @@ pub fn rns_decrypt_f64(
 
     let coeffs = m_noisy.to_coeffs();
     coeffs[0] as f64 / ct.scale as f64
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SIMD Encryption / Decryption (N/2 = 2048 slots per ciphertext)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Encrypt a vector of up to N/2 = 2048 f64 values using SIMD slot packing.
+///
+/// Each value occupies one "slot" in the polynomial ring. Homomorphic
+/// add/multiply then becomes element-wise add/multiply across all slots.
+pub fn rns_encrypt_simd<R: rand::Rng>(
+    values: &[f64],
+    pk_b: &RnsPoly,
+    pk_a: &RnsPoly,
+    ctx: &RnsCkksContext,
+    rng: &mut R,
+) -> RnsCiphertext {
+    let num_primes = ctx.num_primes;
+
+    // Encode values into polynomial coefficients via canonical embedding
+    let coeffs = simd::encode_simd(values, ctx.delta as f64);
+    let m = RnsPoly::from_coeffs(&coeffs, num_primes);
+
+    // Same encryption as rns_encrypt_f64: c0 = pk_b*u + e1 + m, c1 = pk_a*u + e2
+    let mut u_coeffs = vec![0i64; N];
+    for c in u_coeffs.iter_mut() {
+        *c = rng.gen_range(-1..=1);
+    }
+    let u = RnsPoly::from_coeffs(&u_coeffs, num_primes);
+    let e1 = rns_sample_gaussian(rng, num_primes);
+    let e2 = rns_sample_gaussian(rng, num_primes);
+
+    let c0 = pk_b.mul(&u, &ctx.ntt).add(&e1).add(&m);
+    let c1 = pk_a.mul(&u, &ctx.ntt).add(&e2);
+
+    RnsCiphertext {
+        c0,
+        c1,
+        scale: ctx.delta,
+        level: 0,
+    }
+}
+
+/// Decrypt a SIMD-packed ciphertext and decode `count` slot values.
+pub fn rns_decrypt_simd(
+    ct: &RnsCiphertext,
+    s: &RnsPoly,
+    ctx: &RnsCkksContext,
+    count: usize,
+) -> Vec<f64> {
+    let s_at_level = if s.num_primes > ct.c0.num_primes {
+        rns_truncate(s, ct.c0.num_primes)
+    } else {
+        s.clone()
+    };
+
+    let c1_s = ct.c1.mul(&s_at_level, &ctx.ntt);
+    let m_noisy = ct.c0.add(&c1_s);
+
+    let coeffs = m_noisy.to_coeffs();
+    simd::decode_simd(&coeffs, ct.scale as f64, count)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -692,6 +754,150 @@ mod tests {
 
         let ctx5 = RnsCkksContext::new(5);
         assert_eq!(ctx5.max_depth(), 4);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SIMD (slot packing) tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn simd_encrypt_decrypt_roundtrip() {
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let ct = rns_encrypt_simd(&values, &pk_b, &pk_a, &ctx, &mut rng);
+        let decrypted = rns_decrypt_simd(&ct, &s, &ctx, values.len());
+
+        for (i, (expected, got)) in values.iter().zip(decrypted.iter()).enumerate() {
+            assert!(
+                (expected - got).abs() < 0.01,
+                "slot {} mismatch: expected {}, got {}",
+                i, expected, got
+            );
+        }
+    }
+
+    #[test]
+    fn simd_encrypt_decrypt_negative() {
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+        let values = vec![-3.5, 0.0, 7.2, -1.0, 0.001];
+        let ct = rns_encrypt_simd(&values, &pk_b, &pk_a, &ctx, &mut rng);
+        let decrypted = rns_decrypt_simd(&ct, &s, &ctx, values.len());
+
+        for (i, (expected, got)) in values.iter().zip(decrypted.iter()).enumerate() {
+            assert!(
+                (expected - got).abs() < 0.01,
+                "slot {} mismatch: expected {}, got {}",
+                i, expected, got
+            );
+        }
+    }
+
+    #[test]
+    fn simd_elementwise_add() {
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b = vec![10.0, 20.0, 30.0, 40.0];
+
+        let ct_a = rns_encrypt_simd(&a, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_b = rns_encrypt_simd(&b, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_sum = rns_ct_add(&ct_a, &ct_b);
+
+        let decrypted = rns_decrypt_simd(&ct_sum, &s, &ctx, 4);
+
+        for i in 0..4 {
+            let expected = a[i] + b[i];
+            assert!(
+                (decrypted[i] - expected).abs() < 0.01,
+                "slot {} add: expected {}, got {}",
+                i, expected, decrypted[i]
+            );
+        }
+    }
+
+    #[test]
+    fn simd_elementwise_multiply() {
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+        let evk = rns_gen_eval_key(&s, &ctx, &mut rng);
+
+        let a = vec![2.0, 3.0, 4.0, 5.0];
+        let b = vec![10.0, 20.0, 30.0, 40.0];
+
+        let ct_a = rns_encrypt_simd(&a, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_b = rns_encrypt_simd(&b, &pk_b, &pk_a, &ctx, &mut rng);
+
+        let ct_prod = rns_ct_mul_relin(&ct_a, &ct_b, &evk, &ctx);
+        let ct_prod = rns_rescale(&ct_prod);
+
+        let decrypted = rns_decrypt_simd(&ct_prod, &s, &ctx, 4);
+
+        for i in 0..4 {
+            let expected = a[i] * b[i];
+            assert!(
+                (decrypted[i] - expected).abs() < 1.0,
+                "slot {} mul: expected {}, got {}",
+                i, expected, decrypted[i]
+            );
+        }
+    }
+
+    #[test]
+    fn simd_scalar_multiply() {
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let ct = rns_encrypt_simd(&values, &pk_b, &pk_a, &ctx, &mut rng);
+        let ct_scaled = rns_ct_scalar_mul(&ct, 5);
+
+        let decrypted = rns_decrypt_simd(&ct_scaled, &s, &ctx, values.len());
+
+        for (i, &v) in values.iter().enumerate() {
+            let expected = v * 5.0;
+            assert!(
+                (decrypted[i] - expected).abs() < 0.05,
+                "slot {} scalar: expected {}, got {}",
+                i, expected, decrypted[i]
+            );
+        }
+    }
+
+    #[test]
+    fn simd_large_vector() {
+        // Fill all 2048 slots
+        let mut rng = test_rng();
+        let ctx = RnsCkksContext::new(3);
+        let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
+
+        let values: Vec<f64> = (0..simd::NUM_SLOTS)
+            .map(|i| (i as f64 * 0.1).sin() * 5.0)
+            .collect();
+
+        let ct = rns_encrypt_simd(&values, &pk_b, &pk_a, &ctx, &mut rng);
+        let decrypted = rns_decrypt_simd(&ct, &s, &ctx, simd::NUM_SLOTS);
+
+        let max_err = values
+            .iter()
+            .zip(decrypted.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+
+        assert!(
+            max_err < 0.01,
+            "2048-slot roundtrip max error {} too large",
+            max_err
+        );
     }
 
     #[test]
