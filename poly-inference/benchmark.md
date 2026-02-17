@@ -126,3 +126,15 @@ cargo run --release -p poly-inference --bin poly-demo-rns-fhe-e2e -- "The capita
 # Custom prompt
 cargo run --release -p poly-inference --features cuda --bin poly-demo-rns-fhe-e2e -- "The largest ocean is" 20
 ```
+
+### Security
+
+- **526 tests** including 94 adversarial attack tests
+- **38 crypto-layer attacks**: CKKS noise bounds, NTT prime verification,
+  sampling bias, ciphertext malleability, RLWE security
+- **42 protocol-layer attacks**: disclosure spoofing, proof replay,
+  domain separation, Merkle forgery, privacy mode enforcement
+- **14 compliance attacks**: frozen accounts, anti-structuring detection,
+  overflow protection, fee validation
+- **Side-channel resistance**: Fixed ciphertext size eliminates
+  token-length inference (Whisper Leak immune by construction)
