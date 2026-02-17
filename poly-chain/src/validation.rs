@@ -3,6 +3,7 @@ use poly_verified::ivc::mock_ivc::MockIvc;
 use poly_verified::ivc::IvcBackend;
 use poly_verified::types::{Hash, VerifiedProof, ZERO_HASH};
 
+use crate::compliance::{check_compliance, ComplianceStatus};
 use crate::error::{ChainError, Result};
 use crate::fraud::detect_conflict;
 use crate::identity::{IdentityRecord, Tier};
@@ -79,18 +80,22 @@ fn validate_cash_transfer(
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
 
-    // 1. Check sender wallet exists and is not frozen
+    // 1. Check sender wallet exists
     let sender_state_hash = state
         .get_wallet(&tx.from)
         .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.from[..4])))?;
 
-    // We verify the proof — the proof attests that the state transition is correct.
     // The state_pre in the tx must match what's on chain.
     if tx.state_pre != sender_state_hash {
         return Err(ChainError::StateHashMismatch {
             expected: hex_encode(&sender_state_hash),
             actual: hex_encode(&tx.state_pre),
         });
+    }
+
+    // 1b. Reject frozen accounts (proof attests frozen status is correct)
+    if tx.sender_frozen {
+        return Err(ChainError::AccountFrozen(hex_encode(&tx.from[..4])));
     }
 
     // 2. Verify proof (the circuit verified the computation was correct)
@@ -132,6 +137,22 @@ fn validate_cash_transfer(
         .concat(),
     );
     new_state.set_wallet(tx.to, new_recipient_hash);
+
+    // 6. Compliance check — auto-generate report if threshold exceeded
+    let compliance_status = check_compliance(
+        tx.amount,
+        tx.rolling_24h_total_after,
+        tx.sender_tier,
+        tx.jurisdiction,
+        tx.timestamp,
+        tx.sender_identity_hash,
+        tx.recipient_identity_hash,
+    );
+    if let ComplianceStatus::ReportGenerated(report) = compliance_status {
+        let report_hash = report.report_hash();
+        let report_data = hash_with_domain(DOMAIN_COMPLIANCE, &report.to_bytes());
+        new_state.add_compliance_report(report_hash, report_data);
+    }
 
     Ok(new_state)
 }
@@ -507,6 +528,12 @@ mod tests {
             state_pre: sender_state_hash,
             proof: mock_proof(),
             signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
         });
 
         let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
@@ -528,6 +555,12 @@ mod tests {
             state_pre: [0xFF; 32], // wrong!
             proof: mock_proof(),
             signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
         });
 
         let result = validate_transaction(&tx, &state, 1000, 0);
@@ -548,6 +581,12 @@ mod tests {
             state_pre: ZERO_HASH,
             proof: mock_proof(),
             signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
         });
 
         let result = validate_transaction(&tx, &state, 1000, 0);
@@ -950,5 +989,123 @@ mod tests {
         let tx = Transaction::AtomicSwapInit(swap.clone());
         let new_state = validate_transaction(&tx, &state, 1000, 50).unwrap();
         assert!(new_state.get_swap(&swap.swap_id).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Compliance integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_cash_transfer_frozen_account() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_state_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 1000,
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_state_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: true, // frozen!
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
+        });
+
+        let result = validate_transaction(&tx, &state, 1000, 0);
+        assert!(matches!(result, Err(ChainError::AccountFrozen(_))));
+    }
+
+    #[test]
+    fn validate_cash_transfer_compliance_report_generated() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_state_hash = state.get_wallet(&sender).unwrap();
+        let threshold = Tier::Identified.reporting_threshold();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: threshold, // at threshold — triggers report
+            fee: 100,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_state_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            rolling_24h_total_after: threshold,
+            jurisdiction: 840,
+        });
+
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+        // Compliance SMT should have a report
+        assert!(!new_state.compliance.is_empty());
+    }
+
+    #[test]
+    fn validate_cash_transfer_below_threshold_no_report() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_state_hash = state.get_wallet(&sender).unwrap();
+
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 100, // well below any threshold
+            fee: 10,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_state_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            rolling_24h_total_after: 100,
+            jurisdiction: 840,
+        });
+
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+        // No compliance report should be generated
+        assert!(new_state.compliance.is_empty());
+    }
+
+    #[test]
+    fn validate_cash_transfer_rolling_total_triggers_report() {
+        let (state, sender, recipient) = setup_state_with_wallets();
+        let sender_state_hash = state.get_wallet(&sender).unwrap();
+        let threshold = Tier::Anonymous.reporting_threshold();
+
+        // Small individual transfer but rolling total over threshold
+        let tx = Transaction::CashTransfer(CashTransfer {
+            from: sender,
+            to: recipient,
+            amount: 100, // small
+            fee: 10,
+            nonce: 0,
+            timestamp: 1000,
+            state_pre: sender_state_hash,
+            proof: mock_proof(),
+            signature: [0u8; 64],
+            sender_tier: Tier::Anonymous,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            rolling_24h_total_after: threshold + 100, // over threshold
+            jurisdiction: 840,
+        });
+
+        let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
+        // Anti-structuring: rolling total triggered a report
+        assert!(!new_state.compliance.is_empty());
     }
 }

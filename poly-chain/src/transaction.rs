@@ -80,6 +80,19 @@ pub struct CashTransfer {
     pub proof: VerifiedProof,
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
+    // -- Compliance fields (attested by the client's ZK proof) --
+    /// Sender's KYC tier (determines reporting threshold).
+    pub sender_tier: Tier,
+    /// H(sender identity) — included in compliance reports.
+    pub sender_identity_hash: Hash,
+    /// H(recipient identity) — included in compliance reports.
+    pub recipient_identity_hash: Hash,
+    /// Whether the sender account is frozen (proof attests correctness).
+    pub sender_frozen: bool,
+    /// Sender's rolling 24h outgoing total *after* this transfer.
+    pub rolling_24h_total_after: Amount,
+    /// ISO 3166-1 numeric country code of the sender.
+    pub jurisdiction: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +341,12 @@ mod tests {
                 state_pre: ZERO_HASH,
                 proof: mock_proof(),
                 signature: [0u8; 64],
+                sender_tier: Tier::Identified,
+                sender_identity_hash: [0xAA; 32],
+                recipient_identity_hash: [0xBB; 32],
+                sender_frozen: false,
+                rolling_24h_total_after: 0,
+                jurisdiction: 840,
             }),
             Transaction::IdentityRegister(IdentityRegister {
                 account_id: [1u8; 32],
@@ -357,6 +376,12 @@ mod tests {
             state_pre: ZERO_HASH,
             proof: mock_proof(),
             signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
         });
         let h1 = tx.tx_hash();
         let h2 = tx.tx_hash();
@@ -376,6 +401,12 @@ mod tests {
             state_pre: ZERO_HASH,
             proof: mock_proof(),
             signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
         });
         assert_eq!(tx.fee_payer(), Some([0xAA; 32]));
 
