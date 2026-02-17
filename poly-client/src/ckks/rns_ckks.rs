@@ -15,6 +15,8 @@
 //! - CRT reconstruction via Garner's algorithm with variable-width arithmetic (up to 20 primes)
 
 use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +105,9 @@ pub struct RnsCkksContext {
     /// after multiply+rescale, scale_new = scale²/q ≈ scale when scale ≈ q.
     /// With Δ = 2^36 ≈ q, the scale is perfectly preserved at every level.
     pub delta: f64,
+    /// GPU NTT engine (auto-initialized when `cuda` feature is enabled).
+    #[cfg(feature = "cuda")]
+    pub gpu: Option<Arc<super::gpu::GpuNttEngine>>,
 }
 
 impl RnsCkksContext {
@@ -115,16 +120,41 @@ impl RnsCkksContext {
         );
         let ntt = create_ntt_contexts();
         let delta = (1u64 << 36) as f64; // DELTA = 2^36, matches prime size for stable deep chains
+
+        #[cfg(feature = "cuda")]
+        let gpu = match super::gpu::GpuNttEngine::new(0, num_primes) {
+            Ok(engine) => {
+                eprintln!("[CKKS] GPU NTT engine initialized ({num_primes} primes)");
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                eprintln!("[CKKS] GPU NTT unavailable, CPU fallback: {e}");
+                None
+            }
+        };
+
         Self {
             ntt,
             num_primes,
             delta,
+            #[cfg(feature = "cuda")]
+            gpu,
         }
     }
 
     /// Maximum multiplication depth supported.
     pub fn max_depth(&self) -> usize {
         self.num_primes - 1
+    }
+
+    /// NTT polynomial multiply, dispatching to GPU if available.
+    pub(crate) fn poly_mul(&self, a: &RnsPoly, b: &RnsPoly) -> RnsPoly {
+        #[cfg(feature = "cuda")]
+        if let Some(ref gpu) = self.gpu {
+            return super::gpu::gpu_poly_mul(a, b, gpu)
+                .expect("GPU poly_mul failed");
+        }
+        a.mul(b, &self.ntt)
     }
 }
 
@@ -326,7 +356,7 @@ pub fn rns_keygen<R: rand::Rng>(
 
     let a = rns_sample_uniform(rng, ctx.num_primes);
     let e = rns_sample_gaussian(rng, ctx.num_primes);
-    let a_s = a.mul(&s, &ctx.ntt);
+    let a_s = ctx.poly_mul(&a, &s);
     let b = a_s.add(&e).neg();
 
     (s, b, a)
@@ -341,7 +371,7 @@ pub fn rns_gen_eval_key<R: rand::Rng>(
     ctx: &RnsCkksContext,
     rng: &mut R,
 ) -> RnsEvalKey {
-    let s_squared = s.mul(s, &ctx.ntt);
+    let s_squared = ctx.poly_mul(s, s);
     let num_primes = ctx.num_primes;
     let nd = num_decomp_digits(num_primes, DECOMP_BITS_RELIN);
     let base = 1i64 << DECOMP_BITS_RELIN;
@@ -361,7 +391,7 @@ pub fn rns_gen_eval_key<R: rand::Rng>(
         // evk_i: b_i = -(a_i·s + e_i) + s²·T^i, a_i = random
         let a = rns_sample_uniform(rng, num_primes);
         let e = rns_sample_gaussian(rng, num_primes);
-        let a_s = a.mul(s, &ctx.ntt);
+        let a_s = ctx.poly_mul(&a, s);
         let b = a_s.add(&e).neg().add(&s_sq_ti);
         keys.push((b, a));
     }
@@ -430,8 +460,8 @@ pub fn rns_encrypt_simd<R: rand::Rng>(
     let e1 = rns_sample_gaussian(rng, num_primes);
     let e2 = rns_sample_gaussian(rng, num_primes);
 
-    let c0 = pk_b.mul(&u, &ctx.ntt).add(&e1).add(&m);
-    let c1 = pk_a.mul(&u, &ctx.ntt).add(&e2);
+    let c0 = ctx.poly_mul(pk_b, &u).add(&e1).add(&m);
+    let c1 = ctx.poly_mul(pk_a, &u).add(&e2);
 
     RnsCiphertext {
         c0,
@@ -454,7 +484,7 @@ pub fn rns_decrypt_simd(
         s.clone()
     };
 
-    let c1_s = ct.c1.mul(&s_at_level, &ctx.ntt);
+    let c1_s = ctx.poly_mul(&ct.c1, &s_at_level);
     let m_noisy = ct.c0.add(&c1_s);
 
     let coeffs = m_noisy.to_coeffs();
@@ -566,9 +596,9 @@ pub fn rns_ct_mul_leveled(
     let a_m = rns_ct_mod_switch_to(a, target);
     let b_m = rns_ct_mod_switch_to(b, target);
 
-    let d0 = a_m.c0.mul(&b_m.c0, &ctx.ntt);
-    let d1 = a_m.c0.mul(&b_m.c1, &ctx.ntt).add(&a_m.c1.mul(&b_m.c0, &ctx.ntt));
-    let d2 = a_m.c1.mul(&b_m.c1, &ctx.ntt);
+    let d0 = ctx.poly_mul(&a_m.c0, &b_m.c0);
+    let d1 = ctx.poly_mul(&a_m.c0, &b_m.c1).add(&ctx.poly_mul(&a_m.c1, &b_m.c0));
+    let d2 = ctx.poly_mul(&a_m.c1, &b_m.c1);
 
     RnsCiphertextTriple {
         d0,
@@ -616,9 +646,9 @@ pub fn rns_ct_mul(
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
 
-    let d0 = a.c0.mul(&b.c0, &ctx.ntt);
-    let d1 = a.c0.mul(&b.c1, &ctx.ntt).add(&a.c1.mul(&b.c0, &ctx.ntt));
-    let d2 = a.c1.mul(&b.c1, &ctx.ntt);
+    let d0 = ctx.poly_mul(&a.c0, &b.c0);
+    let d1 = ctx.poly_mul(&a.c0, &b.c1).add(&ctx.poly_mul(&a.c1, &b.c0));
+    let d2 = ctx.poly_mul(&a.c1, &b.c1);
 
     RnsCiphertextTriple {
         d0,
@@ -652,8 +682,8 @@ pub fn rns_relinearize(
         let evk_b_t = rns_truncate(evk_b, np);
         let evk_a_t = rns_truncate(evk_a, np);
 
-        c0 = c0.add(&digit.mul(&evk_b_t, &ctx.ntt));
-        c1 = c1.add(&digit.mul(&evk_a_t, &ctx.ntt));
+        c0 = c0.add(&ctx.poly_mul(digit, &evk_b_t));
+        c1 = c1.add(&ctx.poly_mul(digit, &evk_a_t));
     }
 
     RnsCiphertext {
@@ -752,7 +782,7 @@ pub fn rns_gen_rotation_key<R: rand::Rng>(
         // evk_i: b_i = -(a_i·s + e_i) + σ_m(s)·T^i, a_i = random
         let a = rns_sample_uniform(rng, num_primes);
         let e = rns_sample_gaussian(rng, num_primes);
-        let a_s = a.mul(s, &ctx.ntt);
+        let a_s = ctx.poly_mul(&a, s);
         let b = a_s.add(&e).neg().add(&s_auto_ti);
         keys.push((b, a));
     }
@@ -821,8 +851,8 @@ pub fn rns_rotate(
         let ks_b_t = rns_truncate(ks_b, np);
         let ks_a_t = rns_truncate(ks_a, np);
 
-        c0_new = c0_new.add(&digit.mul(&ks_b_t, &ctx.ntt));
-        c1_new = c1_new.add(&digit.mul(&ks_a_t, &ctx.ntt));
+        c0_new = c0_new.add(&ctx.poly_mul(digit, &ks_b_t));
+        c1_new = c1_new.add(&ctx.poly_mul(digit, &ks_a_t));
     }
 
     RnsCiphertext {
@@ -855,8 +885,8 @@ pub fn rns_ct_mul_plain_simd(
     let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
 
     RnsCiphertext {
-        c0: ct.c0.mul(&p, &ctx.ntt),
-        c1: ct.c1.mul(&p, &ctx.ntt),
+        c0: ctx.poly_mul(&ct.c0, &p),
+        c1: ctx.poly_mul(&ct.c1, &p),
         scale: ct.scale * ctx.delta,
         level: ct.level,
     }
