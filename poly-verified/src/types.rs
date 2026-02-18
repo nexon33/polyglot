@@ -87,10 +87,14 @@ impl Commitment {
 
 impl PartialEq for Commitment {
     fn eq(&self, other: &Self) -> bool {
+        // Constant-time comparison for all fields to prevent timing side-channels.
+        // The total_checkpoints field is compared via XOR to avoid short-circuit
+        // leakage of the checkpoint count.
+        let checkpoints_eq = (self.total_checkpoints ^ other.total_checkpoints) == 0;
         hash_eq(&self.root, &other.root)
-            && self.total_checkpoints == other.total_checkpoints
-            && hash_eq(&self.chain_tip, &other.chain_tip)
-            && hash_eq(&self.code_hash, &other.code_hash)
+            & checkpoints_eq
+            & hash_eq(&self.chain_tip, &other.chain_tip)
+            & hash_eq(&self.code_hash, &other.code_hash)
     }
 }
 
@@ -203,6 +207,12 @@ impl MerkleProof {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        // Safety: reject if sibling count exceeds our max (64) or u32 range.
+        assert!(
+            self.siblings.len() <= 64,
+            "MerkleProof: sibling count {} exceeds maximum 64",
+            self.siblings.len()
+        );
         let sibling_count = self.siblings.len() as u32;
         let size = 108 + 33 * self.siblings.len();
         let mut buf = Vec::with_capacity(size);

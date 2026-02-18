@@ -295,8 +295,13 @@ const HARMFUL_PATTERNS: &[&str] = &[
 ///
 /// Returns `Ok(())` if the prompt is allowed, or `Err(PromptRejection)` if blocked.
 /// This is a pre-inference gate — it runs on the raw text before tokenization.
+///
+/// R6: Applies Unicode normalization to defeat homoglyph and confusable-character
+/// bypass attacks. Strips zero-width characters, normalizes to ASCII where possible,
+/// and collapses whitespace before pattern matching.
 pub fn check_prompt(prompt: &str) -> Result<(), PromptRejection> {
-    let lower = prompt.to_lowercase();
+    let normalized = normalize_prompt(prompt);
+    let lower = normalized.to_lowercase();
 
     for &pattern in JAILBREAK_PATTERNS {
         if lower.contains(pattern) {
@@ -311,6 +316,115 @@ pub fn check_prompt(prompt: &str) -> Result<(), PromptRejection> {
     }
 
     Ok(())
+}
+
+/// Normalize a prompt string to defeat Unicode bypass attacks.
+///
+/// Applies the following transformations:
+/// 1. Strip zero-width characters (ZWJ, ZWNJ, ZWSP, soft hyphen, etc.)
+/// 2. Replace common confusable/homoglyph characters with ASCII equivalents
+/// 3. Replace fullwidth ASCII with halfwidth equivalents
+/// 4. Collapse multiple whitespace into single space
+fn normalize_prompt(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+
+    for ch in input.chars() {
+        // 1. Strip zero-width and invisible characters
+        if is_invisible_char(ch) {
+            continue;
+        }
+
+        // 2. Replace fullwidth ASCII (U+FF01..U+FF5E) with halfwidth (U+0021..U+007E)
+        if ('\u{FF01}'..='\u{FF5E}').contains(&ch) {
+            let ascii = (ch as u32 - 0xFF01 + 0x0021) as u8 as char;
+            result.push(ascii);
+            continue;
+        }
+
+        // 3. Replace common Cyrillic/Greek confusables with Latin
+        if let Some(replacement) = confusable_to_ascii(ch) {
+            result.push(replacement);
+            continue;
+        }
+
+        result.push(ch);
+    }
+
+    // 4. Collapse whitespace
+    let mut collapsed = String::with_capacity(result.len());
+    let mut prev_space = false;
+    for ch in result.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                collapsed.push(' ');
+            }
+            prev_space = true;
+        } else {
+            collapsed.push(ch);
+            prev_space = false;
+        }
+    }
+
+    collapsed
+}
+
+/// Returns true for zero-width and invisible Unicode characters.
+fn is_invisible_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{200B}' | // zero-width space
+        '\u{200C}' | // zero-width non-joiner
+        '\u{200D}' | // zero-width joiner
+        '\u{200E}' | // left-to-right mark
+        '\u{200F}' | // right-to-left mark
+        '\u{00AD}' | // soft hyphen
+        '\u{034F}' | // combining grapheme joiner
+        '\u{2060}' | // word joiner
+        '\u{2061}' | // function application
+        '\u{2062}' | // invisible times
+        '\u{2063}' | // invisible separator
+        '\u{2064}' | // invisible plus
+        '\u{FEFF}' | // zero-width no-break space (BOM)
+        '\u{FE00}'..='\u{FE0F}' // variation selectors
+    )
+}
+
+/// Map common confusable characters (Cyrillic, Greek, etc.) to ASCII equivalents.
+fn confusable_to_ascii(ch: char) -> Option<char> {
+    match ch {
+        // Cyrillic confusables
+        '\u{0410}' | '\u{0430}' => Some('a'), // А а
+        '\u{0412}' | '\u{0432}' => Some('b'), // В в (looks like B)
+        '\u{0421}' | '\u{0441}' => Some('c'), // С с
+        '\u{0415}' | '\u{0435}' => Some('e'), // Е е
+        '\u{041D}' | '\u{043D}' => Some('h'), // Н н (looks like H)
+        '\u{041A}' | '\u{043A}' => Some('k'), // К к
+        '\u{041C}' | '\u{043C}' => Some('m'), // М м
+        '\u{041E}' | '\u{043E}' => Some('o'), // О о
+        '\u{0420}' | '\u{0440}' => Some('p'), // Р р
+        '\u{0422}' | '\u{0442}' => Some('t'), // Т т
+        '\u{0425}' | '\u{0445}' => Some('x'), // Х х
+        '\u{0443}' => Some('y'),               // у (lowercase)
+        // Greek confusables
+        '\u{0391}' | '\u{03B1}' => Some('a'), // Α α
+        '\u{0392}' | '\u{03B2}' => Some('b'), // Β β
+        '\u{0395}' | '\u{03B5}' => Some('e'), // Ε ε
+        '\u{0397}' | '\u{03B7}' => Some('h'), // Η η
+        '\u{0399}' | '\u{03B9}' => Some('i'), // Ι ι
+        '\u{039A}' | '\u{03BA}' => Some('k'), // Κ κ
+        '\u{039C}' | '\u{03BC}' => Some('m'), // Μ μ
+        '\u{039D}' | '\u{03BD}' => Some('n'), // Ν ν
+        '\u{039F}' | '\u{03BF}' => Some('o'), // Ο ο
+        '\u{03A1}' | '\u{03C1}' => Some('p'), // Ρ ρ
+        '\u{03A4}' | '\u{03C4}' => Some('t'), // Τ τ
+        '\u{03A7}' | '\u{03C7}' => Some('x'), // Χ χ
+        '\u{03A5}' | '\u{03C5}' => Some('y'), // Υ υ
+        // Common look-alikes
+        '\u{2018}' | '\u{2019}' => Some('\''), // smart quotes
+        '\u{201C}' | '\u{201D}' => Some('"'),  // smart double quotes
+        '\u{2014}' | '\u{2013}' => Some('-'),   // em/en dash
+        '\u{2026}' => Some('.'),                 // ellipsis (treat as period)
+        _ => None,
+    }
 }
 
 #[cfg(test)]

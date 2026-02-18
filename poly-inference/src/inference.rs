@@ -16,34 +16,37 @@ fn is_eos(token_id: u32) -> bool {
 /// Extract last-position logits as a 1D [vocab_size] tensor.
 ///
 /// Handles different output shapes from full-precision vs quantized models:
-/// - [batch, seq_len, vocab_size] → narrow last position → squeeze → [vocab_size]
-/// - [batch, vocab_size] → squeeze batch → [vocab_size]
-/// - [vocab_size] → as-is
-fn last_position_logits(logits: &Tensor) -> Tensor {
+/// - [batch, seq_len, vocab_size] -> narrow last position -> squeeze -> [vocab_size]
+/// - [batch, vocab_size] -> squeeze batch -> [vocab_size]
+/// - [vocab_size] -> as-is
+///
+/// R6: Returns Result instead of panicking on unexpected rank, preventing
+/// server crashes from network-facing code paths.
+fn last_position_logits(logits: &Tensor) -> Result<Tensor, String> {
     match logits.rank() {
         3 => {
-            // [batch, seq_len, vocab_size] — full-precision model
-            let seq_len = logits.dim(1).unwrap();
+            // [batch, seq_len, vocab_size] -- full-precision model
+            let seq_len = logits.dim(1).map_err(|e| format!("logits dim(1): {e}"))?;
             logits
-                .narrow(1, seq_len - 1, 1).unwrap()
-                .squeeze(1).unwrap()
-                .squeeze(0).unwrap()
-                .to_dtype(DType::F32).unwrap()
+                .narrow(1, seq_len - 1, 1).map_err(|e| format!("narrow: {e}"))?
+                .squeeze(1).map_err(|e| format!("squeeze(1): {e}"))?
+                .squeeze(0).map_err(|e| format!("squeeze(0): {e}"))?
+                .to_dtype(DType::F32).map_err(|e| format!("to_f32: {e}"))
         }
         2 => {
             // [batch, vocab_size] or [seq_len, vocab_size]
             // Take the last row (last position / last batch element)
-            let n = logits.dim(0).unwrap();
+            let n = logits.dim(0).map_err(|e| format!("logits dim(0): {e}"))?;
             logits
-                .narrow(0, n - 1, 1).unwrap()
-                .squeeze(0).unwrap()
-                .to_dtype(DType::F32).unwrap()
+                .narrow(0, n - 1, 1).map_err(|e| format!("narrow: {e}"))?
+                .squeeze(0).map_err(|e| format!("squeeze: {e}"))?
+                .to_dtype(DType::F32).map_err(|e| format!("to_f32: {e}"))
         }
         1 => {
             // Already [vocab_size]
-            logits.to_dtype(DType::F32).unwrap()
+            logits.to_dtype(DType::F32).map_err(|e| format!("to_f32: {e}"))
         }
-        r => panic!("unexpected logits rank: {r}"),
+        r => Err(format!("unexpected logits rank: {r}")),
     }
 }
 
@@ -76,7 +79,7 @@ macro_rules! generate_body {
             .unsqueeze(0)
             .unwrap();
         let logits = model.forward(&input_tensor, 0).unwrap();
-        let logits = last_position_logits(&logits);
+        let logits = last_position_logits(&logits).expect("last_position_logits failed");
 
         let mut next_token = logits_processor.sample(&logits).unwrap();
         if is_eos(next_token) {
@@ -92,7 +95,7 @@ macro_rules! generate_body {
                 .unsqueeze(0)
                 .unwrap();
             let logits = model.forward(&input, pos).unwrap();
-            let logits = last_position_logits(&logits);
+            let logits = last_position_logits(&logits).expect("last_position_logits failed");
 
             next_token = logits_processor.sample(&logits).unwrap();
             if is_eos(next_token) {
@@ -219,7 +222,7 @@ pub fn generate_compliant(
         .unsqueeze(0)
         .unwrap();
     let logits = model.forward(&input_tensor, 0).unwrap();
-    let logits = last_position_logits(&logits);
+    let logits = last_position_logits(&logits).expect("last_position_logits failed");
 
     let mut next_token = logits_processor.sample(&logits).unwrap();
     if is_eos(next_token) {
@@ -229,7 +232,7 @@ pub fn generate_compliant(
         return (generated, proof);
     }
 
-    // Compliance gate — first token
+    // Compliance gate -- first token
     let verdict = compliance_acc
         .check_and_fold(next_token)
         .expect("compliance fold");
@@ -252,7 +255,7 @@ pub fn generate_compliant(
             .unsqueeze(0)
             .unwrap();
         let logits = model.forward(&input, pos).unwrap();
-        let logits = last_position_logits(&logits);
+        let logits = last_position_logits(&logits).expect("last_position_logits failed");
 
         next_token = logits_processor.sample(&logits).unwrap();
         if is_eos(next_token) {

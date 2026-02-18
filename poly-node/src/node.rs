@@ -20,6 +20,13 @@
 //! - R5: Connection idle timeout (closes after 60s of no streams)
 //! - R5: Hello timestamp from the future rejected (prevents pre-computed replay windows)
 //! - R5: NodeInfo signature covers all fields (not just pubkey||timestamp)
+//! - R6: stream_count uses SeqCst ordering (was Relaxed, could skip bounds on weak archs)
+//! - R6: Rejected Hello returns minimal HelloAck (no server NodeInfo to unauthenticated peers)
+//! - R6: connect_and_infer has timeout on inference response read (prevents slowloris)
+//! - R6: max_sessions validated >= 1 in PolyNode::new (prevents zero-semaphore deadlock)
+//! - R6: Hello deserialization does NOT allow_trailing_bytes (enforces strict size limit)
+//! - R6: NodeInfo.addresses and NodeInfo.models length capped post-deserialization
+//! - R6: throughput_estimate validated (NaN/Inf rejected)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +66,16 @@ const MAX_STREAMS_PER_CONN: u64 = 256;
 /// the connection is closed. Prevents zombie connections holding semaphore permits.
 const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Maximum number of addresses in a NodeInfo (prevents gossip amplification).
+const MAX_NODEINFO_ADDRESSES: usize = 16;
+
+/// Maximum number of models in a NodeInfo (prevents gossip amplification).
+const MAX_NODEINFO_MODELS: usize = 16;
+
+/// Client-side timeout for reading inference response.
+/// Prevents a malicious/slow server from tying up the client indefinitely.
+const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A running Poly Network compute node.
 pub struct PolyNode {
     pub config: NodeConfig,
@@ -72,6 +89,12 @@ impl PolyNode {
         config: NodeConfig,
         backend: Arc<dyn InferenceBackend + Send + Sync>,
     ) -> Result<Self> {
+        // R6: Validate max_sessions >= 1. A zero value would create a
+        // zero-permit semaphore that blocks ALL connections and inference
+        // forever, effectively a self-DoS configuration footgun.
+        if config.max_sessions == 0 {
+            anyhow::bail!("max_sessions must be >= 1 (got 0)");
+        }
         let identity = NodeIdentity::generate();
         info!(
             "Generated node ID: {}",
@@ -219,7 +242,10 @@ async fn handle_connection(
         };
 
         // Enforce per-connection stream limit to prevent stream-flooding DoS.
-        let count = stream_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // R6: Uses SeqCst (was Relaxed) for consistency with handshake_done ordering.
+        // On weakly-ordered architectures, Relaxed could allow the counter to be read
+        // stale by concurrent stream handlers, potentially exceeding the cap.
+        let count = stream_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if count >= MAX_STREAMS_PER_CONN {
             warn!(
                 "Connection from {} exceeded max streams ({}), closing",
@@ -283,10 +309,14 @@ async fn handle_stream(
             }
 
             // Size-limited bincode deserialization
+            // R6: Removed allow_trailing_bytes() — forces strict size enforcement.
+            // With allow_trailing_bytes(), bincode would happily deserialize a
+            // valid Hello from the start of a larger payload, ignoring extra data.
+            // Without it, any trailing bytes cause a deserialization error, which
+            // is the correct behavior for a fixed-structure message.
             let hello: handshake::Hello = bincode::DefaultOptions::new()
                 .with_limit(MAX_HELLO_SIZE)
                 .with_fixint_encoding()
-                .allow_trailing_bytes()
                 .deserialize(&frame.payload)?;
 
             // Reject incompatible protocol versions
@@ -328,6 +358,39 @@ async fn handle_stream(
                 }
             }
 
+            // R6: Validate NodeInfo field lengths — prevent memory amplification
+            // in gossip tables and oversized HelloAck serialization.
+            if accepted {
+                if hello.node_info.addresses.len() > MAX_NODEINFO_ADDRESSES {
+                    warn!(
+                        "Rejecting Hello: too many addresses ({}, max {})",
+                        hello.node_info.addresses.len(),
+                        MAX_NODEINFO_ADDRESSES
+                    );
+                    accepted = false;
+                }
+                if hello.node_info.models.len() > MAX_NODEINFO_MODELS {
+                    warn!(
+                        "Rejecting Hello: too many models ({}, max {})",
+                        hello.node_info.models.len(),
+                        MAX_NODEINFO_MODELS
+                    );
+                    accepted = false;
+                }
+                // R6: Reject NaN/Inf in throughput_estimate — prevents poisoning
+                // Phase 2 gossip peer-selection comparisons.
+                for m in &hello.node_info.models {
+                    if !m.throughput_estimate.is_finite() {
+                        warn!(
+                            "Rejecting Hello: non-finite throughput_estimate ({})",
+                            m.throughput_estimate
+                        );
+                        accepted = false;
+                        break;
+                    }
+                }
+            }
+
             // Check timestamp freshness — reject stale Hellos (replay defense)
             if accepted {
                 let now = std::time::SystemTime::now()
@@ -356,10 +419,31 @@ async fn handle_stream(
                 handshake_done.store(true, std::sync::atomic::Ordering::SeqCst);
             }
 
-            // Return server's own NodeInfo — never echo back the client's
+            // R6: Only include the server's full NodeInfo if the handshake is accepted.
+            // When rejected, return a minimal NodeInfo with zeroed fields to prevent
+            // leaking server identity, capabilities, and addresses to unauthenticated
+            // peers. An attacker could enumerate server capabilities by sending
+            // deliberately invalid Hellos and inspecting the rejected HelloAck.
+            let ack_node_info = if accepted {
+                (*server_info).clone()
+            } else {
+                NodeInfo {
+                    public_key: [0u8; 32],
+                    addresses: vec![],
+                    models: vec![],
+                    relay_capable: false,
+                    capacity: NodeCapacity {
+                        queue_depth: 0,
+                        active_sessions: 0,
+                        max_sessions: 0,
+                    },
+                    timestamp: 0,
+                    signature: vec![],
+                }
+            };
             let ack = handshake::HelloAck {
                 version: PROTOCOL_VERSION,
-                node_info: (*server_info).clone(),
+                node_info: ack_node_info,
                 accepted,
             };
             Frame::new(MessageType::HelloAck, bincode::serialize(&ack)?)
@@ -525,7 +609,14 @@ pub async fn connect_and_infer(
     send.write_all(&frame.encode()).await?;
     send.finish()?;
 
-    let data = recv.read_to_end(16 * 1024 * 1024).await?;
+    // R6: Timeout on response read to prevent a malicious/slow server from
+    // tying up the client task indefinitely (slowloris attack on client side).
+    let data = tokio::time::timeout(
+        CLIENT_RESPONSE_TIMEOUT,
+        recv.read_to_end(16 * 1024 * 1024),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("inference response read timed out after {:?}", CLIENT_RESPONSE_TIMEOUT))??;
     let (resp_frame, _) = Frame::decode(&data).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     if resp_frame.msg_type != MessageType::InferResponse {

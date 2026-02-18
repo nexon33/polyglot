@@ -452,14 +452,20 @@ fn wide_mul_u64(a: &[u64], b: u64) -> Vec<u64> {
 }
 
 fn wide_add(a: &[u64], b: &[u64]) -> Vec<u64> {
-    let n = a.len();
+    let n = a.len().max(b.len());
     let mut result = vec![0u64; n];
     let mut carry = 0u128;
     for i in 0..n {
+        let av = if i < a.len() { a[i] as u128 } else { 0 };
         let bv = if i < b.len() { b[i] as u128 } else { 0 };
-        let sum = a[i] as u128 + bv + carry;
+        let sum = av + bv + carry;
         result[i] = sum as u64;
         carry = sum >> 64;
+    }
+    // R6: Extend result if there's remaining carry — prevents silent truncation
+    // in CRT reconstruction when wide_mul_u64 has extended one operand.
+    if carry != 0 {
+        result.push(carry as u64);
     }
     result
 }

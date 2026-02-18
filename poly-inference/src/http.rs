@@ -36,6 +36,16 @@ const MAX_ALLOWED_TOKENS: u32 = 4096;
 /// memory exhaustion from oversized payloads.
 const MAX_ENCRYPTED_INPUT_SIZE: usize = 1_048_576;
 
+/// Maximum allowed prompt length in characters.
+/// Prevents DoS via extremely long prompts that tokenize to thousands of tokens,
+/// causing GPU OOM or extreme latency. 100K characters is roughly 25K tokens.
+const MAX_PROMPT_LENGTH: usize = 100_000;
+
+/// Maximum allowed prompt token count after tokenization.
+/// Even if the character count is under the limit, very token-dense inputs
+/// can still overwhelm the model. 8192 tokens is a reasonable context window.
+const MAX_PROMPT_TOKENS: usize = 8192;
+
 // ─── Simple batch request/response types ─────────────────────────────────
 
 /// Simple generation request. Prompt, parameters, and optional privacy mode.
@@ -269,7 +279,12 @@ fn handle_infer<B: InferenceBackend>(
         }
     };
 
-    // Validate max_tokens
+    // R6: Validate max_tokens > 0 (zero wastes prefill resources with no output)
+    if infer_request.max_tokens == 0 {
+        return json_error(400, "max_tokens must be > 0", json_header);
+    }
+
+    // Validate max_tokens upper bound
     if infer_request.max_tokens > MAX_ALLOWED_TOKENS {
         return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
     }
@@ -277,6 +292,24 @@ fn handle_infer<B: InferenceBackend>(
     // Validate temperature
     if let Err(msg) = crate::inference::validate_temperature(infer_request.temperature) {
         return json_error(400, msg, json_header);
+    }
+
+    // R6: Prompt safety check on /infer (previously missing — allowed bypass)
+    {
+        let input_ct: Result<poly_client::encryption::MockCiphertext, _> =
+            serde_json::from_slice(&infer_request.encrypted_input);
+        if let Ok(ct) = input_ct {
+            if !ct.tokens.is_empty() {
+                let prompt_text = crate::model::decode(&ct.tokens);
+                if let Err(rejection) = crate::compliance::check_prompt(&prompt_text) {
+                    return json_error(403, &format!("prompt rejected: {}", rejection), json_header);
+                }
+            }
+            // R6: Validate token count on /infer
+            if ct.tokens.len() > MAX_PROMPT_TOKENS {
+                return json_error(400, &format!("input too many tokens: {} (max {})", ct.tokens.len(), MAX_PROMPT_TOKENS), json_header);
+            }
+        }
     }
 
     // Validate encrypted_input size (max 1 MB / ~8192 encrypted tokens)
@@ -332,7 +365,12 @@ fn handle_generate(
         }
     };
 
-    // Validate max_tokens
+    // R6: Validate max_tokens > 0 (zero wastes prefill resources with no output)
+    if req.max_tokens == 0 {
+        return json_error(400, "max_tokens must be > 0", json_header);
+    }
+
+    // Validate max_tokens upper bound
     if req.max_tokens > MAX_ALLOWED_TOKENS {
         return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
     }
@@ -341,6 +379,11 @@ fn handle_generate(
     // produce degenerate sampling distributions)
     if let Err(msg) = crate::inference::validate_temperature(req.temperature) {
         return json_error(400, msg, json_header);
+    }
+
+    // R6: Validate prompt length in characters (DoS prevention)
+    if req.prompt.len() > MAX_PROMPT_LENGTH {
+        return json_error(400, &format!("prompt too long: {} chars (max {})", req.prompt.len(), MAX_PROMPT_LENGTH), json_header);
     }
 
     // Validate mode
@@ -375,6 +418,11 @@ fn handle_generate(
 
     if token_ids.is_empty() {
         return json_error(400, "prompt tokenized to zero tokens", json_header);
+    }
+
+    // R6: Validate prompt token count (DoS prevention for token-dense inputs)
+    if token_ids.len() > MAX_PROMPT_TOKENS {
+        return json_error(400, &format!("prompt too many tokens: {} (max {})", token_ids.len(), MAX_PROMPT_TOKENS), json_header);
     }
 
     let prompt_len = token_ids.len();
@@ -483,7 +531,12 @@ fn handle_generate_encrypted<B: InferenceBackend>(
         }
     };
 
-    // Validate max_tokens
+    // R6: Validate max_tokens > 0
+    if req.max_tokens == 0 {
+        return json_error(400, "max_tokens must be > 0", json_header);
+    }
+
+    // Validate max_tokens upper bound
     if req.max_tokens > MAX_ALLOWED_TOKENS {
         return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
     }
@@ -532,6 +585,11 @@ fn handle_generate_encrypted<B: InferenceBackend>(
 
     if token_ids.is_empty() {
         return json_error(400, "encrypted input decoded to zero tokens", json_header);
+    }
+
+    // R6: Validate decrypted token count (DoS prevention)
+    if token_ids.len() > MAX_PROMPT_TOKENS {
+        return json_error(400, &format!("decrypted input too many tokens: {} (max {})", token_ids.len(), MAX_PROMPT_TOKENS), json_header);
     }
 
     // Decode tokens to text for compliance check

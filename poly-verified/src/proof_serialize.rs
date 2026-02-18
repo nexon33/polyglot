@@ -59,7 +59,16 @@ impl VerifiedResponse {
     }
 
     /// Serialize to wire format.
+    ///
+    /// # Panics
+    /// Panics if `proof_bytes` length exceeds `u32::MAX`, which would cause
+    /// silent truncation in the wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
+        assert!(
+            self.proof_bytes.len() <= u32::MAX as usize,
+            "VerifiedResponse: proof_bytes length {} exceeds u32::MAX",
+            self.proof_bytes.len()
+        );
         let proof_len = self.proof_bytes.len() as u32;
         let total =
             32 + 32 + 32 + 1 + 1 + 4 + self.proof_bytes.len() + 32 + self.value_bytes.len();

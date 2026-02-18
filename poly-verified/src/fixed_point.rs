@@ -115,10 +115,10 @@ impl FixedPoint {
         })
     }
 
-    /// Absolute value.
+    /// Absolute value. Saturates at i128::MAX for i128::MIN (no panic).
     pub fn abs(self) -> Self {
         Self {
-            raw: self.raw.abs(),
+            raw: self.raw.saturating_abs(),
         }
     }
 
@@ -147,7 +147,7 @@ impl Add for FixedPoint {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
         Self {
-            raw: self.raw + rhs.raw,
+            raw: self.raw.saturating_add(rhs.raw),
         }
     }
 }
@@ -156,7 +156,7 @@ impl Sub for FixedPoint {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
         Self {
-            raw: self.raw - rhs.raw,
+            raw: self.raw.saturating_sub(rhs.raw),
         }
     }
 }
@@ -164,8 +164,18 @@ impl Sub for FixedPoint {
 impl Mul for FixedPoint {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self {
-        Self {
-            raw: (self.raw * rhs.raw) / SCALE,
+        // Use checked_mul to detect overflow; saturate on failure.
+        match self.raw.checked_mul(rhs.raw) {
+            Some(product) => Self {
+                raw: product / SCALE,
+            },
+            None => {
+                // Determine sign of result and saturate.
+                let positive = (self.raw >= 0) == (rhs.raw >= 0);
+                Self {
+                    raw: if positive { i128::MAX } else { i128::MIN },
+                }
+            }
         }
     }
 }
@@ -174,8 +184,18 @@ impl Div for FixedPoint {
     type Output = Self;
     fn div(self, rhs: Self) -> Self {
         assert!(rhs.raw != 0, "division by zero");
-        Self {
-            raw: (self.raw * SCALE) / rhs.raw,
+        // Use checked_mul to prevent overflow in numerator scaling.
+        match self.raw.checked_mul(SCALE) {
+            Some(numerator) => Self {
+                raw: numerator / rhs.raw,
+            },
+            None => {
+                // Numerator overflow: saturate based on sign.
+                let positive = (self.raw >= 0) == (rhs.raw >= 0);
+                Self {
+                    raw: if positive { i128::MAX } else { i128::MIN },
+                }
+            }
         }
     }
 }
@@ -183,7 +203,10 @@ impl Div for FixedPoint {
 impl Neg for FixedPoint {
     type Output = Self;
     fn neg(self) -> Self {
-        Self { raw: -self.raw }
+        // Saturate instead of panicking on i128::MIN.
+        Self {
+            raw: self.raw.saturating_neg(),
+        }
     }
 }
 

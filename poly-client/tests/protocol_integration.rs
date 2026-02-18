@@ -209,7 +209,8 @@ fn disclosure_from_empty_response() {
     let disclosure = verified.disclose(&[]).unwrap();
     assert_eq!(disclosure.total_tokens, 0);
     assert_eq!(disclosure.proofs.len(), 0);
-    assert!(verify_disclosure(&disclosure));
+    // R6-V6-07: 0-token disclosures are now correctly rejected by verify_disclosure
+    assert!(!verify_disclosure(&disclosure));
 }
 
 #[test]

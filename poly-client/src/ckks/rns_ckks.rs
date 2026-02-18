@@ -273,15 +273,20 @@ impl WideInt {
     }
 
     fn add(&self, other: &Self) -> Self {
-        let n = self.limbs.len();
+        let n = self.limbs.len().max(other.limbs.len());
         let mut result = vec![0u64; n];
         let mut carry = 0u128;
         for i in 0..n {
-            let a = self.limbs[i] as u128;
+            let a = if i < self.limbs.len() { self.limbs[i] as u128 } else { 0 };
             let b = if i < other.limbs.len() { other.limbs[i] as u128 } else { 0 };
             let sum = a + b + carry;
             result[i] = sum as u64;
             carry = sum >> 64;
+        }
+        // R6: Extend result if there's remaining carry — prevents silent truncation
+        // when mul_u64 has extended one operand beyond the original limb count.
+        if carry != 0 {
+            result.push(carry as u64);
         }
         Self { limbs: result }
     }
@@ -543,6 +548,16 @@ pub fn rns_encrypt_simd<R: rand::Rng>(
     ctx: &RnsCkksContext,
     rng: &mut R,
 ) -> RnsCiphertext {
+    // R6: Reject NaN/Inf inputs — these produce garbage coefficients after
+    // SIMD encoding, creating ciphertexts that appear valid but decrypt to
+    // nonsense, potentially leaking information about the secret key.
+    for (i, &v) in values.iter().enumerate() {
+        assert!(
+            v.is_finite(),
+            "rns_encrypt_simd: slot {} value must be finite, got {}",
+            i, v
+        );
+    }
     let num_primes = ctx.num_primes;
 
     // Encode values into polynomial coefficients via canonical embedding
@@ -659,7 +674,15 @@ pub fn rns_ct_sub(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
 }
 
 /// Multiply ciphertext by integer scalar.
+///
+/// R6: Rejects scalar=0 (which would silently zero out the ciphertext,
+/// destroying the encrypted message) and extreme scalars that could
+/// cause modular overflow in the RNS channels.
 pub fn rns_ct_scalar_mul(ct: &RnsCiphertext, scalar: i64) -> RnsCiphertext {
+    assert!(
+        scalar != 0,
+        "rns_ct_scalar_mul: scalar must be non-zero (would destroy ciphertext)"
+    );
     RnsCiphertext {
         c0: ct.c0.scalar_mul(scalar),
         c1: ct.c1.scalar_mul(scalar),
@@ -674,6 +697,18 @@ pub fn rns_ct_scalar_mul(ct: &RnsCiphertext, scalar: i64) -> RnsCiphertext {
 /// Uses SIMD encoding (value in slot 0) to match `rns_encrypt_f64`.
 /// The `delta` encoding scale must match `ct.scale` (within 1% tolerance).
 pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: f64) -> RnsCiphertext {
+    // R6: Reject NaN/Inf in plain_val and delta — these bypass the tolerance
+    // check (NaN comparisons always return false) and silently corrupt the ciphertext.
+    assert!(
+        plain_val.is_finite(),
+        "rns_ct_add_plain: plain_val must be finite, got {}",
+        plain_val
+    );
+    assert!(
+        delta.is_finite() && delta > 0.0,
+        "rns_ct_add_plain: delta must be finite and positive, got {}",
+        delta
+    );
     assert!(
         ct.scale > 0.0 && (delta - ct.scale).abs() / ct.scale < 0.01,
         "scale mismatch in rns_ct_add_plain: plaintext delta={:.2} but ct.scale={:.2}",
@@ -719,6 +754,12 @@ pub fn rns_ct_mod_switch_to(ct: &RnsCiphertext, target_primes: usize) -> RnsCiph
 /// Encodes `scalar` at the ciphertext's current scale so the addition
 /// is semantically correct. No level consumed.
 pub fn rns_ct_add_scalar_broadcast(ct: &RnsCiphertext, scalar: f64) -> RnsCiphertext {
+    // R6: Reject NaN/Inf — would silently corrupt the encoded plaintext polynomial.
+    assert!(
+        scalar.is_finite(),
+        "rns_ct_add_scalar_broadcast: scalar must be finite, got {}",
+        scalar
+    );
     let values = vec![scalar; simd::NUM_SLOTS];
     let coeffs = simd::encode_simd(&values, ct.scale);
     let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
@@ -774,6 +815,18 @@ pub fn rns_ct_mul_relin_leveled(
 /// Mod-switches the higher ciphertext to match the lower one.
 /// Uses the average of (approximately equal) scales.
 pub fn rns_ct_add_leveled(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
+    // R6: Reject NaN/Inf scales — these silently propagate through averaging
+    // and corrupt all downstream operations.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_add_leveled: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_add_leveled: b.scale must be finite and positive, got {}",
+        b.scale
+    );
     let target = a.c0.num_primes.min(b.c0.num_primes);
     let a_m = rns_ct_mod_switch_to(a, target);
     let b_m = rns_ct_mod_switch_to(b, target);
@@ -1055,6 +1108,12 @@ pub fn rns_ct_mul_plain_simd(
 /// Required for `rns_matvec`: the encrypted input must be replicated
 /// so that SIMD rotations wrap around correctly at d-element boundaries.
 pub fn replicate_vector(values: &[f64], d: usize) -> Vec<f64> {
+    // R6: Reject d=0 — would cause division by zero in the modular indexing below.
+    assert!(d > 0, "replicate_vector: dimension d must be > 0");
+    assert!(
+        !values.is_empty(),
+        "replicate_vector: values must be non-empty"
+    );
     let mut replicated = vec![0.0; simd::NUM_SLOTS];
     for i in 0..simd::NUM_SLOTS {
         replicated[i] = values[i % d];

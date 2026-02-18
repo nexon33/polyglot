@@ -35,12 +35,19 @@ impl CompositeProof {
     }
 
     /// Compute the binding hash over all proofs.
+    ///
+    /// Panics if a proof cannot be serialized (this is a programming error,
+    /// not an adversarial condition). Previous code used `unwrap_or_default()`
+    /// which would silently produce identical hashes for different invalid
+    /// proofs, allowing composition hash collisions.
     fn compute_composition_hash(outer: &VerifiedProof, inners: &[VerifiedProof]) -> Hash {
-        let outer_bytes = serde_json::to_vec(outer).unwrap_or_default();
+        let outer_bytes = serde_json::to_vec(outer)
+            .expect("VerifiedProof serialization must not fail");
         let mut combined = hash_data(&outer_bytes);
 
         for inner in inners {
-            let inner_bytes = serde_json::to_vec(inner).unwrap_or_default();
+            let inner_bytes = serde_json::to_vec(inner)
+                .expect("VerifiedProof serialization must not fail");
             let inner_hash = hash_data(&inner_bytes);
             combined = hash_combine(&combined, &inner_hash);
         }

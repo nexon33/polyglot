@@ -190,6 +190,12 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
         return false;
     }
 
+    // A disclosure with zero tokens is structurally invalid.
+    // There must be at least one token to form a meaningful disclosure.
+    if disclosure.total_tokens == 0 {
+        return false;
+    }
+
     // Check sequential indices (no gaps, no reordering)
     for (expected_idx, token) in disclosure.tokens.iter().enumerate() {
         if token.index() != expected_idx {

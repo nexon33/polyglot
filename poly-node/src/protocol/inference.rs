@@ -25,14 +25,26 @@ const MAX_INFER_REQUEST_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_INFER_RESPONSE_SIZE: u64 = 16 * 1024 * 1024;
 
 fn bincode_options(limit: u64) -> impl Options {
+    // R6: Removed allow_trailing_bytes() for strict deserialization.
+    // Trailing bytes after a valid message are now rejected, preventing
+    // injection of extra data after a valid payload.
     bincode::DefaultOptions::new()
         .with_limit(limit)
         .with_fixint_encoding()
-        .allow_trailing_bytes()
 }
 
 pub fn encode_infer_request(req: &InferRequest) -> Result<Vec<u8>> {
-    Ok(bincode::serialize(req)?)
+    let bytes = bincode::serialize(req)?;
+    // R6: Validate serialized size does not exceed the wire limit.
+    // A corrupted or malicious caller could produce an oversized request.
+    if bytes.len() as u64 > MAX_INFER_REQUEST_SIZE {
+        anyhow::bail!(
+            "serialized InferRequest too large: {} bytes (max {})",
+            bytes.len(),
+            MAX_INFER_REQUEST_SIZE
+        );
+    }
+    Ok(bytes)
 }
 
 pub fn decode_infer_request(data: &[u8]) -> Result<InferRequest> {
@@ -40,7 +52,17 @@ pub fn decode_infer_request(data: &[u8]) -> Result<InferRequest> {
 }
 
 pub fn encode_infer_response(resp: &InferResponse) -> Result<Vec<u8>> {
-    Ok(bincode::serialize(resp)?)
+    let bytes = bincode::serialize(resp)?;
+    // R6: Validate serialized size does not exceed the wire limit.
+    // A corrupted backend could produce an oversized response.
+    if bytes.len() as u64 > MAX_INFER_RESPONSE_SIZE {
+        anyhow::bail!(
+            "serialized InferResponse too large: {} bytes (max {})",
+            bytes.len(),
+            MAX_INFER_RESPONSE_SIZE
+        );
+    }
+    Ok(bytes)
 }
 
 pub fn decode_infer_response(data: &[u8]) -> Result<InferResponse> {

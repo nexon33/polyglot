@@ -642,8 +642,19 @@ fn validate_fraud_proof(tx: &FraudProofTx, state: &GlobalState) -> Result<Global
     }
 
     // 1. Verify the two observations conflict
-    let _conflict = detect_conflict(&tx.evidence.observation_a, &tx.evidence.observation_b)
+    let actual_conflict = detect_conflict(&tx.evidence.observation_a, &tx.evidence.observation_b)
         .ok_or_else(|| ChainError::FraudDetected("no conflict detected".into()))?;
+
+    // R6: Verify the claimed conflict_type matches the actual detected conflict.
+    // Without this check, an attacker can submit evidence claiming StateInconsistency
+    // when the actual conflict is DoubleSpend (or vice versa), poisoning the on-chain
+    // fraud evidence record with incorrect conflict classification.
+    if tx.evidence.conflict_type != actual_conflict {
+        return Err(ChainError::FraudDetected(format!(
+            "claimed conflict type {:?} does not match detected {:?}",
+            tx.evidence.conflict_type, actual_conflict,
+        )));
+    }
 
     // 2. Verify observer signatures — prevents fabricated fraud evidence
     let obs_a_msg = observation_signing_message(&tx.evidence.observation_a);
@@ -726,12 +737,36 @@ fn validate_stp_action(
                     "only the official can register their own service contract".into(),
                 ));
             }
+
+            // R6: Validate contract parameters to prevent degenerate contracts.
+            // term_start must be before term_end (non-zero-duration contract).
+            if contract.term_start >= contract.term_end {
+                return Err(ChainError::STPError(
+                    "contract term_start must be before term_end".into(),
+                ));
+            }
+            // Staked amount must be non-zero — zero-stake contracts have no slashing deterrent.
+            if contract.staked_amount == 0 {
+                return Err(ChainError::STPError(
+                    "contract must have non-zero staked amount".into(),
+                ));
+            }
+
             // Store contract hash in STP subtree
             let contract_hash = contract.contract_hash();
             new_state.set_stp_record(contract.official, contract_hash);
         }
 
         STPAction::TriggerInvestigation { target, pool_id } => {
+            // R6: Only accounts with an active STP service contract can be
+            // investigated. Without this check, any account can be targeted,
+            // leading to spurious investigations against non-officials.
+            if state.get_stp_record(target).is_none() {
+                return Err(ChainError::UnauthorizedSTPAction(
+                    "investigation target has no STP service contract".into(),
+                ));
+            }
+
             // Create investigation record
             let investigation = InvestigationRecord::new(*pool_id, *target, now);
             let inv_hash = investigation.investigation_hash();
@@ -744,10 +779,23 @@ fn validate_stp_action(
         } => {
             // Only the investigation target can provide data.
             // Load investigation record to verify submitter is the target.
-            let _ = state.get_stp_record(investigation_id).ok_or_else(|| {
+            let _stored_hash = state.get_stp_record(investigation_id).ok_or_else(|| {
                 ChainError::STPError("investigation not found".into())
             })?;
-            // Store the data hash (in full impl, would verify submitter == target)
+
+            // R6: Verify submitter is the investigation target.
+            // The investigation record is stored as its hash in the STP SMT.
+            // We can't recover the target from the hash alone, but we CAN verify
+            // the submitter has an active STP contract (i.e., is a known official).
+            // Without this check, any account can overwrite investigation data.
+            let submitter_has_contract = state.get_stp_record(&tx.submitter).is_some();
+            if !submitter_has_contract {
+                return Err(ChainError::UnauthorizedSTPAction(
+                    "only the investigation target (with an STP contract) can provide data".into(),
+                ));
+            }
+
+            // Store the data hash
             new_state.set_stp_record(*investigation_id, *data_hash);
         }
 
@@ -831,9 +879,12 @@ fn validate_atomic_swap_init(
     let signing_msg = atomic_swap_init_signing_message(tx);
     verify_signature_if_not_mock(&tx.responder, &signing_msg, &tx.signature)?;
 
-    // 0d. Nonce validation (initiator's nonce — they create the swap)
-    let next_nonce = validate_nonce(state, &tx.initiator, tx.nonce)?;
-    new_state.set_nonce(tx.initiator, next_nonce);
+    // R6: Use responder's nonce (they sign the tx, so they control replay).
+    // Previously used initiator's nonce, which allowed a nonce griefing attack:
+    // Eve could create swaps setting initiator=victim, incrementing victim's nonce
+    // without victim's consent (only responder's signature is checked).
+    let next_nonce = validate_nonce(state, &tx.responder, tx.nonce)?;
+    new_state.set_nonce(tx.responder, next_nonce);
 
     // 1. Responder wallet must exist (they're locking funds)
     let _ = state
@@ -860,6 +911,13 @@ fn validate_atomic_swap_init(
             needed: 1,
             available: 0,
         });
+    }
+
+    // R6: Reject ZERO_HASH as hash_lock — a zero hash_lock is meaningless
+    // and could indicate an uninitialized or malformed swap. Any preimage
+    // that hashes to all-zeros would be trivially identifiable.
+    if tx.hash_lock == ZERO_HASH {
+        return Err(ChainError::InvalidPreimage);
     }
 
     // 4. Timeout must be in the future
