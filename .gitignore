@@ -63,3 +63,8 @@ poly-vscode/bin/poly-lsp-*.exe
 
 # VS Code extension build artifacts
 *.vsix
+
+# C build artifacts
+*.o
+poly-verified-c/test_poly_verified
+poly-client-c/test_poly_client
