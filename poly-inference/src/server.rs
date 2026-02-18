@@ -64,9 +64,9 @@ impl InferenceBackend for MockInferenceBackend {
             output_tokens.push(base + i as u32);
         }
 
-        // 3. Create a real HashIvc proof
+        // 3. Create a real HashIvc proof with correct I/O binding
         let privacy = request.mode.to_privacy_mode();
-        let proof = create_proof(&output_tokens, privacy)?;
+        let proof = create_proof(input_tokens, &output_tokens, privacy)?;
 
         // 4. Re-encrypt output (MockEncryption: wrap in MockCiphertext)
         let output_ct = MockCiphertext {
@@ -185,16 +185,16 @@ impl InferenceBackend for ComplianceInferenceBackend {
 
         // 2. Run compliant generation (halts on policy violation)
         let (output_tokens, compliance_proof) = crate::inference::generate_compliant(
-            input_tokens,
+            input_tokens.clone(),
             request.max_tokens,
             request.temperature,
             request.seed,
             self.policy.clone(),
         );
 
-        // 3. Create computation proof (separate from compliance proof)
+        // 3. Create computation proof with correct I/O binding
         let privacy = request.mode.to_privacy_mode();
-        let proof = create_proof(&output_tokens, privacy)?;
+        let proof = create_proof(&input_tokens, &output_tokens, privacy)?;
 
         // 4. Store compliance proof for caller to retrieve
         *self.last_proof.borrow_mut() = Some(compliance_proof);
@@ -221,7 +221,7 @@ impl InferenceBackend for ComplianceInferenceBackend {
 ///
 /// Uses SHA-256 of input/output tokens as state hashes, then runs the full
 /// HashIvc pipeline (init → fold_step → finalize).
-fn create_proof(output_tokens: &[u32], privacy: PrivacyMode) -> Result<VerifiedProof> {
+fn create_proof(input_tokens: &[u32], output_tokens: &[u32], privacy: PrivacyMode) -> Result<VerifiedProof> {
     let backend = HashIvc;
 
     // Code hash: identifies the inference function
@@ -229,8 +229,8 @@ fn create_proof(output_tokens: &[u32], privacy: PrivacyMode) -> Result<VerifiedP
 
     let mut acc = backend.init(&code_hash, privacy);
 
-    // Hash the input and output as state
-    let input_hash = sha256(&tokens_to_bytes(output_tokens));
+    // Hash input and output separately for correct I/O binding
+    let input_hash = sha256(&tokens_to_bytes(input_tokens));
     let output_hash = sha256(&tokens_to_bytes(output_tokens));
 
     let witness = StepWitness {

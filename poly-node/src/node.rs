@@ -1,18 +1,37 @@
 //! PolyNode — main daemon that ties together QUIC transport, identity,
 //! and inference backend.
+//!
+//! Hardened against:
+//! - HelloAck reflection (returns server's own NodeInfo)
+//! - Unbounded connections (semaphore-limited to max_sessions)
+//! - Unbounded inference tasks (semaphore-limited)
+//! - Stream read timeout (10s)
+//! - Bincode deserialization limits
+//! - Version mismatch rejection
+//! - Wrong-direction message rejection
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
+use bincode::Options;
 use log::{info, warn};
+use tokio::sync::Semaphore;
 
 use crate::config::NodeConfig;
 use crate::identity::NodeIdentity;
 use crate::net::transport;
-use crate::protocol::wire::{Frame, MessageType};
-use crate::protocol::{handshake, inference};
+use crate::protocol::handshake::{self, PROTOCOL_VERSION};
+use crate::protocol::wire::{Frame, MessageType, ModelCapability, NodeCapacity, NodeInfo};
+use crate::protocol::{inference};
 
 use poly_inference::server::InferenceBackend;
+
+/// Maximum time to wait for a complete stream read.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum size for a serialized Hello message (64 KB).
+const MAX_HELLO_SIZE: u64 = 64 * 1024;
 
 /// A running Poly Network compute node.
 pub struct PolyNode {
@@ -39,6 +58,30 @@ impl PolyNode {
         })
     }
 
+    /// Build a `NodeInfo` advertising this node's identity and capabilities.
+    fn own_node_info(&self) -> NodeInfo {
+        NodeInfo {
+            public_key: self.identity.public_key_bytes(),
+            addresses: vec![self.config.listen_addr],
+            models: vec![ModelCapability {
+                model_name: self.config.model_name.clone(),
+                gpu: false,
+                throughput_estimate: 0.0,
+            }],
+            relay_capable: self.config.relay,
+            capacity: NodeCapacity {
+                queue_depth: 0,
+                active_sessions: 0,
+                max_sessions: self.config.max_sessions,
+            },
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            signature: vec![0; 64], // TODO: sign in Phase 2
+        }
+    }
+
     /// Run the node: listen for QUIC connections and handle them.
     pub async fn run(&self) -> Result<()> {
         let endpoint = transport::create_server_endpoint(self.config.listen_addr)?;
@@ -48,10 +91,36 @@ impl PolyNode {
             self.config.listen_addr
         );
 
+        // Limit concurrent connections to max_sessions
+        let conn_semaphore = Arc::new(Semaphore::new(self.config.max_sessions as usize));
+        // Limit concurrent inference tasks (compute-heavy)
+        let infer_semaphore = Arc::new(Semaphore::new(self.config.max_sessions as usize));
+
+        let server_info = Arc::new(self.own_node_info());
+
         while let Some(incoming) = endpoint.accept().await {
             let backend = self.backend.clone();
+            let conn_sem = conn_semaphore.clone();
+            let infer_sem = infer_semaphore.clone();
+            let info = server_info.clone();
+
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(incoming, backend).await {
+                // Acquire connection permit (drop releases it)
+                let _permit = match conn_sem.try_acquire() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("Connection rejected: max sessions reached");
+                        // Accept and immediately close to signal overload
+                        if let Ok(conn) = incoming.await {
+                            conn.close(1u32.into(), b"overloaded");
+                        }
+                        return;
+                    }
+                };
+
+                if let Err(e) =
+                    handle_connection(incoming, backend, infer_sem, info).await
+                {
                     warn!("Connection error: {}", e);
                 }
             });
@@ -68,6 +137,8 @@ impl PolyNode {
 async fn handle_connection(
     incoming: quinn::Incoming,
     backend: Arc<dyn InferenceBackend + Send + Sync>,
+    infer_semaphore: Arc<Semaphore>,
+    server_info: Arc<NodeInfo>,
 ) -> Result<()> {
     let conn = incoming.await?;
     info!("Connection from {}", conn.remote_address());
@@ -81,8 +152,10 @@ async fn handle_connection(
         };
 
         let backend = backend.clone();
+        let infer_sem = infer_semaphore.clone();
+        let info = server_info.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv, backend).await {
+            if let Err(e) = handle_stream(send, recv, backend, infer_sem, info).await {
                 warn!("Stream error: {}", e);
             }
         });
@@ -96,31 +169,70 @@ async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     backend: Arc<dyn InferenceBackend + Send + Sync>,
+    infer_semaphore: Arc<Semaphore>,
+    server_info: Arc<NodeInfo>,
 ) -> Result<()> {
-    // Read entire request (max 16MB)
-    let data = recv.read_to_end(16 * 1024 * 1024).await?;
+    // Read entire request with timeout (max 16MB)
+    let data = tokio::time::timeout(STREAM_READ_TIMEOUT, recv.read_to_end(16 * 1024 * 1024))
+        .await
+        .map_err(|_| anyhow::anyhow!("stream read timeout"))??;
+
     let (frame, _) = Frame::decode(&data).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let response_frame = match frame.msg_type {
         MessageType::Ping => Frame::new(MessageType::Pong, vec![]),
 
         MessageType::Hello => {
-            let hello: handshake::Hello = bincode::deserialize(&frame.payload)?;
+            // Size-limited bincode deserialization
+            let hello: handshake::Hello = bincode::DefaultOptions::new()
+                .with_limit(MAX_HELLO_SIZE)
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .deserialize(&frame.payload)?;
+
+            // Reject incompatible protocol versions
+            let accepted = hello.version == PROTOCOL_VERSION;
+            if !accepted {
+                warn!(
+                    "Rejecting Hello: version {} (expected {})",
+                    hello.version, PROTOCOL_VERSION
+                );
+            }
+
+            // Return server's own NodeInfo — never echo back the client's
             let ack = handshake::HelloAck {
-                version: hello.version,
-                node_info: hello.node_info,
-                accepted: true,
+                version: PROTOCOL_VERSION,
+                node_info: (*server_info).clone(),
+                accepted,
             };
             Frame::new(MessageType::HelloAck, bincode::serialize(&ack)?)
         }
 
         MessageType::InferRequest => {
+            // Acquire inference permit (limits concurrent compute tasks)
+            let _permit = infer_semaphore
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("inference semaphore closed"))?;
+
             let payload = frame.payload;
             let result = tokio::task::spawn_blocking(move || {
                 inference::handle_infer(&payload, &*backend)
             })
             .await??;
             Frame::new(MessageType::InferResponse, result)
+        }
+
+        // Reject response-only and unimplemented message types
+        MessageType::HelloAck
+        | MessageType::Pong
+        | MessageType::InferResponse
+        | MessageType::PubkeyResponse => {
+            warn!(
+                "Rejected wrong-direction message: {:?} from client",
+                frame.msg_type
+            );
+            return Ok(());
         }
 
         other => {

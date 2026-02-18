@@ -62,6 +62,11 @@ impl MessageType {
 
 // ─── Frame encoding ──────────────────────────────────────────────────────
 
+/// Maximum allowed frame payload size (16 MB).
+///
+/// Prevents memory exhaustion from malicious length fields.
+pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
+
 /// Wire frame: 1B type + 4B big-endian length + payload.
 pub struct Frame {
     pub msg_type: MessageType,
@@ -84,6 +89,9 @@ impl Frame {
     }
 
     /// Decode a frame from bytes. Returns (frame, bytes_consumed).
+    ///
+    /// Rejects payloads larger than `MAX_FRAME_PAYLOAD` to prevent
+    /// memory exhaustion from malicious length fields.
     pub fn decode(data: &[u8]) -> Result<(Self, usize), FrameError> {
         if data.len() < 5 {
             return Err(FrameError::Incomplete);
@@ -92,6 +100,9 @@ impl Frame {
             MessageType::from_u8(data[0]).ok_or(FrameError::UnknownType(data[0]))?;
         let len =
             u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+        if len > MAX_FRAME_PAYLOAD {
+            return Err(FrameError::PayloadTooLarge(len));
+        }
         if data.len() < 5 + len {
             return Err(FrameError::Incomplete);
         }
@@ -107,6 +118,8 @@ pub enum FrameError {
     Incomplete,
     /// Unknown message type byte.
     UnknownType(u8),
+    /// Payload length exceeds `MAX_FRAME_PAYLOAD`.
+    PayloadTooLarge(usize),
 }
 
 impl std::fmt::Display for FrameError {
@@ -114,6 +127,11 @@ impl std::fmt::Display for FrameError {
         match self {
             Self::Incomplete => write!(f, "incomplete frame"),
             Self::UnknownType(b) => write!(f, "unknown message type: 0x{:02x}", b),
+            Self::PayloadTooLarge(n) => write!(
+                f,
+                "payload too large: {} bytes (max {})",
+                n, MAX_FRAME_PAYLOAD
+            ),
         }
     }
 }
