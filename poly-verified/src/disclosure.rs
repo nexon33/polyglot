@@ -197,7 +197,9 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
         }
     }
 
-    // Verify each revealed token against its Merkle proof
+    // Collect ALL leaf hashes (revealed = recomputed from token, redacted = as-provided)
+    // and verify each revealed token against its Merkle proof.
+    let mut all_leaves: Vec<Hash> = Vec::with_capacity(disclosure.total_tokens);
     let mut proof_idx = 0;
     for token in &disclosure.tokens {
         match token {
@@ -223,6 +225,7 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
                     return false;
                 }
 
+                all_leaves.push(expected_leaf);
                 proof_idx += 1;
             }
             DisclosedToken::Redacted { leaf_hash, .. } => {
@@ -230,6 +233,7 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
                 if hash_eq(leaf_hash, &ZERO_HASH) {
                     return false;
                 }
+                all_leaves.push(*leaf_hash);
             }
         }
     }
@@ -237,6 +241,18 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
     // All proofs should have been consumed
     if proof_idx != disclosure.proofs.len() {
         return false;
+    }
+
+    // [V5-03 FIX] Reconstruct the Merkle tree from ALL leaves and verify the
+    // root matches the disclosure's output_root. This ensures redacted leaf
+    // hashes are genuine (they must be the correct leaves to produce the
+    // committed root). Without this check, an attacker could substitute
+    // arbitrary non-zero hashes for redacted positions.
+    if !all_leaves.is_empty() {
+        let reconstructed = MerkleTree::build(&all_leaves);
+        if !hash_eq(&reconstructed.root, &disclosure.output_root) {
+            return false;
+        }
     }
 
     // Verify output binding: disclosure must be tied to the execution proof

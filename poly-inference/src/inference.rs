@@ -52,7 +52,11 @@ fn last_position_logits(logits: &Tensor) -> Tensor {
 macro_rules! generate_body {
     ($input_ids:expr, $max_tokens:expr, $temperature:expr, $seed:expr) => {{
         let model_guard = MODEL.get().expect("model not loaded");
-        let mut model = model_guard.lock().unwrap();
+        // R5: Recover from a poisoned mutex instead of permanently crashing
+        let mut model = model_guard.lock().unwrap_or_else(|e| {
+            eprintln!("WARN: recovering from poisoned model mutex");
+            e.into_inner()
+        });
         model.clear_kv_cache();
 
         let device = DEVICE.get().expect("device not set");
@@ -184,11 +188,22 @@ pub fn generate_compliant(
     seed: u64,
     policy: ContentPolicy,
 ) -> (Vec<u32>, ComplianceProof) {
+    // R5: Validate temperature to prevent NaN from division by zero
+    assert!(
+        validate_temperature(temperature).is_ok(),
+        "invalid temperature: {}",
+        temperature
+    );
+
     let server_checker = PolicyChecker::new(policy.clone());
     let mut compliance_acc = ComplianceAccumulator::new(PolicyChecker::new(policy));
 
     let model_guard = MODEL.get().expect("model not loaded");
-    let mut model = model_guard.lock().unwrap();
+    // R5: Recover from a poisoned mutex instead of permanently crashing
+    let mut model = model_guard.lock().unwrap_or_else(|e| {
+        eprintln!("WARN: recovering from poisoned model mutex");
+        e.into_inner()
+    });
     model.clear_kv_cache();
 
     let device = DEVICE.get().expect("device not set");

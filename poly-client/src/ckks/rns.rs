@@ -440,6 +440,14 @@ fn wide_mul_u64(a: &[u64], b: u64) -> Vec<u64> {
         result[i] = prod as u64;
         carry = prod >> 64;
     }
+    // R5: Extend result if there's remaining carry — prevents silent truncation
+    // in CRT reconstruction with many primes (4+).
+    if carry != 0 {
+        result.push(carry as u64);
+        if carry >> 64 != 0 {
+            result.push((carry >> 64) as u64);
+        }
+    }
     result
 }
 

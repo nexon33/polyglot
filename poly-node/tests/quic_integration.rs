@@ -95,13 +95,16 @@ async fn ping_pong_over_quic() {
     // Give server time to bind
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Connect client and send Ping
+    // Connect client, handshake, then send Ping
     let client_endpoint = transport::create_client_endpoint().unwrap();
     let conn = client_endpoint
         .connect(addr, "poly-node")
         .unwrap()
         .await
         .unwrap();
+
+    // Handshake required before Ping (R5 hardening)
+    do_handshake(&conn).await;
 
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
 

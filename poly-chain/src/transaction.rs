@@ -42,7 +42,11 @@ impl Transaction {
 
     /// Hash of this transaction for Merkle tree inclusion.
     pub fn tx_hash(&self) -> Hash {
-        hash_with_domain(DOMAIN_TRANSFER, &serde_json::to_vec(self).unwrap_or_default())
+        // R5: Fail loudly rather than silently producing colliding hashes
+        hash_with_domain(
+            DOMAIN_TRANSFER,
+            &serde_json::to_vec(self).expect("Transaction serialization must not fail"),
+        )
     }
 
     /// The account that pays the fee for this transaction.

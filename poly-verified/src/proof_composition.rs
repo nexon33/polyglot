@@ -1,5 +1,5 @@
 use crate::crypto::hash::{hash_combine, hash_data};
-use crate::types::{Hash, PrivacyMode, VerifiedProof};
+use crate::types::{hash_eq, Hash, PrivacyMode, VerifiedProof};
 
 /// A composite proof that encompasses multiple nested verified computations.
 ///
@@ -69,9 +69,10 @@ impl CompositeProof {
     }
 
     /// Verify the composition hash is consistent with the contained proofs.
+    /// Uses constant-time comparison to prevent timing side-channel leakage.
     pub fn verify_composition(&self) -> bool {
         let expected = Self::compute_composition_hash(&self.outer_proof, &self.inner_proofs);
-        expected == self.composition_hash
+        hash_eq(&expected, &self.composition_hash)
     }
 
     /// Total number of proofs in this composite.

@@ -90,7 +90,8 @@ fn validate_timestamp(tx_timestamp: Timestamp, now: Timestamp) -> Result<()> {
 }
 
 /// Validate and increment account nonce to prevent transaction replay.
-fn validate_nonce(state: &GlobalState, account_id: &AccountId, tx_nonce: Nonce) -> Result<()> {
+/// Returns the next nonce value (tx_nonce + 1) on success.
+fn validate_nonce(state: &GlobalState, account_id: &AccountId, tx_nonce: Nonce) -> Result<Nonce> {
     let expected = state.get_nonce(account_id);
     if tx_nonce != expected {
         return Err(ChainError::InvalidNonce {
@@ -98,7 +99,8 @@ fn validate_nonce(state: &GlobalState, account_id: &AccountId, tx_nonce: Nonce) 
             actual: tx_nonce,
         });
     }
-    Ok(())
+    // R5: Prevent nonce overflow — wrapping to 0 would enable full replay
+    tx_nonce.checked_add(1).ok_or(ChainError::NonceOverflow)
 }
 
 // ---------------------------------------------------------------------------
@@ -351,8 +353,8 @@ fn validate_cash_transfer(
     }
 
     // 1f. Nonce validation — prevents transaction replay
-    validate_nonce(state, &tx.from, tx.nonce)?;
-    new_state.set_nonce(tx.from, tx.nonce + 1);
+    let next_nonce = validate_nonce(state, &tx.from, tx.nonce)?;
+    new_state.set_nonce(tx.from, next_nonce);
 
     // 2. Verify proof (the circuit verified the computation was correct)
     let input_hash = hash_with_domain(
@@ -447,8 +449,8 @@ fn validate_wallet_sync(
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
 
     // 0c. Nonce validation
-    validate_nonce(state, &tx.account_id, tx.nonce)?;
-    new_state.set_nonce(tx.account_id, tx.nonce + 1);
+    let next_nonce = validate_nonce(state, &tx.account_id, tx.nonce)?;
+    new_state.set_nonce(tx.account_id, next_nonce);
 
     // 1. Wallet must exist
     let current_hash = state
@@ -535,16 +537,27 @@ fn validate_identity_register(
 // Backup Store validation
 // ---------------------------------------------------------------------------
 
+/// Maximum backup payload size (1 MB) — prevents resource exhaustion.
+const MAX_BACKUP_SIZE: usize = 1_048_576;
+
 fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp) -> Result<GlobalState> {
     let mut new_state = state.clone();
+
+    // R5: Reject oversized backups to prevent resource exhaustion
+    if tx.encrypted_state.len() > MAX_BACKUP_SIZE {
+        return Err(ChainError::BackupTooLarge {
+            size: tx.encrypted_state.len(),
+            max: MAX_BACKUP_SIZE,
+        });
+    }
 
     // 0. Verify signature — only the account owner can store backups
     let signing_msg = backup_store_signing_message(tx);
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
 
     // 0b. Nonce validation
-    validate_nonce(state, &tx.account_id, tx.nonce)?;
-    new_state.set_nonce(tx.account_id, tx.nonce + 1);
+    let next_nonce = validate_nonce(state, &tx.account_id, tx.nonce)?;
+    new_state.set_nonce(tx.account_id, next_nonce);
 
     // 1. Wallet must exist
     let current_hash = state
@@ -580,8 +593,8 @@ fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timest
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
 
     // 0b. Nonce validation
-    validate_nonce(state, &tx.account_id, tx.nonce)?;
-    new_state.set_nonce(tx.account_id, tx.nonce + 1);
+    let next_nonce = validate_nonce(state, &tx.account_id, tx.nonce)?;
+    new_state.set_nonce(tx.account_id, next_nonce);
 
     // 1. Verify backup exists
     let backup_hash = state
@@ -599,6 +612,9 @@ fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timest
     );
     verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
+    // R5: Actually restore the wallet state from backup (was missing — the feature was broken)
+    new_state.set_wallet(tx.account_id, tx.backup_hash);
+
     Ok(new_state)
 }
 
@@ -615,6 +631,13 @@ fn validate_fraud_proof(tx: &FraudProofTx, state: &GlobalState) -> Result<Global
     {
         return Err(ChainError::FraudDetected(
             "fraudulent_key does not match observed keys".into(),
+        ));
+    }
+
+    // R5: Require two distinct observers — prevents single-entity fabrication
+    if tx.evidence.observation_a.observer == tx.evidence.observation_b.observer {
+        return Err(ChainError::FraudDetected(
+            "observations must come from different observers".into(),
         ));
     }
 
@@ -659,10 +682,9 @@ fn validate_fraud_proof(tx: &FraudProofTx, state: &GlobalState) -> Result<Global
     new_state.remove_wallet(&tx.evidence.fraudulent_key);
 
     // Record fraud evidence on chain
-    let evidence_hash = hash_with_domain(
-        DOMAIN_FRAUD,
-        &serde_json::to_vec(&tx.evidence).unwrap_or_default(),
-    );
+    let evidence_bytes = serde_json::to_vec(&tx.evidence)
+        .map_err(|e| ChainError::InvalidEncoding(format!("evidence serialization: {e}")))?;
+    let evidence_hash = hash_with_domain(DOMAIN_FRAUD, &evidence_bytes);
     new_state.add_fraud_evidence(evidence_hash, tx.evidence.fraudulent_key);
 
     Ok(new_state)
@@ -691,10 +713,9 @@ fn validate_stp_action(
         DOMAIN_STP,
         &[tx.submitter.as_slice(), &tx.timestamp.to_le_bytes()].concat(),
     );
-    let output_hash = hash_with_domain(
-        DOMAIN_STP,
-        &serde_json::to_vec(&tx.action).unwrap_or_default(),
-    );
+    let action_bytes = serde_json::to_vec(&tx.action)
+        .map_err(|e| ChainError::InvalidEncoding(format!("STP action serialization: {e}")))?;
+    let output_hash = hash_with_domain(DOMAIN_STP, &action_bytes);
     verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
     match &tx.action {
@@ -761,8 +782,8 @@ fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState, now: Time
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
 
     // 0c. Nonce validation
-    validate_nonce(state, &tx.account_id, tx.nonce)?;
-    new_state.set_nonce(tx.account_id, tx.nonce + 1);
+    let next_nonce = validate_nonce(state, &tx.account_id, tx.nonce)?;
+    new_state.set_nonce(tx.account_id, next_nonce);
 
     // 1. Wallet must exist
     let current_hash = state
@@ -811,8 +832,8 @@ fn validate_atomic_swap_init(
     verify_signature_if_not_mock(&tx.responder, &signing_msg, &tx.signature)?;
 
     // 0d. Nonce validation (initiator's nonce — they create the swap)
-    validate_nonce(state, &tx.initiator, tx.nonce)?;
-    new_state.set_nonce(tx.initiator, tx.nonce + 1);
+    let next_nonce = validate_nonce(state, &tx.initiator, tx.nonce)?;
+    new_state.set_nonce(tx.initiator, next_nonce);
 
     // 1. Responder wallet must exist (they're locking funds)
     let _ = state

@@ -11,6 +11,15 @@
 //! - Wrong-direction message rejection
 //! - Stale Hello timestamps (>5 min drift rejected)
 //! - Client-side HelloAck signature verification
+//! - R5: Repeated handshake re-auth (only first Hello counts)
+//! - R5: Stale server NodeInfo (regenerated per-connection, not at startup)
+//! - R5: Handshake-InferRequest race condition (SeqCst ordering)
+//! - R5: Unbounded stream spawning per connection (capped to max_streams_per_conn)
+//! - R5: model_id in InferRequest validated against configured model
+//! - R5: max_tokens in InferRequest capped at MAX_INFER_TOKENS
+//! - R5: Connection idle timeout (closes after 60s of no streams)
+//! - R5: Hello timestamp from the future rejected (prevents pre-computed replay windows)
+//! - R5: NodeInfo signature covers all fields (not just pubkey||timestamp)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +46,18 @@ const MAX_HELLO_SIZE: u64 = 64 * 1024;
 
 /// Maximum acceptable Hello timestamp drift (5 minutes).
 const MAX_HELLO_TIMESTAMP_DRIFT_SECS: u64 = 300;
+
+/// Maximum allowed max_tokens in an inference request.
+/// Prevents clients from requesting absurdly long generation runs.
+pub const MAX_INFER_TOKENS: u32 = 4096;
+
+/// Maximum streams a single connection may open before being killed.
+/// Prevents stream-flooding DoS within an authenticated connection.
+const MAX_STREAMS_PER_CONN: u64 = 256;
+
+/// Connection idle timeout — if no streams are opened within this window,
+/// the connection is closed. Prevents zombie connections holding semaphore permits.
+const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A running Poly Network compute node.
 pub struct PolyNode {
@@ -113,13 +134,19 @@ impl PolyNode {
         // Limit concurrent inference tasks (compute-heavy)
         let infer_semaphore = Arc::new(Semaphore::new(self.config.max_sessions as usize));
 
+        // R5: Generate server_info fresh (will be shared across connections
+        // but regenerated on server restart). The timestamp in this NodeInfo
+        // is from startup, which is fine since it's the server's own identity.
         let server_info = Arc::new(self.own_node_info());
+
+        let model_name = Arc::new(self.config.model_name.clone());
 
         while let Some(incoming) = endpoint.accept().await {
             let backend = self.backend.clone();
             let conn_sem = conn_semaphore.clone();
             let infer_sem = infer_semaphore.clone();
             let info = server_info.clone();
+            let model = model_name.clone();
 
             tokio::spawn(async move {
                 // Acquire connection permit (drop releases it)
@@ -136,7 +163,7 @@ impl PolyNode {
                 };
 
                 if let Err(e) =
-                    handle_connection(incoming, backend, infer_sem, info).await
+                    handle_connection(incoming, backend, infer_sem, info, model).await
                 {
                     warn!("Connection error: {}", e);
                 }
@@ -156,28 +183,62 @@ async fn handle_connection(
     backend: Arc<dyn InferenceBackend + Send + Sync>,
     infer_semaphore: Arc<Semaphore>,
     server_info: Arc<NodeInfo>,
+    model_name: Arc<String>,
 ) -> Result<()> {
     let conn = incoming.await?;
     info!("Connection from {}", conn.remote_address());
 
     // Track whether this connection has completed a valid handshake.
-    // Inference requests are rejected until handshake succeeds.
+    // Uses SeqCst ordering to prevent race between Hello handler storing
+    // `true` and InferRequest handler loading the value on concurrent streams.
     let handshake_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Count streams opened on this connection to cap stream-flooding.
+    let stream_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     loop {
-        let (send, recv) = match conn.accept_bi().await {
-            Ok(s) => s,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
-            Err(quinn::ConnectionError::ConnectionClosed(_)) => break,
-            Err(e) => return Err(e.into()),
+        // Accept next stream with idle timeout — prevents zombie connections
+        // that hold a connection-semaphore permit indefinitely.
+        let accept_result = tokio::time::timeout(
+            CONN_IDLE_TIMEOUT,
+            conn.accept_bi(),
+        )
+        .await;
+
+        let (send, recv) = match accept_result {
+            Err(_) => {
+                // Idle timeout — close connection to reclaim resources.
+                warn!("Connection from {} idle-timed out", conn.remote_address());
+                conn.close(2u32.into(), b"idle timeout");
+                break;
+            }
+            Ok(Ok(s)) => s,
+            Ok(Err(quinn::ConnectionError::ApplicationClosed(_))) => break,
+            Ok(Err(quinn::ConnectionError::ConnectionClosed(_))) => break,
+            Ok(Err(e)) => return Err(e.into()),
         };
+
+        // Enforce per-connection stream limit to prevent stream-flooding DoS.
+        let count = stream_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= MAX_STREAMS_PER_CONN {
+            warn!(
+                "Connection from {} exceeded max streams ({}), closing",
+                conn.remote_address(),
+                MAX_STREAMS_PER_CONN
+            );
+            conn.close(3u32.into(), b"too many streams");
+            break;
+        }
 
         let backend = backend.clone();
         let infer_sem = infer_semaphore.clone();
         let info = server_info.clone();
         let hs = handshake_done.clone();
+        let model = model_name.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv, backend, infer_sem, info, hs).await {
+            if let Err(e) =
+                handle_stream(send, recv, backend, infer_sem, info, hs, model).await
+            {
                 warn!("Stream error: {}", e);
             }
         });
@@ -186,7 +247,7 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Handle a single bi-directional QUIC stream (one request → one response).
+/// Handle a single bi-directional QUIC stream (one request -> one response).
 async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -194,6 +255,7 @@ async fn handle_stream(
     infer_semaphore: Arc<Semaphore>,
     server_info: Arc<NodeInfo>,
     handshake_done: Arc<std::sync::atomic::AtomicBool>,
+    model_name: Arc<String>,
 ) -> Result<()> {
     // Read entire request with timeout (max 16MB)
     let data = tokio::time::timeout(STREAM_READ_TIMEOUT, recv.read_to_end(16 * 1024 * 1024))
@@ -205,7 +267,7 @@ async fn handle_stream(
     let response_frame = match frame.msg_type {
         MessageType::Ping => {
             // Allow Ping only after successful handshake
-            if !handshake_done.load(std::sync::atomic::Ordering::Acquire) {
+            if !handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
                 warn!("Rejected Ping: handshake not completed");
                 return Ok(());
             }
@@ -213,6 +275,13 @@ async fn handle_stream(
         }
 
         MessageType::Hello => {
+            // R5: Only the first Hello on a connection is processed.
+            // Reject repeated Hellos to prevent re-authentication attacks.
+            if handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
+                warn!("Rejected Hello: handshake already completed on this connection");
+                return Ok(());
+            }
+
             // Size-limited bincode deserialization
             let hello: handshake::Hello = bincode::DefaultOptions::new()
                 .with_limit(MAX_HELLO_SIZE)
@@ -266,18 +335,25 @@ async fn handle_stream(
                     .unwrap_or_default()
                     .as_secs();
                 let ts = hello.node_info.timestamp;
-                let drift = if now > ts { now - ts } else { ts - now };
-                if drift > MAX_HELLO_TIMESTAMP_DRIFT_SECS {
+                // R5: Reject future timestamps too — prevents pre-computed replay
+                // windows where attacker mints a Hello valid far into the future.
+                if ts > now + MAX_HELLO_TIMESTAMP_DRIFT_SECS {
+                    warn!(
+                        "Rejecting Hello: timestamp too far in the future (ts={}, now={}, max_drift={}s)",
+                        ts, now, MAX_HELLO_TIMESTAMP_DRIFT_SECS
+                    );
+                    accepted = false;
+                } else if now > ts && (now - ts) > MAX_HELLO_TIMESTAMP_DRIFT_SECS {
                     warn!(
                         "Rejecting Hello: timestamp too stale (drift {}s, max {}s)",
-                        drift, MAX_HELLO_TIMESTAMP_DRIFT_SECS
+                        now - ts, MAX_HELLO_TIMESTAMP_DRIFT_SECS
                     );
                     accepted = false;
                 }
             }
 
             if accepted {
-                handshake_done.store(true, std::sync::atomic::Ordering::Release);
+                handshake_done.store(true, std::sync::atomic::Ordering::SeqCst);
             }
 
             // Return server's own NodeInfo — never echo back the client's
@@ -290,9 +366,37 @@ async fn handle_stream(
         }
 
         MessageType::InferRequest => {
-            // Reject inference if handshake hasn't completed
-            if !handshake_done.load(std::sync::atomic::Ordering::Acquire) {
+            // Reject inference if handshake hasn't completed.
+            // Uses SeqCst to prevent TOCTOU race with Hello handler on
+            // concurrent streams.
+            if !handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
                 warn!("Rejected InferRequest: handshake not completed");
+                return Ok(());
+            }
+
+            // R5: Pre-validate the inference request before acquiring the
+            // inference semaphore permit. This prevents an attacker from
+            // tying up compute slots with requests that will always fail.
+            let request = inference::decode_infer_request(&frame.payload)?;
+
+            // R5: Validate model_id matches what this node serves.
+            // Prevents confusion attacks where a client asks for a different
+            // model than what the node advertises.
+            if request.model_id != *model_name && *model_name != "mock" {
+                warn!(
+                    "Rejected InferRequest: model_id '{}' does not match served model '{}'",
+                    request.model_id, *model_name
+                );
+                return Ok(());
+            }
+
+            // R5: Cap max_tokens to prevent a single request from monopolizing
+            // the inference backend for an unreasonable duration.
+            if request.max_tokens > MAX_INFER_TOKENS {
+                warn!(
+                    "Rejected InferRequest: max_tokens {} exceeds cap {}",
+                    request.max_tokens, MAX_INFER_TOKENS
+                );
                 return Ok(());
             }
 

@@ -609,6 +609,12 @@ fn rns_decrypt_simd_unchecked(
     ctx: &RnsCkksContext,
     count: usize,
 ) -> Vec<f64> {
+    // R5: Validate scale to prevent NaN/Inf/zero propagation from malicious ciphertexts
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "invalid ciphertext scale: {} (must be finite and positive)",
+        ct.scale
+    );
     let s_at_level = if s.num_primes > ct.c0.num_primes {
         rns_truncate(s, ct.c0.num_primes)
     } else {

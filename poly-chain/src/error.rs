@@ -72,6 +72,12 @@ pub enum ChainError {
     #[error("block height overflow")]
     BlockHeightOverflow,
 
+    #[error("nonce overflow: account nonce would exceed u64::MAX")]
+    NonceOverflow,
+
+    #[error("backup too large: {size} bytes (max {max})")]
+    BackupTooLarge { size: usize, max: usize },
+
     #[error("invalid swap ID derivation")]
     InvalidSwapId,
 

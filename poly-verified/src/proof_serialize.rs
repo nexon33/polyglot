@@ -1,6 +1,6 @@
 use crate::crypto::hash::hash_data;
 use crate::error::{ProofSystemError, Result};
-use crate::types::{BackendId, Hash, PrivacyMode, VerifiedProof, ZERO_HASH};
+use crate::types::{hash_eq, BackendId, Hash, PrivacyMode, VerifiedProof, ZERO_HASH};
 
 /// Wire format for transmitting verified values with their proofs.
 ///
@@ -127,11 +127,13 @@ impl VerifiedResponse {
 
     /// Verify that value_bytes matches value_hash.
     /// In Private mode, always returns true (value is hidden).
+    /// Uses constant-time comparison to prevent timing side-channel leakage.
     pub fn verify_value_integrity(&self) -> bool {
         if self.privacy_mode == PrivacyMode::Private {
             return true;
         }
-        hash_data(&self.value_bytes) == self.value_hash
+        let computed = hash_data(&self.value_bytes);
+        hash_eq(&computed, &self.value_hash)
     }
 }
 

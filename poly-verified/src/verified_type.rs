@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::disclosure::{self, Disclosure};
 use crate::error::{self, VerifiedError};
@@ -14,7 +14,14 @@ use crate::types::{PrivacyMode, VerifiedProof};
 ///
 /// Every `Verified<T>` carries a `VerifiedProof` that any receiver can check
 /// in milliseconds without re-executing anything.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// # Security Note
+///
+/// `Verified<T>` intentionally does NOT implement `Deserialize`. Allowing
+/// arbitrary deserialization would let an attacker forge verified values by
+/// pairing arbitrary data with a stolen or replayed proof. Use
+/// [`Verified::to_transferable`] and [`Verified::from_transferable`] for
+/// safe serialization that validates the value-proof binding on reconstruction.
+#[derive(Clone, Debug, Serialize)]
 pub struct Verified<T> {
     value: T,
     proof: VerifiedProof,

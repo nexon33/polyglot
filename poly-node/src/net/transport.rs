@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -35,6 +36,12 @@ pub fn create_server_endpoint(addr: SocketAddr) -> Result<quinn::Endpoint> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(4u32.into());
     transport.max_concurrent_uni_streams(4u32.into());
+    // R5: QUIC-level idle timeout — complements the application-level idle
+    // timeout in handle_connection. If no QUIC activity (including keep-alives)
+    // for 90 seconds, the connection is silently closed.
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(90)).unwrap(),
+    ));
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,

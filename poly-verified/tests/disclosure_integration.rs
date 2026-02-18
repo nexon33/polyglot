@@ -271,11 +271,11 @@ fn tamper_change_redacted_leaf_hash() {
     let verified = make_verified(vec![100, 200, 300, 400]);
     let mut disclosure = create_disclosure(&verified, &[0]).unwrap();
 
-    // Change a redacted leaf hash to a different value
-    // This is accepted by verify_disclosure since we don't verify
-    // redacted leaves against the Merkle tree (by design — the verifier
-    // only needs to know a token exists, not verify its commitment).
-    // But ZERO_HASH would fail.
+    // Change a redacted leaf hash to a different value.
+    // Previously this was accepted because redacted leaves were not verified
+    // against the Merkle tree. After the V5-03 fix (R5 pentest), the verifier
+    // now reconstructs the Merkle root from ALL leaves and checks it matches
+    // output_root, so tampered redacted hashes are detected.
     if let DisclosedToken::Redacted { index, .. } = &disclosure.tokens[1] {
         disclosure.tokens[1] = DisclosedToken::Redacted {
             index: *index,
@@ -283,10 +283,8 @@ fn tamper_change_redacted_leaf_hash() {
         };
     }
 
-    // This should still pass because redacted hashes aren't verified against tree
-    // (the verifier only checks they aren't ZERO_HASH)
-    // The output_root still binds the original tree, but we only verify revealed tokens.
-    assert!(verify_disclosure(&disclosure));
+    // Now fails: the reconstructed Merkle root won't match the original output_root.
+    assert!(!verify_disclosure(&disclosure));
 }
 
 #[test]

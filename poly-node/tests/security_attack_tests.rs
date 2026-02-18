@@ -378,7 +378,10 @@ async fn attack_bincode_bomb_hello() {
 
     // If we get here without the server crashing, the test passes.
     // The server should still be responsive.
-    // Try a Ping on a new stream to verify the server survived.
+    // Handshake was never completed (the bomb was not a valid Hello),
+    // so Ping would be rejected. Instead, do a proper handshake first
+    // to verify the server survived, then Ping.
+    do_handshake(&conn).await;
     let (mut send2, mut recv2) = conn.open_bi().await.unwrap();
     let ping = Frame::new(MessageType::Ping, vec![]);
     send2.write_all(&ping.encode()).await.unwrap();
@@ -439,7 +442,8 @@ async fn attack_malformed_bincode_in_infer_request() {
         .await;
     }
 
-    // Connection should still be alive — verify with a Ping
+    // Connection should still be alive — do handshake then verify with Ping
+    do_handshake(&conn).await;
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     let ping = Frame::new(MessageType::Ping, vec![]);
     send.write_all(&ping.encode()).await.unwrap();
@@ -512,7 +516,8 @@ async fn attack_wrong_direction_messages() {
         }
     }
 
-    // Connection should survive
+    // Connection should survive — do handshake then verify with Ping
+    do_handshake(&conn).await;
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     let ping = Frame::new(MessageType::Ping, vec![]);
     send.write_all(&ping.encode()).await.unwrap();
