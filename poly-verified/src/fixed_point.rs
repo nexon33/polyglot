@@ -50,10 +50,28 @@ impl FixedPoint {
     }
 
     /// Create from a decimal: `from_decimal(150, 2)` = 1.50
+    ///
+    /// Uses saturating arithmetic: if `decimal_places` is too large (>= 38),
+    /// the divisor exceeds i128 range and the result saturates to ZERO.
+    /// If the numerator `value * SCALE` overflows, the result also saturates.
     pub fn from_decimal(value: i64, decimal_places: u32) -> Self {
+        // 10^38 > i128::MAX, so cap at 38 to avoid panic in pow().
+        if decimal_places >= 38 {
+            // Divisor would be astronomically large; result is effectively zero.
+            return Self::ZERO;
+        }
         let divisor = 10i128.pow(decimal_places);
-        Self {
-            raw: (value as i128) * SCALE / divisor,
+        match (value as i128).checked_mul(SCALE) {
+            Some(numerator) => Self {
+                raw: numerator / divisor,
+            },
+            None => {
+                // Overflow in numerator: saturate based on sign of value.
+                let positive = value >= 0;
+                Self {
+                    raw: if positive { i128::MAX } else { i128::MIN },
+                }
+            }
         }
     }
 

@@ -274,6 +274,7 @@ fn handle_infer<B: InferenceBackend>(
     let infer_request: InferRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(e) => {
+            // R7: Log full error server-side but return generic message to client
             eprintln!("invalid JSON: {e}");
             return json_error(400, "invalid request body", json_header);
         }
@@ -302,12 +303,14 @@ fn handle_infer<B: InferenceBackend>(
             if !ct.tokens.is_empty() {
                 let prompt_text = crate::model::decode(&ct.tokens);
                 if let Err(rejection) = crate::compliance::check_prompt(&prompt_text) {
-                    return json_error(403, &format!("prompt rejected: {}", rejection), json_header);
+                    // R7: Don't echo the specific rejection reason to the client
+                    eprintln!("prompt rejected on /infer: {}", rejection);
+                    return json_error(403, "prompt rejected by safety filter", json_header);
                 }
             }
             // R6: Validate token count on /infer
             if ct.tokens.len() > MAX_PROMPT_TOKENS {
-                return json_error(400, &format!("input too many tokens: {} (max {})", ct.tokens.len(), MAX_PROMPT_TOKENS), json_header);
+                return json_error(400, &format!("input exceeds token limit (max {})", MAX_PROMPT_TOKENS), json_header);
             }
         }
     }
@@ -316,11 +319,7 @@ fn handle_infer<B: InferenceBackend>(
     if infer_request.encrypted_input.len() > MAX_ENCRYPTED_INPUT_SIZE {
         return json_error(
             400,
-            &format!(
-                "encrypted_input too large: {} bytes (max {})",
-                infer_request.encrypted_input.len(),
-                MAX_ENCRYPTED_INPUT_SIZE
-            ),
+            "encrypted_input too large",
             json_header,
         );
     }
@@ -337,8 +336,10 @@ fn handle_infer<B: InferenceBackend>(
             )
         }
         Err(e) => {
+            // R7: Log detailed error server-side, return generic message to client
+            // to prevent information leakage about model internals
             eprintln!("inference failed: {e}");
-            json_error(500, "inference failed", json_header)
+            json_error(500, "internal server error", json_header)
         }
     }
 }
@@ -404,15 +405,19 @@ fn handle_generate(
 
     // Pre-inference safety gate: reject jailbreak and harmful prompts
     if let Err(rejection) = check_prompt(&req.prompt) {
-        return json_error(403, &format!("prompt rejected: {}", rejection), json_header);
+        // R7: Log specific rejection server-side, return generic message to client
+        // to prevent attackers from learning which pattern matched
+        eprintln!("prompt rejected: {}", rejection);
+        return json_error(403, "prompt rejected by safety filter", json_header);
     }
 
     // Tokenize
     let token_ids = match crate::model::tokenize(&req.prompt) {
         Ok(ids) => ids,
         Err(e) => {
+            // R7: Don't reveal "tokenization failed" -- leaks implementation detail
             eprintln!("tokenization failed: {e}");
-            return json_error(500, "tokenization failed", json_header);
+            return json_error(500, "internal server error", json_header);
         }
     };
 
@@ -450,6 +455,19 @@ fn handle_generate(
     let safe_prompt_len = prompt_len.min(output_tokens.len());
     let completion = crate::model::decode(&output_tokens[safe_prompt_len..]);
     let generated_tokens = output_tokens.len().saturating_sub(prompt_len);
+
+    // R7: Post-generation text-level compliance check.
+    // Token-level n-gram checking can be evaded by interleaving whitespace/punctuation
+    // tokens that break the contiguous n-gram match. This catches such evasion by
+    // scanning the decoded completion text for harmful terms.
+    if let Err(term) = crate::compliance::check_output_text(&completion) {
+        eprintln!("R7: post-generation text check caught harmful term: {:?}", term);
+        return json_error(
+            451,
+            "generation contained harmful content and was blocked",
+            json_header,
+        );
+    }
 
     // Build execution proof summary with I/O binding
     let proof_summary = proof_to_summary(
@@ -522,7 +540,9 @@ fn handle_generate_encrypted<B: InferenceBackend>(
         }
     };
 
-    // Entire body is PFHE-compressed (bincode + zstd)
+    // Entire body is PFHE-compressed (bincode + zstd).
+    // The compress module has an internal MAX_DECOMPRESSED_SIZE (32 MB) that prevents
+    // decompression bombs. The read_body() above caps the compressed input at 1 MB.
     let req: EncryptedGenerateRequest = match compress::decompress(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -553,6 +573,21 @@ fn handle_generate_encrypted<B: InferenceBackend>(
             &format!(
                 "encrypted_input too large: {} bytes (max {})",
                 req.encrypted_input.len(),
+                MAX_ENCRYPTED_INPUT_SIZE
+            ),
+            json_header,
+        );
+    }
+
+    // R7: Validate client_public_key size (same limit as encrypted_input).
+    // Without this, an attacker can send a multi-MB client_public_key that
+    // decompresses to an enormous CKKS key, exhausting memory.
+    if req.client_public_key.len() > MAX_ENCRYPTED_INPUT_SIZE {
+        return json_error(
+            400,
+            &format!(
+                "client_public_key too large: {} bytes (max {})",
+                req.client_public_key.len(),
                 MAX_ENCRYPTED_INPUT_SIZE
             ),
             json_header,
@@ -636,6 +671,18 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     let exec_proof = infer_response.proof;
     let safe_enc_prompt_len = prompt_len.min(output_tokens.len());
     let generated_tokens = output_tokens.len().saturating_sub(prompt_len);
+
+    // R7: Post-generation text-level compliance check on encrypted endpoint.
+    // Same rationale as /generate: n-gram evasion via token interleaving.
+    let completion_text = crate::model::decode(&output_tokens[safe_enc_prompt_len..]);
+    if let Err(term) = crate::compliance::check_output_text(&completion_text) {
+        eprintln!("R7: post-generation text check caught harmful term on encrypted endpoint: {:?}", term);
+        return json_error(
+            451,
+            "generation contained harmful content and was blocked",
+            json_header,
+        );
+    }
 
     // Post-hoc compliance attestation (the ComplianceInferenceBackend already
     // enforced per-token compliance in-loop via generate_compliant())

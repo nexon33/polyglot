@@ -470,13 +470,17 @@ fn wide_add(a: &[u64], b: &[u64]) -> Vec<u64> {
     result
 }
 
+/// R7: Use max(a.len(), b.len()) — if b was extended by wide_mul_u64 carry
+/// propagation, using only a.len() silently drops higher limbs of b,
+/// producing an incorrect subtraction result in CRT reconstruction.
 fn wide_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
-    let n = a.len();
+    let n = a.len().max(b.len());
     let mut result = vec![0u64; n];
     let mut borrow = 0i128;
     for i in 0..n {
+        let av = if i < a.len() { a[i] as i128 } else { 0 };
         let bv = if i < b.len() { b[i] as i128 } else { 0 };
-        let diff = a[i] as i128 - bv - borrow;
+        let diff = av - bv - borrow;
         if diff < 0 {
             result[i] = (diff + (1i128 << 64)) as u64;
             borrow = 1;
@@ -500,12 +504,15 @@ fn wide_shr(a: &[u64], bits: u32) -> Vec<u64> {
     result
 }
 
+/// R7: Use max(a.len(), b.len()) — if b has more limbs than a,
+/// non-zero higher limbs of b mean b > a, which was previously missed.
 fn wide_gt(a: &[u64], b: &[u64]) -> bool {
-    let n = a.len();
+    let n = a.len().max(b.len());
     for i in (0..n).rev() {
+        let av = if i < a.len() { a[i] } else { 0 };
         let bv = if i < b.len() { b[i] } else { 0 };
-        if a[i] > bv { return true; }
-        if a[i] < bv { return false; }
+        if av > bv { return true; }
+        if av < bv { return false; }
     }
     false // equal
 }

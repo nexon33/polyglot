@@ -77,9 +77,38 @@ impl CompositeProof {
 
     /// Verify the composition hash is consistent with the contained proofs.
     /// Uses constant-time comparison to prevent timing side-channel leakage.
+    ///
+    /// Also performs structural validation: the outer proof must be
+    /// structurally valid (step_count > 0 for HashIvc), and all inner
+    /// proofs must also be structurally valid.
     pub fn verify_composition(&self) -> bool {
+        // [V7-05 FIX] Structural validation of all contained proofs.
+        // Without this, an attacker could wrap invalid proofs inside a
+        // CompositeProof and the composition hash would still verify,
+        // making the composite appear legitimate.
+        if !Self::is_structurally_valid(&self.outer_proof) {
+            return false;
+        }
+        for inner in &self.inner_proofs {
+            if !Self::is_structurally_valid(inner) {
+                return false;
+            }
+        }
+
         let expected = Self::compute_composition_hash(&self.outer_proof, &self.inner_proofs);
         hash_eq(&expected, &self.composition_hash)
+    }
+
+    /// Check whether a proof is structurally valid (non-empty computation).
+    fn is_structurally_valid(proof: &VerifiedProof) -> bool {
+        match proof {
+            VerifiedProof::HashIvc {
+                step_count,
+                checkpoints,
+                ..
+            } => *step_count > 0 && checkpoints.len() as u64 == *step_count,
+            VerifiedProof::Mock { .. } => true,
+        }
     }
 
     /// Total number of proofs in this composite.

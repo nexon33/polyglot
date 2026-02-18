@@ -135,6 +135,17 @@ pub fn rns_ct_add_plain_simd(
     values: &[f64],
     dim: usize,
 ) -> RnsCiphertext {
+    // R7: Reject NaN/Inf in bias values — these silently corrupt the encoded
+    // plaintext and propagate through all downstream neural network layers.
+    assert!(
+        values.iter().all(|v| v.is_finite()),
+        "rns_ct_add_plain_simd: all bias values must be finite (no NaN/Inf)"
+    );
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_add_plain_simd: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
     let mut replicated = vec![0.0; simd::NUM_SLOTS];
     for i in 0..simd::NUM_SLOTS {
         if i % dim < values.len() {

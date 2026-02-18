@@ -71,11 +71,21 @@ impl<T> Verified<T> {
 
     /// Check whether this value carries a valid proof structure.
     /// For full cryptographic verification, use `verify_with_backend`.
+    ///
+    /// Mock proofs are only accepted when the `mock` feature is enabled
+    /// or in unit tests. In production builds without the `mock` feature,
+    /// `is_verified()` returns `false` for Mock proofs to prevent an
+    /// attacker from constructing a Verified<T> that claims to be verified
+    /// while carrying a trivially forgeable Mock proof.
     pub fn is_verified(&self) -> bool {
         // Structural check: proof is well-formed
         match &self.proof {
             VerifiedProof::HashIvc { step_count, .. } => *step_count > 0,
-            VerifiedProof::Mock { .. } => true,
+            VerifiedProof::Mock { .. } => {
+                // In test or mock-feature builds, accept Mock proofs.
+                // In production, reject them.
+                cfg!(any(test, feature = "mock"))
+            }
         }
     }
 

@@ -154,6 +154,13 @@ impl InferenceBackend for RealInferenceBackend {
 ///
 /// The compliance proof is stored after each request and can be retrieved
 /// via `last_compliance_proof()`.
+///
+/// **R7 SAFETY NOTE:** The `last_proof` pattern stores only the most recent
+/// compliance proof. Under concurrent access, a caller may retrieve another
+/// request's proof (TOCTOU race). The HTTP server's `serve()` loop processes
+/// requests sequentially, but callers using `handle_one()` from multiple
+/// threads must be aware of this limitation. In production, the compliance
+/// proof should be keyed by a unique request identifier.
 pub struct ComplianceInferenceBackend {
     policy: ContentPolicy,
     last_proof: std::sync::Mutex<Option<ComplianceProof>>,
@@ -172,8 +179,13 @@ impl ComplianceInferenceBackend {
     }
 
     /// Retrieve the compliance proof from the most recent `infer()` call.
+    ///
+    /// R7: Recovers from poisoned mutex instead of panicking.
     pub fn last_compliance_proof(&self) -> Option<ComplianceProof> {
-        self.last_proof.lock().unwrap().clone()
+        self.last_proof.lock().unwrap_or_else(|e| {
+            eprintln!("WARN: recovering from poisoned last_proof mutex");
+            e.into_inner()
+        }).clone()
     }
 }
 
@@ -197,7 +209,11 @@ impl InferenceBackend for ComplianceInferenceBackend {
         let proof = create_proof(&input_tokens, &output_tokens, privacy)?;
 
         // 4. Store compliance proof for caller to retrieve
-        *self.last_proof.lock().unwrap() = Some(compliance_proof);
+        // R7: Recover from poisoned mutex instead of panicking
+        *self.last_proof.lock().unwrap_or_else(|e| {
+            eprintln!("WARN: recovering from poisoned last_proof mutex");
+            e.into_inner()
+        }) = Some(compliance_proof);
 
         // 5. Re-encrypt output
         let output_ct = MockCiphertext {

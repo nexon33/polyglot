@@ -27,6 +27,13 @@
 //! - R6: Hello deserialization does NOT allow_trailing_bytes (enforces strict size limit)
 //! - R6: NodeInfo.addresses and NodeInfo.models length capped post-deserialization
 //! - R6: throughput_estimate validated (NaN/Inf rejected)
+//! - R7: model_name string length capped at 256 bytes (prevents memory amplification)
+//! - R7: signature Vec length capped at 64 bytes (early rejection of oversized sigs)
+//! - R7: Negative throughput_estimate rejected (prevents peer-selection inversion)
+//! - R7: encrypted_input size capped at 1 MB (prevents oversized ciphertext payloads)
+//! - R7: Phase 2/3 message types require handshake authentication
+//! - R7: Client-side HelloAck deserialization uses size-limited bincode (prevents OOM)
+//! - R7: Client-side HelloAck timestamp freshness check (prevents replay)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +78,22 @@ const MAX_NODEINFO_ADDRESSES: usize = 16;
 
 /// Maximum number of models in a NodeInfo (prevents gossip amplification).
 const MAX_NODEINFO_MODELS: usize = 16;
+
+/// Maximum allowed length for a model_name string in NodeInfo (bytes).
+/// Prevents memory amplification via long model names within the 16-model cap.
+/// 16 models x 256 bytes = 4 KB max model name storage.
+const MAX_MODEL_NAME_LEN: usize = 256;
+
+/// Maximum allowed length for the signature field in NodeInfo (bytes).
+/// Ed25519 signatures are exactly 64 bytes; anything else is invalid.
+/// Without this cap, the Vec<u8> signature could be up to 64KB within
+/// the bincode size limit, wasting memory before the == 64 check rejects it.
+const MAX_SIGNATURE_LEN: usize = 64;
+
+/// Maximum allowed size for InferRequest.encrypted_input (1 MB).
+/// Prevents a single request from passing an oversized encrypted payload
+/// that wastes memory in the inference backend's spawn_blocking task.
+const MAX_ENCRYPTED_INPUT_SIZE: usize = 1 * 1024 * 1024;
 
 /// Client-side timeout for reading inference response.
 /// Prevents a malicious/slow server from tying up the client indefinitely.
@@ -379,6 +402,8 @@ async fn handle_stream(
                 }
                 // R6: Reject NaN/Inf in throughput_estimate — prevents poisoning
                 // Phase 2 gossip peer-selection comparisons.
+                // R7: Also reject negative throughput_estimate — negative values
+                // are nonsensical and could invert peer-selection sorting.
                 for m in &hello.node_info.models {
                     if !m.throughput_estimate.is_finite() {
                         warn!(
@@ -388,6 +413,40 @@ async fn handle_stream(
                         accepted = false;
                         break;
                     }
+                    if m.throughput_estimate < 0.0 {
+                        warn!(
+                            "Rejecting Hello: negative throughput_estimate ({})",
+                            m.throughput_estimate
+                        );
+                        accepted = false;
+                        break;
+                    }
+                }
+                // R7: Reject model names that are too long — each model_name is
+                // an unbounded String. Without this cap, 16 models x 64KB names
+                // = 1 MB of string data that passes all other checks.
+                for m in &hello.node_info.models {
+                    if m.model_name.len() > MAX_MODEL_NAME_LEN {
+                        warn!(
+                            "Rejecting Hello: model_name too long ({} bytes, max {})",
+                            m.model_name.len(),
+                            MAX_MODEL_NAME_LEN
+                        );
+                        accepted = false;
+                        break;
+                    }
+                }
+                // R7: Reject oversized signature field — Ed25519 signatures are
+                // exactly 64 bytes. The signature field is Vec<u8> which bincode
+                // will happily deserialize up to the 64KB limit. Reject early
+                // before the expensive signature verification.
+                if hello.node_info.signature.len() > MAX_SIGNATURE_LEN {
+                    warn!(
+                        "Rejecting Hello: signature too long ({} bytes, max {})",
+                        hello.node_info.signature.len(),
+                        MAX_SIGNATURE_LEN
+                    );
+                    accepted = false;
                 }
             }
 
@@ -484,6 +543,19 @@ async fn handle_stream(
                 return Ok(());
             }
 
+            // R7: Cap encrypted_input size to prevent a single request from
+            // passing an oversized ciphertext blob into the inference backend.
+            // The 4MB bincode limit on InferRequest allows up to ~4MB of
+            // encrypted_input, but real PFHE ciphertexts should be much smaller.
+            if request.encrypted_input.len() > MAX_ENCRYPTED_INPUT_SIZE {
+                warn!(
+                    "Rejected InferRequest: encrypted_input too large ({} bytes, max {})",
+                    request.encrypted_input.len(),
+                    MAX_ENCRYPTED_INPUT_SIZE
+                );
+                return Ok(());
+            }
+
             // Acquire inference permit (limits concurrent compute tasks)
             let _permit = infer_semaphore
                 .acquire()
@@ -498,7 +570,7 @@ async fn handle_stream(
             Frame::new(MessageType::InferResponse, result)
         }
 
-        // Reject response-only and unimplemented message types
+        // Reject response-only message types (server->client only)
         MessageType::HelloAck
         | MessageType::Pong
         | MessageType::InferResponse
@@ -507,6 +579,29 @@ async fn handle_stream(
                 "Rejected wrong-direction message: {:?} from client",
                 frame.msg_type
             );
+            return Ok(());
+        }
+
+        // R7: Explicitly reject Phase 2/3 message types that are not yet
+        // implemented. These require handshake authentication, so reject
+        // pre-auth to avoid burning stream count on unauthenticated probes.
+        MessageType::GetPeers
+        | MessageType::Announce
+        | MessageType::PubkeyRequest
+        | MessageType::Peers
+        | MessageType::RelayOpen
+        | MessageType::RelayAccept
+        | MessageType::RelayDeny
+        | MessageType::RelayData
+        | MessageType::RelayClose => {
+            if !handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
+                warn!(
+                    "Rejected unauthenticated Phase 2/3 message: {:?}",
+                    frame.msg_type
+                );
+                return Ok(());
+            }
+            warn!("Phase 2/3 message {:?} not yet implemented", frame.msg_type);
             return Ok(());
         }
 
@@ -576,7 +671,13 @@ pub async fn connect_and_infer(
         if ack_frame.msg_type != MessageType::HelloAck {
             anyhow::bail!("expected HelloAck, got {:?}", ack_frame.msg_type);
         }
-        let ack: handshake::HelloAck = bincode::deserialize(&ack_frame.payload)?;
+        // R7: Use size-limited deserialization for HelloAck (matches server-side
+        // hardening). Raw bincode::deserialize could OOM on a crafted payload
+        // from a malicious server.
+        let ack: handshake::HelloAck = bincode::DefaultOptions::new()
+            .with_limit(MAX_HELLO_SIZE)
+            .with_fixint_encoding()
+            .deserialize(&ack_frame.payload)?;
         if !ack.accepted {
             anyhow::bail!("handshake rejected by server");
         }
@@ -598,6 +699,28 @@ pub async fn connect_and_infer(
             }
         } else {
             anyhow::bail!("server HelloAck has invalid public key");
+        }
+        // R7: Validate server HelloAck timestamp freshness. Without this,
+        // a replayed HelloAck from a compromised server would pass signature
+        // verification indefinitely.
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let ts = ack.node_info.timestamp;
+            if ts > now + MAX_HELLO_TIMESTAMP_DRIFT_SECS {
+                anyhow::bail!(
+                    "server HelloAck timestamp too far in the future (ts={}, now={})",
+                    ts, now
+                );
+            }
+            if now > ts && (now - ts) > MAX_HELLO_TIMESTAMP_DRIFT_SECS {
+                anyhow::bail!(
+                    "server HelloAck timestamp too stale (drift={}s, max={}s)",
+                    now - ts, MAX_HELLO_TIMESTAMP_DRIFT_SECS
+                );
+            }
         }
     }
 

@@ -207,13 +207,21 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
     // and verify each revealed token against its Merkle proof.
     let mut all_leaves: Vec<Hash> = Vec::with_capacity(disclosure.total_tokens);
     let mut proof_idx = 0;
-    for token in &disclosure.tokens {
+    for (position, token) in disclosure.tokens.iter().enumerate() {
         match token {
             DisclosedToken::Revealed { token_id, .. } => {
                 if proof_idx >= disclosure.proofs.len() {
                     return false;
                 }
                 let proof = &disclosure.proofs[proof_idx];
+
+                // [V7-03 FIX] Check leaf_index matches the actual token position.
+                // Without this, an attacker could present a valid Merkle proof for
+                // position X while claiming it corresponds to position Y, allowing
+                // token position spoofing within a disclosure.
+                if proof.leaf_index != position as u64 {
+                    return false;
+                }
 
                 // Check leaf matches the token (constant-time)
                 let expected_leaf = token_leaf(*token_id);

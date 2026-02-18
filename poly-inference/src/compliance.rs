@@ -213,6 +213,38 @@ pub fn init_runtime_policy(tokenize_fn: impl Fn(&str) -> Vec<u32>) {
     let _ = RUNTIME_POLICY.set(policy);
 }
 
+// ─── Output text safety filter ───────────────────────────────────────────────
+
+/// R7: Post-generation text-level harmful content check.
+///
+/// The token-level n-gram compliance check can be evaded by interleaving
+/// whitespace or punctuation tokens between harmful terms (e.g., "pipe . bomb"
+/// passes a 2-gram check for ["pipe", "bomb"] because the "." token breaks
+/// the contiguous match). This function catches such evasion by checking the
+/// decoded text of generated output against the same HARMFUL_TERMS list.
+///
+/// Returns Ok(()) if no harmful terms found, Err(term) if a match is detected.
+pub fn check_output_text(text: &str) -> Result<(), String> {
+    let normalized = normalize_prompt(text);
+    let lower = normalized.to_lowercase();
+
+    for &term in HARMFUL_TERMS {
+        // Check if the term appears in the generated text (case-insensitive)
+        if lower.contains(&term.to_lowercase()) {
+            return Err(term.to_string());
+        }
+    }
+
+    // Also check harmful patterns from the prompt filter
+    for &pattern in HARMFUL_PATTERNS {
+        if lower.contains(pattern) {
+            return Err(pattern.to_string());
+        }
+    }
+
+    Ok(())
+}
+
 // ─── Input prompt safety filter ─────────────────────────────────────────────
 
 /// Why a prompt was rejected before inference.
@@ -347,6 +379,12 @@ fn normalize_prompt(input: &str) -> String {
             continue;
         }
 
+        // R7: Replace Mathematical Alphanumeric Symbols (U+1D400-U+1D7FF)
+        if let Some(replacement) = math_alpha_to_ascii(ch) {
+            result.push(replacement);
+            continue;
+        }
+
         result.push(ch);
     }
 
@@ -368,7 +406,12 @@ fn normalize_prompt(input: &str) -> String {
     collapsed
 }
 
-/// Returns true for zero-width and invisible Unicode characters.
+/// Returns true for zero-width, invisible, and combining Unicode characters
+/// that should be stripped during normalization to prevent bypass attacks.
+///
+/// R7: Extended to include combining diacritical marks (U+0300-U+036F),
+/// variation selectors supplement (U+E0100-U+E01EF), and tag characters
+/// (U+E0001-U+E007F) used in sophisticated Unicode evasion.
 fn is_invisible_char(ch: char) -> bool {
     matches!(ch,
         '\u{200B}' | // zero-width space
@@ -384,11 +427,22 @@ fn is_invisible_char(ch: char) -> bool {
         '\u{2063}' | // invisible separator
         '\u{2064}' | // invisible plus
         '\u{FEFF}' | // zero-width no-break space (BOM)
-        '\u{FE00}'..='\u{FE0F}' // variation selectors
+        '\u{FE00}'..='\u{FE0F}' | // variation selectors
+        '\u{0300}'..='\u{036F}' | // R7: combining diacritical marks (e.g., j\u0308ailbreak)
+        '\u{1AB0}'..='\u{1AFF}' | // R7: combining diacritical marks extended
+        '\u{1DC0}'..='\u{1DFF}' | // R7: combining diacritical marks supplement
+        '\u{20D0}'..='\u{20FF}' | // R7: combining diacritical marks for symbols
+        '\u{FE20}'..='\u{FE2F}' | // R7: combining half marks
+        '\u{E0001}'..='\u{E007F}' | // R7: tag characters (invisible metadata)
+        '\u{E0100}'..='\u{E01EF}'   // R7: variation selectors supplement
     )
 }
 
 /// Map common confusable characters (Cyrillic, Greek, etc.) to ASCII equivalents.
+///
+/// R7: Extended to cover Mathematical Alphanumeric Symbols (U+1D400-U+1D7FF),
+/// Enclosed Alphanumerics, Subscript/Superscript digits, and additional
+/// confusable ranges that were missed in R6.
 fn confusable_to_ascii(ch: char) -> Option<char> {
     match ch {
         // Cyrillic confusables
@@ -423,8 +477,101 @@ fn confusable_to_ascii(ch: char) -> Option<char> {
         '\u{201C}' | '\u{201D}' => Some('"'),  // smart double quotes
         '\u{2014}' | '\u{2013}' => Some('-'),   // em/en dash
         '\u{2026}' => Some('.'),                 // ellipsis (treat as period)
+        // R7: Subscript and superscript digits
+        '\u{2070}' => Some('0'), // superscript 0
+        '\u{00B9}' => Some('1'), // superscript 1
+        '\u{00B2}' => Some('2'), // superscript 2
+        '\u{00B3}' => Some('3'), // superscript 3
+        '\u{2074}' => Some('4'), // superscript 4
+        '\u{2075}' => Some('5'), // superscript 5
+        '\u{2076}' => Some('6'), // superscript 6
+        '\u{2077}' => Some('7'), // superscript 7
+        '\u{2078}' => Some('8'), // superscript 8
+        '\u{2079}' => Some('9'), // superscript 9
+        '\u{2080}'..='\u{2089}' => {
+            // subscript digits 0-9
+            Some((ch as u32 - 0x2080 + b'0' as u32) as u8 as char)
+        }
+        // R7: Latin-like characters from other scripts
+        '\u{0131}' => Some('i'), // Turkish dotless i
+        '\u{0406}' | '\u{0456}' => Some('i'), // Ukrainian І і
+        '\u{0408}' | '\u{0458}' => Some('j'), // Cyrillic Ј ј
+        '\u{0405}' | '\u{0455}' => Some('s'), // Cyrillic Ѕ ѕ
+        '\u{0460}' | '\u{0461}' => Some('w'), // Cyrillic Ѡ ѡ (omega-like)
+        // R7: Roman numerals (common in evasion)
+        '\u{2160}' => Some('i'),  // Ⅰ
+        '\u{2164}' => Some('v'),  // Ⅴ
+        '\u{2169}' => Some('x'),  // Ⅹ
+        '\u{216C}' => Some('l'),  // Ⅼ
+        '\u{216D}' => Some('c'),  // Ⅽ
+        '\u{216E}' => Some('d'),  // Ⅾ
+        '\u{216F}' => Some('m'),  // Ⅿ
+        '\u{2170}' => Some('i'),  // ⅰ
+        '\u{2174}' => Some('v'),  // ⅴ
+        '\u{2179}' => Some('x'),  // ⅹ
+        '\u{217C}' => Some('l'),  // ⅼ
+        '\u{217D}' => Some('c'),  // ⅽ
+        '\u{217E}' => Some('d'),  // ⅾ
+        '\u{217F}' => Some('m'),  // ⅿ
         _ => None,
     }
+}
+
+/// R7: Normalize Mathematical Alphanumeric Symbols (U+1D400-U+1D7FF) to ASCII.
+///
+/// These are styled variants of Latin letters used in mathematical notation:
+/// Bold, Italic, Bold Italic, Script, etc. Each range maps to A-Z or a-z.
+/// Attackers can use these to write "𝗷𝗮𝗶𝗹𝗯𝗿𝗲𝗮𝗸" which looks like "jailbreak"
+/// but bypasses ASCII-only pattern matching.
+fn math_alpha_to_ascii(ch: char) -> Option<char> {
+    let cp = ch as u32;
+
+    // Mathematical Bold (A-Z: 1D400-1D419, a-z: 1D41A-1D433)
+    if (0x1D400..=0x1D419).contains(&cp) {
+        return Some((cp - 0x1D400 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D41A..=0x1D433).contains(&cp) {
+        return Some((cp - 0x1D41A + b'a' as u32) as u8 as char);
+    }
+    // Mathematical Italic (A-Z: 1D434-1D44D, a-z: 1D44E-1D467)
+    // Note: 1D455 is reserved, ℎ (U+210E) is used for italic h
+    if (0x1D434..=0x1D44D).contains(&cp) {
+        return Some((cp - 0x1D434 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D44E..=0x1D467).contains(&cp) {
+        if cp == 0x1D455 { return Some('h'); } // reserved slot
+        return Some((cp - 0x1D44E + b'a' as u32) as u8 as char);
+    }
+    // Mathematical Bold Italic (A-Z: 1D468-1D481, a-z: 1D482-1D49B)
+    if (0x1D468..=0x1D481).contains(&cp) {
+        return Some((cp - 0x1D468 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D482..=0x1D49B).contains(&cp) {
+        return Some((cp - 0x1D482 + b'a' as u32) as u8 as char);
+    }
+    // Mathematical Sans-Serif (A-Z: 1D5A0-1D5B9, a-z: 1D5BA-1D5D3)
+    if (0x1D5A0..=0x1D5B9).contains(&cp) {
+        return Some((cp - 0x1D5A0 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D5BA..=0x1D5D3).contains(&cp) {
+        return Some((cp - 0x1D5BA + b'a' as u32) as u8 as char);
+    }
+    // Mathematical Sans-Serif Bold (A-Z: 1D5D4-1D5ED, a-z: 1D5EE-1D607)
+    if (0x1D5D4..=0x1D5ED).contains(&cp) {
+        return Some((cp - 0x1D5D4 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D5EE..=0x1D607).contains(&cp) {
+        return Some((cp - 0x1D5EE + b'a' as u32) as u8 as char);
+    }
+    // Mathematical Monospace (A-Z: 1D670-1D689, a-z: 1D68A-1D6A3)
+    if (0x1D670..=0x1D689).contains(&cp) {
+        return Some((cp - 0x1D670 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D68A..=0x1D6A3).contains(&cp) {
+        return Some((cp - 0x1D68A + b'a' as u32) as u8 as char);
+    }
+
+    None
 }
 
 #[cfg(test)]

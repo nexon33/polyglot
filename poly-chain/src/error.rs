@@ -84,6 +84,12 @@ pub enum ChainError {
     #[error("unauthorized STP action: {0}")]
     UnauthorizedSTPAction(String),
 
+    #[error("duplicate fraud evidence: {0}")]
+    DuplicateFraudEvidence(String),
+
+    #[error("duplicate STP contract: official already has a registered contract")]
+    DuplicateSTPContract,
+
     #[error("proof system error: {0}")]
     ProofSystem(#[from] poly_verified::error::ProofSystemError),
 }

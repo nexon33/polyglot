@@ -52,7 +52,10 @@ fn add_mock(a: u64, b: u64) -> u64 {
 fn test_verified_mock_backend() {
     let result = add_mock(10, 20);
     assert_eq!(*result.value(), 30);
-    assert!(result.is_verified());
+    // R7-V7-08: Mock proofs are rejected by is_verified() in production builds.
+    // poly-verified is compiled as a regular dependency here (not in test mode),
+    // so cfg!(test) inside poly-verified is false.
+    assert!(!result.is_verified());
 
     match result.proof() {
         VerifiedProof::Mock { privacy_mode, .. } => {

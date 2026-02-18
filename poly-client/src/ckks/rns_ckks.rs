@@ -66,9 +66,13 @@ impl RnsCiphertext {
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(mac_key)
             .expect("HMAC accepts any key length");
-        mac.update(b"rns_ckks_auth_v1");
+        mac.update(b"rns_ckks_auth_v2");
         mac.update(&self.scale.to_le_bytes());
         mac.update(&(self.level as u64).to_le_bytes());
+        // R7: Include num_primes in the auth tag — without this, an attacker
+        // can mod-switch a ciphertext (dropping primes) without invalidating
+        // the authentication tag, since only scale/level/coefficients were hashed.
+        mac.update(&(self.c0.num_primes as u64).to_le_bytes());
         for ch in &self.c0.residues {
             for &coeff in ch {
                 mac.update(&coeff.to_le_bytes());
@@ -649,6 +653,18 @@ fn rns_decrypt_simd_unchecked(
 
 /// Add two ciphertexts.
 pub fn rns_ct_add(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
+    // R7: Reject NaN/Inf scales — the assert_eq check passes for NaN==NaN (false)
+    // which means NaN scales silently bypass the mismatch check and propagate.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_add: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_add: b.scale must be finite and positive, got {}",
+        b.scale
+    );
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
     RnsCiphertext {
@@ -662,6 +678,17 @@ pub fn rns_ct_add(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
 
 /// Subtract two ciphertexts.
 pub fn rns_ct_sub(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
+    // R7: Reject NaN/Inf scales — same bypass vector as rns_ct_add.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_sub: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_sub: b.scale must be finite and positive, got {}",
+        b.scale
+    );
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
     RnsCiphertext {
@@ -918,13 +945,26 @@ pub fn rns_rescale(ct: &RnsCiphertext) -> RnsCiphertext {
         ct.c0.num_primes > 1,
         "cannot rescale: only 1 prime remaining"
     );
+    // R7: Reject NaN/Inf/negative scales — division by q_last would propagate
+    // the corruption, and the result scale could become 0.0 or subnormal.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_rescale: scale must be finite and positive, got {}",
+        ct.scale
+    );
 
     let q_last = NTT_PRIMES[ct.c0.num_primes - 1];
+    let new_scale = ct.scale / q_last as f64;
+    assert!(
+        new_scale.is_finite() && new_scale > 0.0,
+        "rns_rescale: resulting scale must be finite and positive, got {} (from {}/{})",
+        new_scale, ct.scale, q_last
+    );
 
     RnsCiphertext {
         c0: ct.c0.drop_last_prime(),
         c1: ct.c1.drop_last_prime(),
-        scale: ct.scale / q_last as f64,
+        scale: new_scale,
         level: ct.level + 1,
         auth_tag: None,
     }
@@ -1087,6 +1127,12 @@ pub fn rns_ct_mul_plain_simd(
     values: &[f64],
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
+    // R7: Reject NaN/Inf in plaintext values — these silently corrupt
+    // the encoded polynomial and propagate through all downstream ops.
+    assert!(
+        values.iter().all(|v| v.is_finite()),
+        "rns_ct_mul_plain_simd: all values must be finite (no NaN/Inf)"
+    );
     let coeffs = simd::encode_simd(values, ctx.delta);
     let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
 

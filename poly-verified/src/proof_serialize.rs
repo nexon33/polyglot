@@ -37,7 +37,8 @@ impl VerifiedResponse {
         let privacy = proof.privacy_mode();
         let proof_scheme = proof.backend_id();
         let code_hash = proof.code_hash();
-        let proof_bytes = serde_json::to_vec(proof).unwrap_or_default();
+        let proof_bytes = serde_json::to_vec(proof)
+            .expect("VerifiedProof serialization must not fail");
 
         // Apply privacy: zero out hidden fields
         let (effective_value_hash, effective_input_hash, effective_value_bytes) = match privacy {
@@ -107,6 +108,17 @@ impl VerifiedResponse {
         let proof_scheme = BackendId::from_u8(data[96])?;
         let privacy_mode = PrivacyMode::from_u8(data[97])?;
         let proof_len = u32::from_be_bytes(data[98..102].try_into().unwrap()) as usize;
+
+        // Sanity cap: proof_bytes cannot exceed 16 MiB. A valid serialized
+        // VerifiedProof is at most a few KiB; allowing 16 MiB provides ample
+        // headroom while preventing a crafted message from allocating 4 GiB.
+        const MAX_PROOF_LEN: usize = 16 * 1024 * 1024;
+        if proof_len > MAX_PROOF_LEN {
+            return Err(ProofSystemError::InvalidEncoding(format!(
+                "verified response: proof_len {} exceeds maximum {}",
+                proof_len, MAX_PROOF_LEN
+            )));
+        }
 
         let proof_end = 102 + proof_len;
         if data.len() < proof_end + 32 {
