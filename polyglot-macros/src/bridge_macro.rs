@@ -19,7 +19,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse2, Attribute, FnArg, Ident, ItemTrait, Meta, ReturnType, TraitItem, TraitItemFn, Type,
+    parse2, FnArg, ItemTrait, ReturnType, TraitItem, TraitItemFn,
 };
 
 /// Supported foreign language runtimes
@@ -86,7 +86,7 @@ pub fn expand(args: TokenStream, input: TokenStream) -> TokenStream {
 
     let trait_name = &trait_def.ident;
     let wrapper_name = format_ident!("{}{}", runtime.prefix(), trait_name);
-    let runtime_type = runtime.runtime_type();
+    let _runtime_type = runtime.runtime_type();
 
     // Generate method implementations
     let method_impls = generate_method_impls(&trait_def, runtime);
@@ -138,7 +138,7 @@ fn generate_method_impls(trait_def: &ItemTrait, runtime: Runtime) -> TokenStream
 }
 
 /// Generate implementation for a single method
-fn generate_single_method(method: &TraitItemFn, runtime: Runtime) -> TokenStream {
+fn generate_single_method(method: &TraitItemFn, _runtime: Runtime) -> TokenStream {
     let method_name = &method.sig.ident;
     let method_name_str = method_name.to_string();
     let inputs = &method.sig.inputs;

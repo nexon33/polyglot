@@ -25,6 +25,7 @@ impl<T> Verified<T> {
     ///
     /// This is `pub(crate)` — only the IVC proof system can create
     /// `Verified<T>` values. User code cannot call this.
+    #[allow(dead_code)]
     pub(crate) fn new_proven(value: T, proof: VerifiedProof) -> Self {
         Self { value, proof }
     }

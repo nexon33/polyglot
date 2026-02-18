@@ -73,7 +73,7 @@ impl ModelKind {
 // Model catalog
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
     Qwen3,
     Llama,
@@ -167,13 +167,19 @@ pub static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
 pub static DEVICE: OnceLock<Device> = OnceLock::new();
 pub static WEIGHTS_PATH: OnceLock<PathBuf> = OnceLock::new();
 pub static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
-/// Cached embed_tokens/lm_head weight tensor [vocab_size, hidden_dim] in F32.
-/// Only populated for Qwen3 full-precision models (tied embeddings).
+/// Cached lm_head weight tensor [vocab_size, hidden_dim] in F32.
+/// For Qwen3 (tied embeddings): this equals embed_tokens.weight.
+/// For LLaMA: this is lm_head.weight (or dequantized output.weight for GGUF).
 pub static EMBED_TENSOR: OnceLock<Tensor> = OnceLock::new();
 /// Which model is currently loaded.
 pub static MODEL_NAME: OnceLock<String> = OnceLock::new();
 /// EOS token IDs for the currently loaded model. Set during model loading.
 pub static EOS_TOKENS: OnceLock<Vec<u32>> = OnceLock::new();
+/// Which architecture is currently loaded.
+pub static LOADED_ARCHITECTURE: OnceLock<Architecture> = OnceLock::new();
+/// Cached Gram matrix G = W^T @ W [hidden_dim, hidden_dim] in F64.
+/// Lazily computed on first use for conjugate gradient hidden state recovery.
+pub static GRAM_MATRIX: OnceLock<Tensor> = OnceLock::new();
 
 const DEFAULT_MODEL: &str = "0.6b";
 
@@ -252,6 +258,7 @@ pub fn load_model_by_name(name: &str, device: Device) -> Result<()> {
     TOKENIZER.set(tokenizer).map_err(|_| anyhow!("tokenizer already loaded"))?;
     MODEL_NAME.set(spec.display_name.to_string()).ok();
     EOS_TOKENS.set(spec.eos_tokens.to_vec()).ok();
+    LOADED_ARCHITECTURE.set(spec.architecture).ok();
 
     Ok(())
 }
@@ -336,6 +343,23 @@ fn load_llama_full(spec: &ModelSpec, api: &Api, device: &Device) -> Result<Model
     let model = llama::Llama::load(vb, &config)?;
     let cache = llama::Cache::new(true, dtype, &config, device)?;
 
+    // Extract lm_head weight for FHE pipeline (PCA projection + lm_head_top_k)
+    // Try lm_head.weight first (untied), fall back to model.embed_tokens.weight (tied)
+    for path in &weights_paths {
+        let raw_tensors = candle_core::safetensors::load(path, device)?;
+        if let Some(lm_head) = raw_tensors.get("lm_head.weight") {
+            let lm_head_f32 = lm_head.to_dtype(DType::F32)?;
+            eprintln!("      Extracted lm_head.weight [{:?}] for FHE pipeline", lm_head_f32.dims());
+            EMBED_TENSOR.set(lm_head_f32).ok();
+            break;
+        } else if let Some(embed) = raw_tensors.get("model.embed_tokens.weight") {
+            let embed_f32 = embed.to_dtype(DType::F32)?;
+            eprintln!("      Extracted embed_tokens.weight [{:?}] for FHE pipeline (tied)", embed_f32.dims());
+            EMBED_TENSOR.set(embed_f32).ok();
+            break;
+        }
+    }
+
     Ok(ModelKind::LlamaFull {
         model,
         cache,
@@ -356,6 +380,35 @@ fn load_llama_quantized(spec: &ModelSpec, api: &Api, device: &Device) -> Result<
     let mut file = std::fs::File::open(&gguf_path)?;
     let content = gguf_file::Content::read(&mut file)
         .map_err(|e| anyhow!("GGUF read: {e}"))?;
+
+    // Dequantize lm_head weight for FHE pipeline before consuming `content`
+    let lm_head_key = "output.weight";
+    let embed_key = "token_embd.weight";
+    let tensor_key = if content.tensor_infos.contains_key(lm_head_key) {
+        lm_head_key
+    } else if content.tensor_infos.contains_key(embed_key) {
+        embed_key
+    } else {
+        ""
+    };
+    if !tensor_key.is_empty() {
+        match content.tensor(&mut file, tensor_key, device) {
+            Ok(qtensor) => match qtensor.dequantize(device) {
+                Ok(t) => {
+                    let t_f32 = t.to_dtype(DType::F32).unwrap_or(t);
+                    eprintln!("      Dequantized {} [{:?}] for FHE pipeline", tensor_key, t_f32.dims());
+                    EMBED_TENSOR.set(t_f32).ok();
+                }
+                Err(e) => eprintln!("      Warning: dequantize {} failed: {e}", tensor_key),
+            },
+            Err(e) => eprintln!("      Warning: GGUF tensor {} read failed: {e}", tensor_key),
+        }
+    }
+
+    // Re-read GGUF for model construction (file position was consumed)
+    let mut file = std::fs::File::open(&gguf_path)?;
+    let content = gguf_file::Content::read(&mut file)
+        .map_err(|e| anyhow!("GGUF re-read: {e}"))?;
     let model = quantized_llama::ModelWeights::from_gguf(content, &mut file, device)?;
 
     Ok(ModelKind::LlamaQuantized {
@@ -508,7 +561,201 @@ pub fn compute_pca_projection(d: usize) -> Result<Vec<Vec<f64>>> {
     Ok(eigenvectors)
 }
 
-/// Get the 1024-dim contextualized hidden state for the last position by running
+/// Return the hidden dimension of the loaded model (from EMBED_TENSOR shape).
+pub fn get_hidden_dim() -> Result<usize> {
+    let embed = EMBED_TENSOR
+        .get()
+        .ok_or_else(|| anyhow!("embedding tensor not loaded"))?;
+    Ok(embed.dim(1)?)
+}
+
+/// Compute the top-d principal directions of the lm_head weight matrix,
+/// returning both eigenvectors AND eigenvalues.
+///
+/// Returns (eigenvectors: d×hidden_dim, eigenvalues: d) where eigenvalues[i] is the
+/// eigenvalue of W^T W corresponding to eigenvectors[i].
+/// Needed by the pseudoinverse method for LLaMA FHE pipeline.
+pub fn compute_pca_projection_with_eigenvalues(d: usize) -> Result<(Vec<Vec<f64>>, Vec<f64>)> {
+    let embed = EMBED_TENSOR
+        .get()
+        .ok_or_else(|| anyhow!("embedding tensor not loaded"))?;
+    let device = DEVICE.get().ok_or_else(|| anyhow!("device not set"))?;
+
+    let g = embed.t()?.matmul(embed)?;
+    let hidden_dim = g.dim(0)?;
+
+    let mut g_deflated = g.to_dtype(DType::F64)?;
+    let mut eigenvectors: Vec<Vec<f64>> = Vec::with_capacity(d);
+    let mut eigenvalues: Vec<f64> = Vec::with_capacity(d);
+
+    for _k in 0..d {
+        let mut v: Vec<f64> = (0..hidden_dim).map(|i| ((i * 7 + _k * 13) % 97) as f64 / 97.0 - 0.5).collect();
+        let mut eigenvalue = 0.0f64;
+
+        for _ in 0..200 {
+            let v_tensor = Tensor::new(&v[..], device)?;
+            let w_tensor = g_deflated.matmul(&v_tensor.unsqueeze(1)?)?.squeeze(1)?;
+            let w: Vec<f64> = w_tensor.to_vec1()?;
+
+            let norm: f64 = w.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm < 1e-12 { break; }
+
+            eigenvalue = norm;
+            v = w.iter().map(|x| x / norm).collect();
+        }
+
+        let v_tensor = Tensor::new(&v[..], device)?;
+        let vvt = v_tensor.unsqueeze(1)?.matmul(&v_tensor.unsqueeze(0)?)?;
+        let scaled = (vvt * eigenvalue)?;
+        g_deflated = g_deflated.broadcast_sub(&scaled)?;
+
+        eigenvectors.push(v);
+        eigenvalues.push(eigenvalue);
+    }
+
+    Ok((eigenvectors, eigenvalues))
+}
+
+/// Run the main MODEL forward pass and return last-position logits as f64.
+///
+/// Works for any architecture (Qwen3, LLaMA, quantized or full).
+/// Uses the KV cache for incremental decoding.
+pub fn forward_model_logits(token_ids: &[u32], offset: usize) -> Result<Vec<f64>> {
+    let model_guard = MODEL.get().ok_or_else(|| anyhow!("model not loaded"))?;
+    let mut model = model_guard.lock().unwrap();
+    let device = DEVICE.get().ok_or_else(|| anyhow!("device not set"))?;
+
+    let input = Tensor::new(token_ids, device)?.unsqueeze(0)?;
+    let raw = model.forward(&input, offset)?;
+
+    // Handle both shapes: [batch, seq, vocab] and [batch, vocab] (quantized_llama)
+    let last = if raw.dims().len() == 3 {
+        let seq_len = raw.dim(1)?;
+        raw.narrow(1, seq_len - 1, 1)?.squeeze(1)?.squeeze(0)?
+    } else {
+        raw.squeeze(0)?
+    };
+    let last = last.to_dtype(DType::F32)?;
+    let values: Vec<f32> = last.to_vec1()?;
+    Ok(values.iter().map(|&x| x as f64).collect())
+}
+
+/// Recover the PCA-projected hidden state from logits using the pseudoinverse method.
+///
+/// Given logits = W @ h, where W is [vocab × hidden] (lm_head weight):
+///   h_pca[i] = (1/λ_i) * (W @ v_i)^T @ logits
+///
+/// This allows FHE pipeline on LLaMA models where we can only get logits,
+/// not raw hidden states.
+///
+/// Arguments:
+/// - `logits`: [vocab_size] logits from model forward pass
+/// - `pca_dirs`: d eigenvectors of W^T W (each is [hidden_dim])
+/// - `eigenvalues`: d eigenvalues corresponding to each eigenvector
+pub fn logits_to_pca_hidden(
+    logits: &[f64],
+    pca_dirs: &[Vec<f64>],
+    eigenvalues: &[f64],
+) -> Result<Vec<f64>> {
+    let embed = EMBED_TENSOR
+        .get()
+        .ok_or_else(|| anyhow!("embedding tensor not loaded"))?;
+    let device = DEVICE.get().ok_or_else(|| anyhow!("device not set"))?;
+
+    let d = pca_dirs.len();
+    let mut projected = vec![0.0f64; d];
+
+    // Compute W @ v_i for each PCA direction, then dot with logits
+    for i in 0..d {
+        if eigenvalues[i].abs() < 1e-12 { continue; }
+
+        // W @ v_i: [vocab × hidden] @ [hidden] → [vocab]
+        let v_tensor = Tensor::new(&pca_dirs[i][..], device)?.to_dtype(DType::F32)?;
+        let wv = embed.matmul(&v_tensor.unsqueeze(1)?)?.squeeze(1)?;
+        let wv_f64: Vec<f32> = wv.to_vec1()?;
+
+        // dot(W @ v_i, logits) / λ_i
+        let dot: f64 = wv_f64.iter().zip(logits.iter()).map(|(&a, &b)| a as f64 * b).sum();
+        projected[i] = dot / eigenvalues[i];
+    }
+
+    Ok(projected)
+}
+
+/// Recover the full hidden state from logits using conjugate gradient.
+///
+/// Solves (W^T W) @ h = W^T @ logits where W is the lm_head weight [vocab, hidden].
+/// This gives the exact hidden state h (assuming lm_head is full rank), enabling
+/// the h-aligned+PCA projection approach on any model architecture.
+///
+/// The Gram matrix G = W^T @ W is cached after first computation.
+pub fn recover_hidden_from_logits(logits: &[f64]) -> Result<Vec<f64>> {
+    let embed = EMBED_TENSOR
+        .get()
+        .ok_or_else(|| anyhow!("EMBED_TENSOR not loaded"))?;
+    let device = DEVICE.get().ok_or_else(|| anyhow!("device not set"))?;
+
+    // Lazily compute and cache G = W^T @ W [hidden, hidden] in F64
+    if GRAM_MATRIX.get().is_none() {
+        let gt = embed.t()?.matmul(embed)?.to_dtype(DType::F64)?;
+        GRAM_MATRIX.set(gt).ok();
+    }
+    let g = GRAM_MATRIX.get().ok_or_else(|| anyhow!("gram matrix init failed"))?;
+
+    let hidden_dim = g.dim(0)?;
+
+    // b = W^T @ logits [hidden]
+    let logits_f32: Vec<f32> = logits.iter().map(|&x| x as f32).collect();
+    let logits_tensor = Tensor::new(&logits_f32[..], device)?;
+    let b_tensor = embed
+        .t()?
+        .matmul(&logits_tensor.unsqueeze(1)?)?
+        .squeeze(1)?
+        .to_dtype(DType::F64)?;
+    let b: Vec<f64> = b_tensor.to_vec1()?;
+
+    // Conjugate gradient: solve G @ h = b
+    let mut x = vec![0.0f64; hidden_dim];
+    let mut r = b.clone();
+    let mut p = r.clone();
+    let mut rsold: f64 = r.iter().map(|v| v * v).sum();
+
+    let tol = 1e-8;
+    let max_iter = 500;
+
+    for _ in 0..max_iter {
+        // ap = G @ p
+        let p_tensor = Tensor::new(&p[..], device)?;
+        let ap_tensor = g.matmul(&p_tensor.unsqueeze(1)?)?.squeeze(1)?;
+        let ap: Vec<f64> = ap_tensor.to_vec1()?;
+
+        let pap: f64 = p.iter().zip(ap.iter()).map(|(a, b)| a * b).sum();
+        if pap.abs() < 1e-30 {
+            break;
+        }
+        let alpha = rsold / pap;
+
+        for j in 0..hidden_dim {
+            x[j] += alpha * p[j];
+            r[j] -= alpha * ap[j];
+        }
+
+        let rsnew: f64 = r.iter().map(|v| v * v).sum();
+        if rsnew.sqrt() < tol {
+            break;
+        }
+
+        let beta = rsnew / rsold;
+        for j in 0..hidden_dim {
+            p[j] = r[j] + beta * p[j];
+        }
+        rsold = rsnew;
+    }
+
+    Ok(x)
+}
+
+/// Get the contextualized hidden state for the last position by running
 /// a full forward pass of the Qwen3 base model (28 transformer layers).
 ///
 /// Unlike `get_token_embedding` which returns a static, context-free embedding,

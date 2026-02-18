@@ -1,11 +1,12 @@
-//! Qwen3-0.6B Inference Benchmark — Plaintext vs Encrypted (RNS-CKKS)
+//! LLM Inference Benchmark — Plaintext vs Encrypted (RNS-CKKS)
 //!
-//! Benchmarks both:
-//!   Part A: Plaintext Qwen3-0.6B inference (tokens/sec, prefill vs decode)
-//!   Part B: Encrypted multi-token generation (RNS-CKKS homomorphic encryption)
-//!     Per token: Qwen3 forward → project → FHE blind compute → lm_head → next token
+//! Supports multiple architectures (Qwen3, LLaMA/Nanbeige) with automatic
+//! pipeline selection:
+//!   - Qwen3 full-precision: Direct hidden state access via BASE_MODEL
+//!   - All others (quantized, LLaMA): Pseudoinverse recovery from logits
 //!
-//! Usage: cargo run --release -p poly-inference --bin poly-demo-rns-fhe-e2e [prompt] [max_tokens]
+//! Usage: cargo run --release -p poly-inference --bin poly-demo-rns-fhe-e2e \
+//!        [--model <name>] [prompt] [max_tokens]
 
 use std::time::Instant;
 
@@ -13,6 +14,7 @@ use poly_client::ckks::rns_ckks::*;
 use poly_client::ckks::rns_fhe_layer::*;
 use poly_inference::compliance::{default_policy, PolicyChecker, TokenVerdict};
 use poly_inference::compliance_proof::ComplianceAccumulator;
+use poly_inference::model::{BASE_MODEL, EOS_TOKENS, LOADED_ARCHITECTURE};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -29,13 +31,30 @@ fn thin_sep() {
 // ═══════════════════════════════════════════════════════════════════════
 
 fn main() {
+    // ── Argument parsing ────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
-    let prompt = args.get(1).map(|s| s.as_str()).unwrap_or("The capital of France is");
-    let max_tokens: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50);
+    let mut model_name = String::from("0.6b");
+    let mut prompt: Option<String> = None;
+    let mut max_tokens: u32 = 50;
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--model" && i + 1 < args.len() {
+            model_name = args[i + 1].clone();
+            i += 2;
+        } else if prompt.is_none() {
+            prompt = Some(args[i].clone());
+            i += 1;
+        } else {
+            max_tokens = args[i].parse().unwrap_or(50);
+            i += 1;
+        }
+    }
+    let prompt = prompt.unwrap_or_else(|| "The capital of France is".to_string());
 
     eprintln!();
     separator();
-    eprintln!("  Poly Network — Qwen3-0.6B Inference Benchmark");
+    eprintln!("  Poly Network — LLM Inference Benchmark");
     eprintln!("  Plaintext LLM vs Encrypted (RNS-CKKS) Pipeline");
     separator();
     eprintln!();
@@ -43,25 +62,37 @@ fn main() {
     let total_start = Instant::now();
 
     // ══════════════════════════════════════════════════════════════════
-    // PART A: Plaintext Qwen3-0.6B Inference
+    // PART A: Plaintext Inference
     // ══════════════════════════════════════════════════════════════════
 
-    eprintln!("  PART A: Plaintext Qwen3-0.6B Inference");
+    eprintln!("  PART A: Plaintext Inference");
     thin_sep();
     eprintln!();
 
     // [A1] Load model
-    eprint!("  [A1] Loading Qwen3-0.6B...");
+    eprint!("  [A1] Loading {}...", model_name);
     let t = Instant::now();
     let device = candle_core::Device::cuda_if_available(0).unwrap_or(candle_core::Device::Cpu);
     eprintln!(" ({})", if device.is_cuda() { "CUDA" } else { "CPU" });
-    poly_inference::model::load_model(device)
+    poly_inference::model::load_model_by_name(&model_name, device)
         .expect("failed to load model");
     let model_load_ms = t.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(" done ({:.1}s)", model_load_ms / 1000.0);
+    let display_name = poly_inference::model::current_model_name().to_string();
+    eprintln!("       {} loaded ({:.1}s)", display_name, model_load_ms / 1000.0);
+
+    let eos_tokens = EOS_TOKENS.get()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[151643, 151645]);
+    let arch = LOADED_ARCHITECTURE.get().copied();
+    let use_direct_hidden = BASE_MODEL.get().is_some();
+
+    eprintln!("       Architecture: {:?}, FHE mode: {}",
+        arch.unwrap_or(poly_inference::model::Architecture::Qwen3),
+        if use_direct_hidden { "direct hidden state" } else { "pseudoinverse from logits" });
+    eprintln!();
 
     // [A2] Tokenize
-    let token_ids = poly_inference::model::tokenize(prompt).expect("tokenization failed");
+    let token_ids = poly_inference::model::tokenize(&prompt).expect("tokenization failed");
     eprintln!("  [A2] Prompt:  \"{}\"", prompt);
     eprintln!("       Tokens:  {:?} ({} tokens)", token_ids, token_ids.len());
     eprintln!();
@@ -97,17 +128,28 @@ fn main() {
         model.clear_kv_cache();
         let device = DEVICE.get().expect("device not set");
 
+        // Helper: extract last-position 1D logits regardless of output shape
+        // quantized_llama returns [batch, vocab], others return [batch, seq, vocab]
+        let extract_logits = |raw: Tensor| -> Tensor {
+            if raw.dims().len() == 3 {
+                let seq_len = raw.dim(1).unwrap();
+                raw.narrow(1, seq_len - 1, 1).unwrap()
+                    .squeeze(1).unwrap().squeeze(0).unwrap()
+                    .to_dtype(DType::F32).unwrap()
+            } else {
+                raw.squeeze(0).unwrap()
+                    .to_dtype(DType::F32).unwrap()
+            }
+        };
+
         // Prefill
         let t = Instant::now();
         let input_tensor = Tensor::new(token_ids.as_slice(), device)
             .unwrap().unsqueeze(0).unwrap();
-        let logits = model.forward(&input_tensor, 0).unwrap();
+        let raw = model.forward(&input_tensor, 0).unwrap();
         prefill_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        let seq_len = logits.dim(1).unwrap();
-        let logits = logits.narrow(1, seq_len - 1, 1).unwrap()
-            .squeeze(1).unwrap().squeeze(0).unwrap()
-            .to_dtype(DType::F32).unwrap();
+        let logits = extract_logits(raw);
         let mut lp = LogitsProcessor::new(42, Some(0.7), None);
         let mut next_token = lp.sample(&logits).unwrap();
 
@@ -118,12 +160,11 @@ fn main() {
             let pos = token_ids.len() + i as usize;
             let inp = Tensor::new(&[next_token], device)
                 .unwrap().unsqueeze(0).unwrap();
-            let logits = model.forward(&inp, pos).unwrap();
-            let logits = logits.squeeze(0).unwrap().squeeze(0).unwrap()
-                .to_dtype(DType::F32).unwrap();
+            let raw = model.forward(&inp, pos).unwrap();
+            let logits = extract_logits(raw);
             next_token = lp.sample(&logits).unwrap();
             count += 1;
-            if next_token == 151643 || next_token == 151645 { break; }
+            if eos_tokens.contains(&next_token) { break; }
         }
         decode_ms = t.elapsed().as_secs_f64() * 1000.0;
         decode_tokens = count;
@@ -145,14 +186,24 @@ fn main() {
     eprintln!();
 
     let mut rng = StdRng::seed_from_u64(42);
-    let d = 16;
+    let d: usize = std::env::var("PCA_DIM").ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let num_primes = 3;
-    let hidden_dim = 1024;
+    let hidden_dim = poly_inference::model::get_hidden_dim()
+        .expect("EMBED_TENSOR not loaded — cannot run FHE pipeline");
 
+    if use_direct_hidden {
+        eprintln!("  Mode: Direct hidden state (forward_base -> h -> project -> FHE)");
+    } else {
+        eprintln!("  Mode: CG recovery (forward -> logits -> CG solve -> h -> project -> FHE)");
+    }
     eprintln!("  Per-token pipeline:");
-    eprintln!("    Qwen3 forward (28 layers) → h-aligned projection (1024→{}d)", d);
-    eprintln!("    → RNS-CKKS encrypt → blind FHE compute → decrypt");
-    eprintln!("    → project back ({}d→1024d) → lm_head → next token", d);
+    eprintln!("    forward -> {}h-aligned projection ({}->{}d)",
+        if use_direct_hidden { "" } else { "CG recover -> " },
+        hidden_dim, d);
+    eprintln!("    -> RNS-CKKS encrypt -> blind FHE compute -> decrypt");
+    eprintln!("    -> project back ({}d->{}d) -> lm_head -> next token", d, hidden_dim);
     eprintln!();
 
     // Identity network: preserves projected hidden state through FHE
@@ -165,13 +216,14 @@ fn main() {
         activations: vec![Activation::None],
     };
 
-    // [B0] PCA eigenvectors (one-time, reusable across all tokens)
+    // [B0] PCA eigenvectors + eigenvalues (one-time, reusable across all tokens)
     eprint!("  [B0] Computing PCA projection basis...");
     let t = Instant::now();
     let pca_dirs = poly_inference::model::compute_pca_projection(d + 4)
         .expect("PCA failed");
     let pca_ms = t.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(" done ({:.1}s, top-{} eigenvectors of W^T W)", pca_ms / 1000.0, d + 4);
+    eprintln!(" done ({:.1}s, top-{} eigenvectors of W^T W, hidden_dim={})",
+        pca_ms / 1000.0, d + 4, hidden_dim);
 
     // [B1] RNS-CKKS keygen (one-time)
     eprint!("  [B1] RNS-CKKS keygen...");
@@ -191,11 +243,28 @@ fn main() {
         policy.version, policy.blocked_token_ids.len(), policy.blocked_ngrams.len());
     eprintln!();
 
-    // [B2] Initial Qwen3 forward pass (prompt → KV cache + first hidden state)
-    eprint!("  [B2] Qwen3 forward on prompt ({} tokens)...", token_ids.len());
+    // [B2] Clear KV cache from Part A, then run initial forward pass
+    if !use_direct_hidden {
+        let model_guard = poly_inference::model::MODEL.get().expect("model not loaded");
+        let mut model = model_guard.lock().unwrap();
+        model.clear_kv_cache();
+    }
+
+    // h: full hidden state (from forward_base for Qwen3, or CG-recovered for others)
+    let mut h: Vec<f64>;
+
+    eprint!("  [B2] Forward on prompt ({} tokens)...", token_ids.len());
     let t = Instant::now();
-    let mut h = poly_inference::model::forward_base(&token_ids, 0)
-        .expect("forward_base failed");
+    if use_direct_hidden {
+        h = poly_inference::model::forward_base(&token_ids, 0)
+            .expect("forward_base failed");
+    } else {
+        let logits = poly_inference::model::forward_model_logits(&token_ids, 0)
+            .expect("forward_model_logits failed");
+        eprint!(" CG solve...");
+        h = poly_inference::model::recover_hidden_from_logits(&logits)
+            .expect("CG recovery failed");
+    }
     let prefill_fhe_ms = t.elapsed().as_secs_f64() * 1000.0;
     eprintln!(" done ({:.0}ms)", prefill_fhe_ms);
     eprintln!();
@@ -218,8 +287,11 @@ fn main() {
     let gen_start = Instant::now();
 
     for step in 0..max_tokens as usize {
-        // (a) Build h-aligned + PCA projection for this hidden state
+        // (a) Build projection basis and project to d dimensions
         let t_proj = Instant::now();
+
+        // h-aligned + PCA basis (Gram-Schmidt) — same approach for all architectures
+        // since we always have a full hidden state h (direct or CG-recovered)
         let h_norm: f64 = h.iter().map(|x| x * x).sum::<f64>().sqrt();
         let e1: Vec<f64> = h.iter().map(|x| x / h_norm).collect();
 
@@ -241,10 +313,11 @@ fn main() {
             }
         }
 
-        // Project 1024 → d
+        // Project hidden_dim -> d
         let input_d: Vec<f64> = proj.iter()
             .map(|row| row.iter().zip(h.iter()).map(|(w, e)| w * e).sum::<f64>())
             .collect();
+
         total_proj_ms += t_proj.elapsed().as_secs_f64() * 1000.0;
 
         // Plaintext reference (for error tracking)
@@ -273,7 +346,7 @@ fn main() {
             max_fhe_err = max_fhe_err.max((expected[i] - decrypted[i]).abs());
         }
 
-        // (e) Project back d → 1024 and apply lm_head
+        // (e) Project back d -> hidden_dim and apply lm_head
         let t_lm = Instant::now();
         let h_back: Vec<f64> = (0..hidden_dim)
             .map(|j| (0..d).map(|i| proj[i][j] * decrypted[i]).sum::<f64>())
@@ -304,14 +377,23 @@ fn main() {
         enc_generated.push(next_id);
         eprint!("{}", next_text);
 
-        // EOS check
-        if next_id == 151643 || next_id == 151645 { break; }
+        // EOS check (dynamic, model-specific)
+        if eos_tokens.contains(&next_id) { break; }
 
         // (f) Forward pass for next hidden state
         if step < (max_tokens as usize) - 1 {
             let t_fwd = Instant::now();
-            h = poly_inference::model::forward_base(&[next_id], token_ids.len() + step)
-                .expect("forward_base failed");
+            if use_direct_hidden {
+                h = poly_inference::model::forward_base(
+                    &[next_id], token_ids.len() + step,
+                ).expect("forward_base failed");
+            } else {
+                let logits = poly_inference::model::forward_model_logits(
+                    &[next_id], token_ids.len() + step,
+                ).expect("forward_model_logits failed");
+                h = poly_inference::model::recover_hidden_from_logits(&logits)
+                    .expect("CG recovery failed");
+            }
             total_fwd_ms += t_fwd.elapsed().as_secs_f64() * 1000.0;
         }
     }
@@ -382,7 +464,7 @@ fn main() {
     separator();
     eprintln!();
 
-    eprintln!("  PART A — Plaintext Qwen3-0.6B:");
+    eprintln!("  PART A — Plaintext {}:", display_name);
     eprintln!("    Model load:        {:>10.1}ms", model_load_ms);
     eprintln!("    Prefill:           {:>10.1}ms  ({} prompt tokens)", prefill_ms, token_ids.len());
     eprintln!("    Decode:            {:>10.1}ms  ({} tokens, {:.1} tok/s)",
@@ -392,7 +474,8 @@ fn main() {
 
     let per_token_ms = if n_enc > 0 { gen_total_ms / n_enc as f64 } else { 0.0 };
 
-    eprintln!("  PART B — Encrypted RNS-CKKS ({} tokens):", n_enc);
+    eprintln!("  PART B — Encrypted RNS-CKKS ({} tokens, {}):", n_enc,
+        if use_direct_hidden { "direct" } else { "CG recovery" });
     eprintln!("    PCA setup:         {:>10.1}ms  (one-time)", pca_ms);
     eprintln!("    Keygen:            {:>10.1}ms  (one-time)", keygen_ms);
     eprintln!("    Forward passes:    {:>10.1}ms  ({:.0}ms/tok)",
@@ -425,6 +508,9 @@ fn main() {
     eprintln!("  RESULT");
     separator();
     eprintln!();
+    eprintln!("    Model:       {}", display_name);
+    eprintln!("    FHE mode:    {}", if use_direct_hidden { "direct hidden state" } else { "pseudoinverse" });
+    eprintln!("    Hidden dim:  {}", hidden_dim);
     eprintln!("    Plaintext:   {} tokens at {:.1} tok/s", new_tokens, tok_per_sec);
     eprintln!("    Encrypted:   {} tokens at {:.3} tok/s ({:.1}s/tok)",
         n_enc, n_enc as f64 / (gen_total_ms / 1000.0), per_token_ms / 1000.0);

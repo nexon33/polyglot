@@ -5,6 +5,7 @@ members = [".", "gridmesh", "poly-lsp", "poly-verified", "poly-chain", "polyglot
 name = "polyglot"
 version = "0.1.0"
 edition = "2021"
+autoexamples = false
 
 [lib]
 path = "src/lib.rs"

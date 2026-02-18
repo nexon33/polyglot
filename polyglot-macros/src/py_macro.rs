@@ -15,7 +15,7 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 use std::collections::HashSet;
-use syn::{parse2, Expr, Ident};
+// syn used for future typed macro expansion
 
 /// Extract identifiers that look like variable references in Python code
 fn extract_likely_variables(code: &str) -> HashSet<String> {
@@ -27,7 +27,7 @@ fn extract_likely_variables(code: &str) -> HashSet<String> {
     let mut in_string = false;
     let mut string_char = ' ';
 
-    for (i, c) in code.chars().enumerate() {
+    for (_i, c) in code.chars().enumerate() {
         // Track string state
         if !in_string && (c == '"' || c == '\'') {
             in_string = true;
@@ -212,6 +212,7 @@ pub fn expand(input: TokenStream) -> TokenStream {
 
 /// Expand py! macro with explicit type annotation
 /// Usage: py!(Type){ expr }
+#[allow(dead_code)]
 pub fn expand_typed(type_hint: TokenStream, code: TokenStream) -> TokenStream {
     let code_str = code.to_string();
     let code_str = code_str.trim();
