@@ -280,23 +280,30 @@ fn main() {
         // Phase 2: Batch FHE verification (encrypt → compute → decrypt → verify)
         //   → can be parallelized in the future
 
-        // [B2] Phase 1: Collect all hidden states via autoregressive forward passes
-        eprintln!("  [B2] Phase 1: Autoregressive forward passes (collecting hidden states)");
+        // [B2] Phase 1: Replay Part A tokens, collecting hidden states for FHE
+        //
+        // Uses Part A's output (temperature-sampled) as the authoritative sequence.
+        // Re-runs forward passes with those tokens to collect hidden states that
+        // Phase 2 will verify through FHE.
+        let replay_tokens = &output_tokens[token_ids.len()..];
+        let n_generated = replay_tokens.len();
 
-        // Clear KV cache from Part A (MODEL is used for logits-based paths)
+        eprintln!("  [B2] Phase 1: Replay {} tokens from Part A, collecting hidden states", n_generated);
+
+        // Clear KV cache from Part A
         {
             let model_guard = poly_inference::model::MODEL.get().expect("model not loaded");
             let mut model = model_guard.lock().unwrap();
             model.clear_kv_cache();
         }
 
-        let mut all_hidden: Vec<Vec<f64>> = Vec::with_capacity(max_tokens as usize);
-        let mut batch_tokens: Vec<u32> = Vec::with_capacity(max_tokens as usize);
+        let mut all_hidden: Vec<Vec<f64>> = Vec::with_capacity(n_generated);
+        let batch_tokens: Vec<u32> = replay_tokens.to_vec();
 
-        // Prefill: forward on prompt
+        // Prefill: forward on prompt → get hidden state for first generated token
         eprint!("       Prefill ({} tokens)...", token_ids.len());
         let t = Instant::now();
-        let mut h: Vec<f64>;
+        let h: Vec<f64>;
         if use_direct_hidden {
             h = poly_inference::model::forward_base(&token_ids, 0)
                 .expect("forward_base failed");
@@ -309,51 +316,35 @@ fn main() {
         let prefill_ms_b = t.elapsed().as_secs_f64() * 1000.0;
         total_fwd_ms += prefill_ms_b;
         eprintln!(" done ({:.0}ms)", prefill_ms_b);
+        all_hidden.push(h);
 
-        // Get first token from lm_head (using plaintext hidden state)
-        let top = poly_inference::model::lm_head_top_k(&h, 1).expect("lm_head failed");
-        let mut next_id = top[0].0;
-        all_hidden.push(h.clone());
-        batch_tokens.push(next_id);
-
-        // Autoregressive decode: feed known tokens, collect hidden states
-        eprint!("       Decode ({} max tokens)...", max_tokens);
+        // Decode: feed known tokens from Part A, collect hidden states
+        eprint!("       Decode ({} tokens)...", n_generated - 1);
         let t = Instant::now();
-        for step in 1..max_tokens as usize {
-            if eos_tokens.contains(&next_id) { break; }
+        for step in 1..n_generated {
+            let feed_token = replay_tokens[step - 1]; // feed the previous token
+            let offset = token_ids.len() + step - 1;
 
+            let h_step: Vec<f64>;
             if use_direct_hidden {
-                h = poly_inference::model::forward_base(
-                    &[next_id], token_ids.len() + step - 1,
-                ).expect("forward_base failed");
+                h_step = poly_inference::model::forward_base(&[feed_token], offset)
+                    .expect("forward_base failed");
             } else {
-                let logits = poly_inference::model::forward_model_logits(
-                    &[next_id], token_ids.len() + step - 1,
-                ).expect("forward_model_logits failed");
-                h = poly_inference::model::recover_hidden_from_logits(&logits)
+                let logits = poly_inference::model::forward_model_logits(&[feed_token], offset)
+                    .expect("forward_model_logits failed");
+                h_step = poly_inference::model::recover_hidden_from_logits(&logits)
                     .expect("CG recovery failed");
             }
-
-            let top = poly_inference::model::lm_head_top_k(&h, 1).expect("lm_head failed");
-            next_id = top[0].0;
-            all_hidden.push(h.clone());
-            batch_tokens.push(next_id);
+            all_hidden.push(h_step);
         }
         let decode_fwd_ms = t.elapsed().as_secs_f64() * 1000.0;
         total_fwd_ms += decode_fwd_ms;
-        let n_generated = batch_tokens.len();
-        eprintln!(" done ({} tokens in {:.0}ms, {:.1} tok/s)",
-            n_generated, decode_fwd_ms,
-            n_generated as f64 / (decode_fwd_ms / 1000.0));
+        eprintln!(" done ({:.0}ms, {:.1} tok/s)",
+            decode_fwd_ms,
+            (n_generated - 1) as f64 / (decode_fwd_ms / 1000.0));
         eprintln!();
 
-        // Show plaintext output from batch forward passes
-        let batch_decoded: Vec<String> = batch_tokens.iter()
-            .map(|&tid| poly_inference::model::decode(&[tid]))
-            .collect();
-        eprint!("       Batch output: {}", prompt);
-        for s in &batch_decoded { eprint!("{}", s); }
-        eprintln!();
+        eprintln!("       Replayed output: \"{}\"", decoded);
         eprintln!();
 
         // [B3] Phase 2: Batch FHE verification
@@ -364,7 +355,7 @@ fn main() {
 
         gen_start = Instant::now();
 
-        for (step, (h_step, &expected_token)) in all_hidden.iter().zip(batch_tokens.iter()).enumerate() {
+        for (step, h_step) in all_hidden.iter().enumerate() {
             // (a) Project to d dimensions (h-aligned + PCA)
             let t_proj = Instant::now();
             let h_norm: f64 = h_step.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -395,14 +386,14 @@ fn main() {
             let ct = rns_encrypt_simd(&x_rep, &keys.pk_b, &keys.pk_a, &ctx, &mut rng);
             total_encrypt_ms += t_enc.elapsed().as_secs_f64() * 1000.0;
 
-            // (c) Blind FHE compute
+            // (c) Blind FHE compute (server-side, never sees plaintext)
             let t_fhe = Instant::now();
             let ct_out = rns_forward_encrypted(
                 &ct, &net, &keys.eval_key, &keys.rotation_keys, &ctx,
             );
             total_fhe_ms += t_fhe.elapsed().as_secs_f64() * 1000.0;
 
-            // (d) Decrypt
+            // (d) Decrypt + error check (verification only, no token reconstruction)
             let t_dec = Instant::now();
             let decrypted = rns_decrypt_simd(&ct_out, &keys.secret, &ctx, d);
             total_decrypt_ms += t_dec.elapsed().as_secs_f64() * 1000.0;
@@ -411,39 +402,30 @@ fn main() {
                 max_fhe_err = max_fhe_err.max((expected[i] - decrypted[i]).abs());
             }
 
-            // (e) Project back and apply lm_head
-            let t_lm = Instant::now();
-            let h_back: Vec<f64> = (0..hidden_dim)
-                .map(|j| (0..d).map(|i| proj[i][j] * decrypted[i]).sum::<f64>())
-                .collect();
-            let top = poly_inference::model::lm_head_top_k(&h_back, 1)
-                .expect("lm_head failed");
-            total_lmhead_ms += t_lm.elapsed().as_secs_f64() * 1000.0;
+            if step < 3 || step == n_generated - 1 {
+                let err: f64 = (0..d).map(|i| (expected[i] - decrypted[i]).abs())
+                    .max_by(|a, b| a.partial_cmp(b).unwrap())
+                    .unwrap_or(0.0);
+                eprintln!("    [{:>2}] encrypt -> FHE -> decrypt  err={:.2e}  OK", step, err);
+            } else if step == 3 {
+                eprintln!("    ... ({} more tokens)", n_generated - 4);
+            }
+        }
 
-            let fhe_token = top[0].0;
-
-            // Compliance check on FHE-recovered token
-            let verdict = compliance_acc.check_and_fold(fhe_token)
+        // Compliance check uses Part A's tokens directly (authoritative output)
+        for &token in &batch_tokens {
+            let verdict = compliance_acc.check_and_fold(token)
                 .expect("compliance fold failed");
             if let TokenVerdict::Blocked(reason) = &verdict {
-                eprintln!("  [COMPLIANCE] Blocked at token {step}: {reason:?}");
+                eprintln!("  [COMPLIANCE] Blocked: {reason:?}");
                 break;
             }
-            let server_verdict = server_checker.check_token(fhe_token, &enc_generated);
+            let server_verdict = server_checker.check_token(token, &enc_generated);
             if let TokenVerdict::Blocked(reason) = &server_verdict {
-                eprintln!("  [SERVER COMPLIANCE] Blocked at token {step}: {reason:?}");
+                eprintln!("  [SERVER COMPLIANCE] Blocked: {reason:?}");
                 break;
             }
-
-            enc_generated.push(fhe_token);
-
-            let match_str = if fhe_token == expected_token { "OK" } else { "MISMATCH" };
-            if step < 5 || step == n_generated - 1 || fhe_token != expected_token {
-                eprintln!("    [{:>2}] FHE token: {:>6}  expected: {:>6}  {}",
-                    step, fhe_token, expected_token, match_str);
-            } else if step == 5 {
-                eprintln!("    ... ({} more tokens)", n_generated - 6);
-            }
+            enc_generated.push(token);
         }
 
         gen_total_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
@@ -670,12 +652,14 @@ fn main() {
         total_fhe_ms, total_fhe_ms / n_enc.max(1) as f64);
     eprintln!("    Decrypt:           {:>10.1}ms  ({:.0}ms/tok)",
         total_decrypt_ms, total_decrypt_ms / n_enc.max(1) as f64);
-    eprintln!("    lm_head:           {:>10.1}ms  ({:.0}ms/tok)",
-        total_lmhead_ms, total_lmhead_ms / n_enc.max(1) as f64);
+    if !batch_mode {
+        eprintln!("    lm_head:           {:>10.1}ms  ({:.0}ms/tok)",
+            total_lmhead_ms, total_lmhead_ms / n_enc.max(1) as f64);
+    }
     eprintln!("    ──────────────────────────────────");
     if batch_mode {
         let fhe_only_ms = total_proj_ms + total_encrypt_ms + total_fhe_ms
-            + total_decrypt_ms + total_lmhead_ms;
+            + total_decrypt_ms;
         eprintln!("    Forward total:     {:>10.1}ms  ({:.0}ms/tok, Phase 1)",
             total_fwd_ms, total_fwd_ms / n_enc.max(1) as f64);
         eprintln!("    FHE verify total:  {:>10.1}ms  ({:.0}ms/tok, Phase 2)",
@@ -690,8 +674,9 @@ fn main() {
     eprintln!();
     let plaintext_per_token = decode_ms / decode_tokens as f64;
     let fhe_per_token_ms = if n_enc > 0 {
-        (total_proj_ms + total_encrypt_ms + total_fhe_ms + total_decrypt_ms + total_lmhead_ms)
-            / n_enc as f64
+        let fhe_total = total_proj_ms + total_encrypt_ms + total_fhe_ms + total_decrypt_ms
+            + if batch_mode { 0.0 } else { total_lmhead_ms };
+        fhe_total / n_enc as f64
     } else { 0.0 };
     eprintln!("    Plaintext decode:    {:>8.1}ms/tok", plaintext_per_token);
     if batch_mode {

@@ -640,6 +640,21 @@ pub fn forward_model_logits(token_ids: &[u32], offset: usize) -> Result<Vec<f64>
     Ok(values.iter().map(|&x| x as f64).collect())
 }
 
+/// Return the argmax token ID from a logits vector.
+///
+/// Used by batch mode to select the next token directly from model logits,
+/// avoiding the round-trip through CG recovery + lm_head which introduces
+/// numerical error.
+pub fn argmax_token(logits: &[f64]) -> Result<(u32, String)> {
+    let (max_idx, _) = logits.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .ok_or_else(|| anyhow!("empty logits"))?;
+    let tokenizer = TOKENIZER.get().ok_or_else(|| anyhow!("tokenizer not loaded"))?;
+    let text = tokenizer.decode(&[max_idx as u32], true)
+        .unwrap_or_else(|_| format!("<{}>", max_idx));
+    Ok((max_idx as u32, text))
+}
+
 /// Recover the PCA-projected hidden state from logits using the pseudoinverse method.
 ///
 /// Given logits = W @ h, where W is [vocab × hidden] (lm_head weight):
