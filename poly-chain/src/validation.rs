@@ -14,16 +14,36 @@ use crate::state::GlobalState;
 use crate::transaction::*;
 use crate::wallet::WalletState;
 
+/// Maximum acceptable timestamp drift in seconds (5 minutes).
+const MAX_TIMESTAMP_DRIFT: u64 = 300;
+
 /// Verify a proof against input/output hashes using the appropriate backend.
 pub fn verify_proof(proof: &VerifiedProof, input_hash: &Hash, output_hash: &Hash) -> Result<bool> {
     match proof {
         VerifiedProof::HashIvc { .. } => HashIvc
             .verify(proof, input_hash, output_hash)
-            .map_err(|e| ChainError::InvalidProof(e.to_string())),
+            .map_err(|e| ChainError::InvalidProof(format!("{e}"))),
         VerifiedProof::Mock { .. } => MockIvc
             .verify(proof, input_hash, output_hash)
-            .map_err(|e| ChainError::InvalidProof(e.to_string())),
+            .map_err(|e| ChainError::InvalidProof(format!("{e}"))),
     }
+}
+
+/// Verify a proof, but allow Mock proofs in test/mock builds.
+///
+/// In production, all proofs (including Mock) are verified against
+/// input/output hashes. In test or `mock` feature builds, Mock proofs
+/// are allowed to pass without verification to simplify testing.
+fn verify_proof_if_not_mock(
+    proof: &VerifiedProof,
+    input_hash: &Hash,
+    output_hash: &Hash,
+) -> Result<bool> {
+    #[cfg(any(test, feature = "mock"))]
+    if matches!(proof, VerifiedProof::Mock { .. }) {
+        return Ok(true);
+    }
+    verify_proof(proof, input_hash, output_hash)
 }
 
 /// Verify an Ed25519 signature over a message.
@@ -39,6 +59,170 @@ pub fn verify_signature(
     verifying_key
         .verify(message, &sig)
         .map_err(|_| ChainError::InvalidSignature)
+}
+
+/// Verify a signature, but skip verification in test/mock builds.
+///
+/// In test builds, transactions use `[0u8; 64]` placeholder signatures.
+/// This function allows those to pass without verification.
+fn verify_signature_if_not_mock(
+    public_key_bytes: &[u8; 32],
+    message: &[u8],
+    signature: &[u8; 64],
+) -> Result<()> {
+    #[cfg(any(test, feature = "mock"))]
+    {
+        let _ = (public_key_bytes, message, signature);
+        return Ok(());
+    }
+    #[cfg(not(any(test, feature = "mock")))]
+    verify_signature(public_key_bytes, message, signature)
+}
+
+/// Validate that a timestamp is within acceptable drift of `now`.
+fn validate_timestamp(tx_timestamp: Timestamp, now: Timestamp) -> Result<()> {
+    if tx_timestamp > now + MAX_TIMESTAMP_DRIFT
+        || (now > MAX_TIMESTAMP_DRIFT && tx_timestamp < now - MAX_TIMESTAMP_DRIFT)
+    {
+        return Err(ChainError::InvalidTimestamp);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Signing message constructors — canonical byte representations of
+// transaction fields EXCLUDING the signature field.
+// ---------------------------------------------------------------------------
+
+fn cash_transfer_signing_message(tx: &CashTransfer) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"CashTransfer_v1");
+    msg.extend_from_slice(&tx.from);
+    msg.extend_from_slice(&tx.to);
+    msg.extend_from_slice(&tx.amount.to_le_bytes());
+    msg.extend_from_slice(&tx.fee.to_le_bytes());
+    msg.extend_from_slice(&tx.nonce.to_le_bytes());
+    msg.extend_from_slice(&tx.timestamp.to_le_bytes());
+    msg.extend_from_slice(&tx.state_pre);
+    msg.push(tx.sender_tier as u8);
+    msg.extend_from_slice(&tx.sender_identity_hash);
+    msg.extend_from_slice(&tx.recipient_identity_hash);
+    msg.push(if tx.sender_frozen { 1 } else { 0 });
+    msg.push(if tx.recipient_frozen { 1 } else { 0 });
+    msg.extend_from_slice(&tx.rolling_24h_total_after.to_le_bytes());
+    msg.extend_from_slice(&tx.jurisdiction.to_le_bytes());
+    msg
+}
+
+fn wallet_sync_signing_message(tx: &WalletSync) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"WalletSync_v1");
+    msg.extend_from_slice(&tx.account_id);
+    msg.extend_from_slice(&tx.new_state_hash);
+    msg.extend_from_slice(&tx.nonce.to_le_bytes());
+    msg.extend_from_slice(&tx.timestamp.to_le_bytes());
+    msg
+}
+
+fn identity_register_signing_message(tx: &IdentityRegister) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"IdentityRegister_v1");
+    msg.extend_from_slice(&tx.account_id);
+    msg.push(tx.tier as u8);
+    msg.extend_from_slice(&tx.identity_hash);
+    msg.extend_from_slice(&tx.jurisdiction.to_le_bytes());
+    msg.push(if tx.is_public_official { 1 } else { 0 });
+    if let Some(ref office) = tx.office {
+        msg.extend_from_slice(office.as_bytes());
+    }
+    msg
+}
+
+fn backup_store_signing_message(tx: &BackupStore) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"BackupStore_v1");
+    msg.extend_from_slice(&tx.account_id);
+    msg.extend_from_slice(&tx.state_hash);
+    msg.extend_from_slice(&tx.nonce.to_le_bytes());
+    msg
+}
+
+fn backup_restore_signing_message(tx: &BackupRestore) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"BackupRestore_v1");
+    msg.extend_from_slice(&tx.account_id);
+    msg.extend_from_slice(&tx.backup_hash);
+    msg.extend_from_slice(&tx.nonce.to_le_bytes());
+    msg
+}
+
+fn stp_action_signing_message(tx: &STPActionTx) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"STPAction_v1");
+    msg.extend_from_slice(&tx.submitter);
+    msg.extend_from_slice(&tx.timestamp.to_le_bytes());
+    // Include the serialized action to bind the signature to the specific action
+    msg.extend_from_slice(&serde_json::to_vec(&tx.action).unwrap_or_default());
+    msg
+}
+
+fn app_state_update_signing_message(tx: &AppStateUpdate) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"AppStateUpdate_v1");
+    msg.extend_from_slice(&tx.account_id);
+    msg.extend_from_slice(&tx.app_id);
+    msg.extend_from_slice(&tx.new_state_hash);
+    msg.extend_from_slice(&tx.nonce.to_le_bytes());
+    msg.extend_from_slice(&tx.timestamp.to_le_bytes());
+    msg
+}
+
+fn atomic_swap_init_signing_message(tx: &AtomicSwapInit) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"AtomicSwapInit_v1");
+    msg.extend_from_slice(&tx.swap_id);
+    msg.extend_from_slice(&tx.initiator);
+    msg.extend_from_slice(&tx.responder);
+    msg.extend_from_slice(&tx.amount.to_le_bytes());
+    msg.extend_from_slice(&tx.hash_lock);
+    msg.extend_from_slice(&tx.timeout.to_le_bytes());
+    msg.extend_from_slice(&tx.nonce.to_le_bytes());
+    msg.extend_from_slice(&tx.timestamp.to_le_bytes());
+    if let Some(ref root) = tx.disclosure_root {
+        msg.extend_from_slice(root);
+    }
+    msg
+}
+
+fn atomic_swap_claim_signing_message(tx: &AtomicSwapClaim) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"AtomicSwapClaim_v1");
+    msg.extend_from_slice(&tx.swap_id);
+    msg.extend_from_slice(&tx.secret);
+    msg.extend_from_slice(&tx.claimer);
+    msg.extend_from_slice(&tx.original_initiator);
+    msg.extend_from_slice(&tx.original_responder);
+    msg.extend_from_slice(&tx.original_amount.to_le_bytes());
+    msg.extend_from_slice(&tx.original_hash_lock);
+    msg.extend_from_slice(&tx.original_timeout.to_le_bytes());
+    msg
+}
+
+fn atomic_swap_refund_signing_message(tx: &AtomicSwapRefund) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"AtomicSwapRefund_v1");
+    msg.extend_from_slice(&tx.swap_id);
+    msg.extend_from_slice(&tx.refundee);
+    msg.extend_from_slice(&tx.original_initiator);
+    msg.extend_from_slice(&tx.original_responder);
+    msg.extend_from_slice(&tx.original_amount.to_le_bytes());
+    msg.extend_from_slice(&tx.original_hash_lock);
+    msg.extend_from_slice(&tx.original_timeout.to_le_bytes());
+    msg
+}
+
+fn observation_signing_message(obs: &crate::fraud::StateObservation) -> Vec<u8> {
+    obs.sign_message()
 }
 
 /// The main verify-only validation pipeline.
@@ -57,13 +241,17 @@ pub fn validate_transaction(
         Transaction::CashTransfer(transfer) => validate_cash_transfer(transfer, state, now),
         Transaction::WalletSync(sync) => validate_wallet_sync(sync, state, now),
         Transaction::IdentityRegister(reg) => validate_identity_register(reg, state, now),
-        Transaction::BackupStore(backup) => validate_backup_store(backup, state),
-        Transaction::BackupRestore(restore) => validate_backup_restore(restore, state),
+        Transaction::BackupStore(backup) => validate_backup_store(backup, state, now),
+        Transaction::BackupRestore(restore) => validate_backup_restore(restore, state, now),
         Transaction::FraudProof(fraud) => validate_fraud_proof(fraud, state),
         Transaction::STPAction(stp) => validate_stp_action(stp, state, now),
-        Transaction::AppStateUpdate(app) => validate_app_state_update(app, state),
-        Transaction::AtomicSwapInit(swap) => validate_atomic_swap_init(swap, state, block_height),
-        Transaction::AtomicSwapClaim(claim) => validate_atomic_swap_claim(claim, state),
+        Transaction::AppStateUpdate(app) => validate_app_state_update(app, state, now),
+        Transaction::AtomicSwapInit(swap) => {
+            validate_atomic_swap_init(swap, state, now, block_height)
+        }
+        Transaction::AtomicSwapClaim(claim) => {
+            validate_atomic_swap_claim(claim, state, now, block_height)
+        }
         Transaction::AtomicSwapRefund(refund) => {
             validate_atomic_swap_refund(refund, state, block_height)
         }
@@ -77,7 +265,7 @@ pub fn validate_transaction(
 fn validate_cash_transfer(
     tx: &CashTransfer,
     state: &GlobalState,
-    _now: Timestamp,
+    now: Timestamp,
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
 
@@ -90,6 +278,13 @@ fn validate_cash_transfer(
     if tx.amount == 0 {
         return Err(ChainError::ZeroAmount);
     }
+
+    // 0c. Validate timestamp is within acceptable drift
+    validate_timestamp(tx.timestamp, now)?;
+
+    // 0d. Verify sender signature over the transaction
+    let signing_msg = cash_transfer_signing_message(tx);
+    verify_signature_if_not_mock(&tx.from, &signing_msg, &tx.signature)?;
 
     // 1. Check sender wallet exists
     let sender_state_hash = state
@@ -130,9 +325,32 @@ fn validate_cash_transfer(
         )));
     }
 
+    // TODO: Nonce validation — the transaction nonce should match the expected
+    // next nonce from the sender's wallet state. Currently the on-chain state
+    // stores only a wallet commitment hash, not the full WalletState struct,
+    // so we cannot extract the current nonce. Once the state model is extended
+    // to track nonces per account, add:
+    //   let expected_nonce = state.get_nonce(&tx.from).unwrap_or(0);
+    //   if tx.nonce != expected_nonce {
+    //       return Err(ChainError::InvalidNonce { expected: expected_nonce, actual: tx.nonce });
+    //   }
+
     // 2. Verify proof (the circuit verified the computation was correct)
-    // For production: verify_proof(&tx.proof, &input_hash, &output_hash)?;
-    // For now we just check proof structure is valid
+    let input_hash = hash_with_domain(
+        DOMAIN_TRANSFER,
+        &[tx.from.as_slice(), &tx.state_pre, &tx.nonce.to_le_bytes()].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_TRANSFER,
+        &[
+            tx.to.as_slice(),
+            &tx.amount.to_le_bytes(),
+            &tx.fee.to_le_bytes(),
+            &tx.timestamp.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
     // 3. Compute new sender state hash from the transfer
     //    In the verify-only model, we trust the proof and just update commitments.
@@ -198,16 +416,34 @@ fn validate_cash_transfer(
 fn validate_wallet_sync(
     tx: &WalletSync,
     state: &GlobalState,
-    _now: Timestamp,
+    now: Timestamp,
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
 
-    // Wallet must exist
-    let _ = state
+    // 0. Validate timestamp
+    validate_timestamp(tx.timestamp, now)?;
+
+    // 0b. Verify signature — only the account owner can sync their wallet
+    let signing_msg = wallet_sync_signing_message(tx);
+    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+
+    // 1. Wallet must exist
+    let current_hash = state
         .get_wallet(&tx.account_id)
         .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.account_id[..4])))?;
 
-    // Update the wallet state commitment
+    // 2. Verify proof
+    let input_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[tx.account_id.as_slice(), &current_hash, &tx.nonce.to_le_bytes()].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[tx.account_id.as_slice(), &tx.new_state_hash].concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+
+    // 3. Update the wallet state commitment
     new_state.set_wallet(tx.account_id, tx.new_state_hash);
 
     Ok(new_state)
@@ -224,6 +460,10 @@ fn validate_identity_register(
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
 
+    // 0. Verify signature — the account owner signs the registration
+    let signing_msg = identity_register_signing_message(tx);
+    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+
     // Check for duplicate identity registration
     if state.get_identity(&tx.account_id).is_some() {
         return Err(ChainError::DuplicateIdentity);
@@ -235,6 +475,17 @@ fn validate_identity_register(
             "PublicOfficial tier requires is_public_official flag".into(),
         ));
     }
+
+    // Verify proof
+    let input_hash = hash_with_domain(
+        DOMAIN_IDENTITY,
+        &[tx.account_id.as_slice(), &tx.identity_hash].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_IDENTITY,
+        &[tx.account_id.as_slice(), &[tx.tier as u8], &tx.jurisdiction.to_le_bytes()].concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
     // Store identity record hash
     let record = IdentityRecord {
@@ -261,15 +512,30 @@ fn validate_identity_register(
 // Backup Store validation
 // ---------------------------------------------------------------------------
 
-fn validate_backup_store(tx: &BackupStore, state: &GlobalState) -> Result<GlobalState> {
+fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp) -> Result<GlobalState> {
     let mut new_state = state.clone();
 
-    // Wallet must exist
-    let _ = state
+    // 0. Verify signature — only the account owner can store backups
+    let signing_msg = backup_store_signing_message(tx);
+    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+
+    // 1. Wallet must exist
+    let current_hash = state
         .get_wallet(&tx.account_id)
         .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.account_id[..4])))?;
 
-    // Store backup hash
+    // 2. Verify proof
+    let input_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[tx.account_id.as_slice(), &current_hash, &tx.nonce.to_le_bytes()].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[tx.account_id.as_slice(), &tx.state_hash].concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+
+    // 3. Store backup hash
     new_state.set_backup(tx.account_id, tx.state_hash);
 
     Ok(new_state)
@@ -279,15 +545,29 @@ fn validate_backup_store(tx: &BackupStore, state: &GlobalState) -> Result<Global
 // Backup Restore validation
 // ---------------------------------------------------------------------------
 
-fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState) -> Result<GlobalState> {
+fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timestamp) -> Result<GlobalState> {
     let new_state = state.clone();
 
-    // Verify backup exists
-    let _ = state
+    // 0. Verify signature — only the account owner can restore backups
+    let signing_msg = backup_restore_signing_message(tx);
+    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+
+    // 1. Verify backup exists
+    let backup_hash = state
         .get_backup(&tx.account_id)
         .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.account_id[..4])))?;
 
-    // The proof attests that the restore is valid — we trust it
+    // 2. Verify proof — the proof attests that the restore is valid
+    let input_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[tx.account_id.as_slice(), &backup_hash, &tx.nonce.to_le_bytes()].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[tx.account_id.as_slice(), &tx.backup_hash].concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+
     Ok(new_state)
 }
 
@@ -311,11 +591,40 @@ fn validate_fraud_proof(tx: &FraudProofTx, state: &GlobalState) -> Result<Global
     let _conflict = detect_conflict(&tx.evidence.observation_a, &tx.evidence.observation_b)
         .ok_or_else(|| ChainError::FraudDetected("no conflict detected".into()))?;
 
-    // NOTE: Phase 1 limitation — observer signatures are not verified here.
-    // In production, both observation_a.observer_signature and observation_b.observer_signature
-    // must be verified against the observer's public key before accepting the fraud proof.
+    // 2. Verify observer signatures — prevents fabricated fraud evidence
+    let obs_a_msg = observation_signing_message(&tx.evidence.observation_a);
+    verify_signature_if_not_mock(
+        &tx.evidence.observation_a.observer,
+        &obs_a_msg,
+        &tx.evidence.observation_a.observer_signature,
+    )?;
+    let obs_b_msg = observation_signing_message(&tx.evidence.observation_b);
+    verify_signature_if_not_mock(
+        &tx.evidence.observation_b.observer,
+        &obs_b_msg,
+        &tx.evidence.observation_b.observer_signature,
+    )?;
 
-    // 2. Burn the fraudulent key — remove wallet
+    // 3. Verify the execution proof
+    let input_hash = hash_with_domain(
+        DOMAIN_FRAUD,
+        &[
+            tx.evidence.fraudulent_key.as_slice(),
+            &tx.evidence.observation_a.to_bytes(),
+        ]
+        .concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_FRAUD,
+        &[
+            tx.evidence.fraudulent_key.as_slice(),
+            &tx.evidence.observation_b.to_bytes(),
+        ]
+        .concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+
+    // 4. Burn the fraudulent key — remove wallet
     new_state.remove_wallet(&tx.evidence.fraudulent_key);
 
     // Record fraud evidence on chain
@@ -338,6 +647,24 @@ fn validate_stp_action(
     now: Timestamp,
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
+
+    // 0. Validate timestamp
+    validate_timestamp(tx.timestamp, now)?;
+
+    // 0b. Verify submitter signature
+    let signing_msg = stp_action_signing_message(tx);
+    verify_signature_if_not_mock(&tx.submitter, &signing_msg, &tx.signature)?;
+
+    // 0c. Verify proof
+    let input_hash = hash_with_domain(
+        DOMAIN_STP,
+        &[tx.submitter.as_slice(), &tx.timestamp.to_le_bytes()].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_STP,
+        &serde_json::to_vec(&tx.action).unwrap_or_default(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
     match &tx.action {
         STPAction::RegisterContract(contract) => {
@@ -383,15 +710,33 @@ fn validate_stp_action(
 // App State Update validation
 // ---------------------------------------------------------------------------
 
-fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState) -> Result<GlobalState> {
+fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState, now: Timestamp) -> Result<GlobalState> {
     let mut new_state = state.clone();
 
-    // Wallet must exist
-    let _ = state
+    // 0. Validate timestamp
+    validate_timestamp(tx.timestamp, now)?;
+
+    // 0b. Verify signature — only the account owner can update app state
+    let signing_msg = app_state_update_signing_message(tx);
+    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+
+    // 1. Wallet must exist
+    let current_hash = state
         .get_wallet(&tx.account_id)
         .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.account_id[..4])))?;
 
-    // Update app state
+    // 2. Verify proof
+    let input_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[tx.account_id.as_slice(), &tx.app_id, &current_hash, &tx.nonce.to_le_bytes()].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[tx.account_id.as_slice(), &tx.app_id, &tx.new_state_hash].concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+
+    // 3. Update app state
     new_state.set_app_state(tx.app_id, tx.new_state_hash);
 
     Ok(new_state)
@@ -404,6 +749,7 @@ fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState) -> Result
 fn validate_atomic_swap_init(
     tx: &AtomicSwapInit,
     state: &GlobalState,
+    now: Timestamp,
     block_height: BlockHeight,
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
@@ -412,6 +758,13 @@ fn validate_atomic_swap_init(
     if tx.initiator == tx.responder {
         return Err(ChainError::SelfTransfer);
     }
+
+    // 0b. Validate timestamp
+    validate_timestamp(tx.timestamp, now)?;
+
+    // 0c. Verify responder signature (responder is locking funds)
+    let signing_msg = atomic_swap_init_signing_message(tx);
+    verify_signature_if_not_mock(&tx.responder, &signing_msg, &tx.signature)?;
 
     // 1. Responder wallet must exist (they're locking funds)
     let _ = state
@@ -436,7 +789,18 @@ fn validate_atomic_swap_init(
         return Err(ChainError::SwapExpired);
     }
 
-    // 5. Store swap state (Active) in the swaps SMT
+    // 5. Verify proof
+    let input_hash = hash_with_domain(
+        DOMAIN_SWAP,
+        &[tx.responder.as_slice(), &tx.amount.to_le_bytes(), &tx.nonce.to_le_bytes()].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_SWAP,
+        &[tx.swap_id.as_slice(), &tx.hash_lock, &tx.timeout.to_le_bytes()].concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+
+    // 6. Store swap state (Active) in the swaps SMT
     let state_hash = swap_state_hash(tx, SwapStatus::Active);
     new_state.set_swap(tx.swap_id, state_hash);
 
@@ -464,8 +828,14 @@ fn validate_atomic_swap_init(
 fn validate_atomic_swap_claim(
     tx: &AtomicSwapClaim,
     state: &GlobalState,
+    _now: Timestamp,
+    block_height: BlockHeight,
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
+
+    // 0. Verify claimer signature
+    let signing_msg = atomic_swap_claim_signing_message(tx);
+    verify_signature_if_not_mock(&tx.claimer, &signing_msg, &tx.signature)?;
 
     // 1. Swap must exist
     let stored_hash = state
@@ -495,11 +865,27 @@ fn validate_atomic_swap_claim(
         ));
     }
 
+    // 3b. Claims must be submitted before the timeout
+    if block_height >= tx.original_timeout {
+        return Err(ChainError::SwapExpired);
+    }
+
     // 4. Verify hash preimage: H(secret) must equal hash_lock
     let secret_hash = hash_with_domain(DOMAIN_SWAP, tx.secret.as_slice());
     if secret_hash != tx.original_hash_lock {
         return Err(ChainError::InvalidPreimage);
     }
+
+    // 4b. Verify proof
+    let input_hash = hash_with_domain(
+        DOMAIN_SWAP,
+        &[tx.swap_id.as_slice(), tx.claimer.as_slice(), &tx.secret].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_SWAP,
+        &[tx.swap_id.as_slice(), &tx.original_hash_lock].concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
     // 5. Remove swap (claimed — no longer active)
     new_state.remove_swap(&tx.swap_id);
@@ -530,6 +916,10 @@ fn validate_atomic_swap_refund(
     block_height: BlockHeight,
 ) -> Result<GlobalState> {
     let mut new_state = state.clone();
+
+    // 0. Verify refundee signature
+    let signing_msg = atomic_swap_refund_signing_message(tx);
+    verify_signature_if_not_mock(&tx.refundee, &signing_msg, &tx.signature)?;
 
     // 1. Swap must exist
     let stored_hash = state
@@ -562,6 +952,17 @@ fn validate_atomic_swap_refund(
     if block_height < tx.original_timeout {
         return Err(ChainError::SwapNotExpired);
     }
+
+    // 4b. Verify proof
+    let input_hash = hash_with_domain(
+        DOMAIN_SWAP,
+        &[tx.swap_id.as_slice(), tx.refundee.as_slice(), &tx.original_timeout.to_le_bytes()].concat(),
+    );
+    let output_hash = hash_with_domain(
+        DOMAIN_SWAP,
+        &[tx.swap_id.as_slice(), &tx.original_amount.to_le_bytes()].concat(),
+    );
+    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
     // 5. Remove swap (refunded — no longer active)
     new_state.remove_swap(&tx.swap_id);
@@ -1507,7 +1908,7 @@ mod tests {
         let swap = make_swap_init(initiator, responder, 5000, 100);
 
         let init_tx = Transaction::AtomicSwapInit(swap.clone());
-        let state = validate_transaction(&init_tx, &state, 0, 1).unwrap();
+        let state = validate_transaction(&init_tx, &state, 1000, 1).unwrap();
 
         // Try refund at block 2 — timeout is 100
         let refund = make_swap_refund(&swap);
@@ -1524,7 +1925,7 @@ mod tests {
         let swap = make_swap_init(initiator, responder, 5000, 100);
 
         let init_tx = Transaction::AtomicSwapInit(swap.clone());
-        let state = validate_transaction(&init_tx, &state, 0, 1).unwrap();
+        let state = validate_transaction(&init_tx, &state, 1000, 1).unwrap();
 
         // Try to claim with wrong secret
         let mut claim = make_swap_claim(&swap);
@@ -1543,7 +1944,7 @@ mod tests {
         let swap = make_swap_init(initiator, responder, 5000, 100);
 
         let init_tx = Transaction::AtomicSwapInit(swap.clone());
-        let state = validate_transaction(&init_tx, &state, 0, 1).unwrap();
+        let state = validate_transaction(&init_tx, &state, 1000, 1).unwrap();
 
         // Eve tries to claim — she's not the initiator
         let mut claim = make_swap_claim(&swap);
@@ -1562,7 +1963,7 @@ mod tests {
         let swap = make_swap_init(initiator, responder, 5000, 10);
 
         let init_tx = Transaction::AtomicSwapInit(swap.clone());
-        let state = validate_transaction(&init_tx, &state, 0, 1).unwrap();
+        let state = validate_transaction(&init_tx, &state, 1000, 1).unwrap();
 
         // Eve tries to refund — she's not the responder
         let mut refund = make_swap_refund(&swap);

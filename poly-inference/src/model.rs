@@ -27,7 +27,7 @@ pub enum ModelKind {
     },
     LlamaQuantized {
         model: quantized_llama::ModelWeights,
-        gguf_path: PathBuf,
+        gguf_bytes: Vec<u8>,
         device: Device,
     },
 }
@@ -47,17 +47,15 @@ impl ModelKind {
             ModelKind::Qwen3Full(m) => m.clear_kv_cache(),
             ModelKind::Qwen3Quantized(m) => m.clear_kv_cache(),
             ModelKind::LlamaFull { cache, config, dtype, device, .. } => {
-                if let Ok(new_cache) = llama::Cache::new(true, *dtype, config, device) {
-                    *cache = new_cache;
-                }
+                *cache = llama::Cache::new(true, *dtype, config, device)
+                    .expect("failed to recreate LLaMA KV cache");
             }
-            ModelKind::LlamaQuantized { model, gguf_path, device } => {
-                // quantized_llama has no public clear_kv_cache — reload from GGUF.
-                if let Ok(mut file) = std::fs::File::open(gguf_path.as_path()) {
-                    if let Ok(content) = gguf_file::Content::read(&mut file) {
-                        if let Ok(fresh) = quantized_llama::ModelWeights::from_gguf(content, &mut file, device) {
-                            *model = fresh;
-                        }
+            ModelKind::LlamaQuantized { model, gguf_bytes, device } => {
+                // quantized_llama has no public clear_kv_cache — reload from cached GGUF bytes.
+                let mut cursor = std::io::Cursor::new(&gguf_bytes[..]);
+                if let Ok(content) = gguf_file::Content::read(&mut cursor) {
+                    if let Ok(fresh) = quantized_llama::ModelWeights::from_gguf(content, &mut cursor, device) {
+                        *model = fresh;
                     }
                 }
             }
@@ -405,15 +403,16 @@ fn load_llama_quantized(spec: &ModelSpec, api: &Api, device: &Device) -> Result<
         }
     }
 
-    // Re-read GGUF for model construction (file position was consumed)
-    let mut file = std::fs::File::open(&gguf_path)?;
-    let content = gguf_file::Content::read(&mut file)
+    // Read GGUF bytes into memory for model construction and future KV cache resets
+    let gguf_bytes = std::fs::read(&gguf_path)?;
+    let mut cursor = std::io::Cursor::new(&gguf_bytes[..]);
+    let content = gguf_file::Content::read(&mut cursor)
         .map_err(|e| anyhow!("GGUF re-read: {e}"))?;
-    let model = quantized_llama::ModelWeights::from_gguf(content, &mut file, device)?;
+    let model = quantized_llama::ModelWeights::from_gguf(content, &mut cursor, device)?;
 
     Ok(ModelKind::LlamaQuantized {
         model,
-        gguf_path,
+        gguf_bytes,
         device: device.clone(),
     })
 }

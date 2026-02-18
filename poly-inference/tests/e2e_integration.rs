@@ -549,7 +549,8 @@ fn http_get_pubkey() {
 #[test]
 fn http_encrypted_roundtrip() {
     use poly_client::encryption::EncryptionBackend;
-    use poly_client::ckks::CkksEncryption;
+    use poly_client::ckks::{CkksEncryption, compress};
+    use poly_inference::http::{EncryptedGenerateRequest, EncryptedGenerateResponse};
 
     let server = HttpServer::new("127.0.0.1:0").unwrap();
     let addr = server.addr();
@@ -560,7 +561,6 @@ fn http_encrypted_roundtrip() {
     // Client generates its own key pair (for response encryption)
     let ckks = CkksEncryption;
     let (client_pk, client_sk) = ckks.keygen();
-    let client_pk_hex = hex::encode(serde_json::to_vec(&client_pk).unwrap());
 
     // Client encrypts some token IDs with server's public key
     let server_pk_bytes = hex::decode(&server_pk_hex).unwrap();
@@ -568,52 +568,53 @@ fn http_encrypted_roundtrip() {
         serde_json::from_slice(&server_pk_bytes).unwrap();
     let input_tokens: Vec<u32> = vec![100, 200, 300];
     let input_ct = ckks.encrypt(&input_tokens, &server_pk, &client_sk);
-    let input_ct_hex = hex::encode(serde_json::to_vec(&input_ct).unwrap());
+
+    // PFHE-compress the ciphertext and public key for the wire format
+    let encrypted_input = compress::compress(&input_ct).unwrap();
+    let client_public_key = compress::compress(&client_pk).unwrap();
+
+    let req = EncryptedGenerateRequest {
+        encrypted_input,
+        client_public_key,
+        max_tokens: 10,
+        temperature: 700,
+        seed: 42,
+    };
+
+    // PFHE-compress the entire request
+    let req_bytes = compress::compress(&req).unwrap();
 
     let backend = MockInferenceBackend::default();
     let handle = thread::spawn(move || {
         server.handle_one(&backend).unwrap();
     });
 
-    // POST /generate/encrypted
+    // POST /generate/encrypted with binary PFHE payload
     let url = format!("http://{}/generate/encrypted", addr);
-    let req_body = serde_json::json!({
-        "encrypted_input": input_ct_hex,
-        "client_public_key": client_pk_hex,
-        "max_tokens": 10,
-        "temperature": 700,
-        "seed": 42,
-    });
-
     let mut resp = ureq::post(&url)
-        .content_type("application/json")
-        .send(&serde_json::to_string(&req_body).unwrap())
+        .content_type("application/x-pfhe")
+        .send(&req_bytes)
         .unwrap();
 
-    let resp_body = resp.body_mut().read_to_string().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
+    // Response is PFHE-compressed binary
+    let resp_bytes = resp.body_mut().read_to_vec().unwrap();
+    let parsed: EncryptedGenerateResponse = compress::decompress(&resp_bytes).unwrap();
 
-    // Response should have encrypted_output, proof, compliance
-    assert!(parsed["encrypted_output"].is_string());
-    assert!(parsed["proof"].is_object());
-    assert!(parsed["compliance"].is_object());
-    assert!(parsed["generated_tokens"].is_number());
-    assert!(parsed["total_tokens"].is_number());
+    // Response should have expected fields
+    assert!(parsed.generated_tokens > 0);
+    assert!(parsed.total_tokens > 3);
 
     // Proof should be private (ZK)
-    assert_eq!(parsed["proof"]["privacy_mode"].as_str().unwrap(), "Private");
-    assert!(parsed["proof"]["verified"].as_bool().unwrap());
+    assert_eq!(parsed.proof.privacy_mode, "Private");
+    assert!(parsed.proof.verified);
 
-    // Decrypt the output
-    let output_ct_hex = parsed["encrypted_output"].as_str().unwrap();
-    let output_ct_bytes = hex::decode(output_ct_hex).unwrap();
+    // Decrypt the output from PFHE-compressed ciphertext
     let output_ct: poly_client::ckks::CkksCiphertext =
-        serde_json::from_slice(&output_ct_bytes).unwrap();
+        compress::decompress(&parsed.encrypted_output).unwrap();
     let output_tokens = ckks.decrypt(&output_ct, &client_sk);
 
     // Output should contain input tokens + generated tokens
-    let total = parsed["total_tokens"].as_u64().unwrap() as usize;
-    assert_eq!(output_tokens.len(), total);
+    assert_eq!(output_tokens.len(), parsed.total_tokens);
     // First tokens should be the input
     assert_eq!(&output_tokens[..3], &[100, 200, 300]);
     // Should have generated new tokens

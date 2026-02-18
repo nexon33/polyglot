@@ -66,6 +66,9 @@ pub enum ChainError {
     #[error("zero amount transfer")]
     ZeroAmount,
 
+    #[error("invalid timestamp: outside acceptable drift window")]
+    InvalidTimestamp,
+
     #[error("proof system error: {0}")]
     ProofSystem(#[from] poly_verified::error::ProofSystemError),
 }

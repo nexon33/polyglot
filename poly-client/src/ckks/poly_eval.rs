@@ -225,6 +225,7 @@ fn trivial_ciphertext_broadcast(
         c1,
         scale,
         level: 0,
+        auth_tag: None,
     }
 }
 

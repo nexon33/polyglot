@@ -50,6 +50,54 @@ pub struct RnsCiphertext {
     pub scale: f64,
     /// Number of rescale operations performed (0 for fresh).
     pub level: usize,
+    /// Authentication tag (SHA-256 HMAC over ciphertext data).
+    /// None for legacy/unauthenticated ciphertexts.
+    #[serde(default)]
+    pub auth_tag: Option<[u8; 32]>,
+}
+
+impl RnsCiphertext {
+    /// Compute an authentication tag over the ciphertext contents.
+    pub fn compute_auth_tag(&self, mac_key: &[u8; 32]) -> [u8; 32] {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"rns_ckks_auth_v1");
+        hasher.update(mac_key);
+        hasher.update(self.scale.to_le_bytes());
+        hasher.update((self.level as u64).to_le_bytes());
+        for ch in &self.c0.residues {
+            for &coeff in ch {
+                hasher.update(coeff.to_le_bytes());
+            }
+        }
+        for ch in &self.c1.residues {
+            for &coeff in ch {
+                hasher.update(coeff.to_le_bytes());
+            }
+        }
+        hasher.finalize().into()
+    }
+
+    /// Verify the authentication tag. Returns true if valid.
+    pub fn verify_auth(&self, mac_key: &[u8; 32]) -> bool {
+        match &self.auth_tag {
+            Some(tag) => {
+                let expected = self.compute_auth_tag(mac_key);
+                // Constant-time comparison
+                let mut diff = 0u8;
+                for (a, b) in tag.iter().zip(expected.iter()) {
+                    diff |= a ^ b;
+                }
+                diff == 0
+            }
+            None => false, // No auth tag means not authenticated
+        }
+    }
+
+    /// Set the authentication tag.
+    pub fn authenticate(&mut self, mac_key: &[u8; 32]) {
+        self.auth_tag = Some(self.compute_auth_tag(mac_key));
+    }
 }
 
 /// Evaluation key for RNS-based relinearization with digit decomposition.
@@ -118,6 +166,17 @@ impl RnsCkksContext {
             num_primes,
             NTT_PRIMES.len()
         );
+
+        // HES 128-bit security bounds for N=4096
+        if num_primes > 3 {
+            eprintln!(
+                "WARNING: RNS-CKKS with N=4096 and {} primes (log2(Q) ~ {}) \
+                 exceeds the Homomorphic Encryption Standard bound for 128-bit security. \
+                 For secure parameters, use num_primes <= 3 or increase N.",
+                num_primes, num_primes as f64 * 36.5
+            );
+        }
+
         let ntt = create_ntt_contexts();
         let delta = (1u64 << 36) as f64; // DELTA = 2^36, matches prime size for stable deep chains
 
@@ -468,6 +527,7 @@ pub fn rns_encrypt_simd<R: rand::Rng>(
         c1,
         scale: ctx.delta,
         level: 0,
+        auth_tag: None,
     }
 }
 
@@ -504,6 +564,7 @@ pub fn rns_ct_add(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
         c1: a.c1.add(&b.c1),
         scale: a.scale,
         level: a.level,
+        auth_tag: None,
     }
 }
 
@@ -516,6 +577,7 @@ pub fn rns_ct_sub(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
         c1: a.c1.sub(&b.c1),
         scale: a.scale,
         level: a.level,
+        auth_tag: None,
     }
 }
 
@@ -526,6 +588,7 @@ pub fn rns_ct_scalar_mul(ct: &RnsCiphertext, scalar: i64) -> RnsCiphertext {
         c1: ct.c1.scalar_mul(scalar),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
@@ -540,6 +603,7 @@ pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: f64) -> RnsCi
         c1: ct.c1.clone(),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
@@ -563,6 +627,7 @@ pub fn rns_ct_mod_switch_to(ct: &RnsCiphertext, target_primes: usize) -> RnsCiph
         c1: rns_truncate(&ct.c1, target_primes),
         scale: ct.scale,
         level: ct.level + levels_dropped,
+        auth_tag: None,
     }
 }
 
@@ -579,6 +644,7 @@ pub fn rns_ct_add_scalar_broadcast(ct: &RnsCiphertext, scalar: f64) -> RnsCipher
         c1: ct.c1.clone(),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
@@ -634,6 +700,7 @@ pub fn rns_ct_add_leveled(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext
         c1: a_m.c1.add(&b_m.c1),
         scale: (a_m.scale + b_m.scale) / 2.0,
         level: a_m.level,
+        auth_tag: None,
     }
 }
 
@@ -691,6 +758,7 @@ pub fn rns_relinearize(
         c1,
         scale: triple.scale,
         level: triple.level,
+        auth_tag: None,
     }
 }
 
@@ -722,6 +790,7 @@ pub fn rns_rescale(ct: &RnsCiphertext) -> RnsCiphertext {
         c1: ct.c1.drop_last_prime(),
         scale: ct.scale / q_last as f64,
         level: ct.level + 1,
+        auth_tag: None,
     }
 }
 
@@ -860,6 +929,7 @@ pub fn rns_rotate(
         c1: c1_new,
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
@@ -889,6 +959,7 @@ pub fn rns_ct_mul_plain_simd(
         c1: ctx.poly_mul(&ct.c1, &p),
         scale: ct.scale * ctx.delta,
         level: ct.level,
+        auth_tag: None,
     }
 }
 

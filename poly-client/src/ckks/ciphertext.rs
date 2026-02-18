@@ -96,6 +96,21 @@ fn compute_auth_tag(
     hasher.finalize().into()
 }
 
+/// Constant-time comparison of two byte slices.
+///
+/// Returns `true` if the slices are equal, using bitwise OR accumulation
+/// to avoid timing side-channels that could leak partial tag information.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl CkksCiphertext {
     /// Verify the integrity and authenticity of this ciphertext.
     ///
@@ -105,6 +120,9 @@ impl CkksCiphertext {
     ///
     /// Returns `false` if any check fails (tampering detected) or if
     /// authentication fields are missing (unauthenticated ciphertext).
+    ///
+    /// All comparisons use constant-time equality to prevent timing
+    /// side-channels from leaking partial tag or key-id information.
     pub fn verify_integrity(&self, pk: &CkksPublicKey, mac_key: &[u8; 32]) -> bool {
         let (Some(auth_tag), Some(key_id), Some(nonce)) =
             (self.auth_tag, self.key_id, self.nonce)
@@ -112,15 +130,15 @@ impl CkksCiphertext {
             return false; // unauthenticated ciphertext
         };
 
-        // Check key binding
+        // Check key binding (constant-time)
         let expected_key_id = compute_key_id(pk);
-        if key_id != expected_key_id {
+        if !constant_time_eq(&key_id, &expected_key_id) {
             return false;
         }
 
-        // Check integrity
+        // Check integrity (constant-time)
         let expected_tag = compute_auth_tag(&self.chunks, self.token_count, self.scale, &nonce, &key_id, mac_key);
-        auth_tag == expected_tag
+        constant_time_eq(&auth_tag, &expected_tag)
     }
 }
 

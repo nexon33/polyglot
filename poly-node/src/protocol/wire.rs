@@ -34,6 +34,8 @@ pub enum MessageType {
     RelayDeny = 0x42,
     RelayData = 0x43,
     RelayClose = 0x44,
+    // Error
+    Error = 0xFE,
 }
 
 impl MessageType {
@@ -55,6 +57,7 @@ impl MessageType {
             0x42 => Some(Self::RelayDeny),
             0x43 => Some(Self::RelayData),
             0x44 => Some(Self::RelayClose),
+            0xFE => Some(Self::Error),
             _ => None,
         }
     }
@@ -79,7 +82,17 @@ impl Frame {
     }
 
     /// Encode frame to bytes: [type][length][payload].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload length exceeds `u32::MAX`, which would cause
+    /// silent truncation of the length field on the wire.
     pub fn encode(&self) -> Vec<u8> {
+        assert!(
+            self.payload.len() <= u32::MAX as usize,
+            "payload too large for wire format: {} bytes exceeds u32::MAX",
+            self.payload.len()
+        );
         let len = self.payload.len() as u32;
         let mut buf = Vec::with_capacity(5 + self.payload.len());
         buf.push(self.msg_type as u8);
@@ -255,6 +268,7 @@ mod tests {
             MessageType::RelayDeny,
             MessageType::RelayData,
             MessageType::RelayClose,
+            MessageType::Error,
         ];
         for &ty in &types {
             let b = ty as u8;

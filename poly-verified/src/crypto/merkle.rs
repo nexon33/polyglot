@@ -1,6 +1,6 @@
 use crate::error::{ProofSystemError, Result};
 use crate::crypto::hash::hash_combine;
-use crate::types::{Hash, MerkleProof, ProofNode, ZERO_HASH};
+use crate::types::{hash_eq, Hash, MerkleProof, ProofNode, ZERO_HASH};
 
 /// A Merkle tree built from an ordered list of leaf hashes.
 #[derive(Clone, Debug)]
@@ -114,7 +114,7 @@ pub fn verify_proof(proof: &MerkleProof) -> bool {
         }
     }
 
-    current == proof.root
+    hash_eq(&current, &proof.root)
 }
 
 #[cfg(test)]

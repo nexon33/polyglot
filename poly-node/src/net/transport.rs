@@ -20,6 +20,10 @@ pub fn generate_self_signed_cert(
 }
 
 /// Create a QUIC server endpoint bound to `addr`.
+///
+/// Transport is configured with per-connection stream limits to prevent
+/// a single connection from opening unlimited streams and monopolizing
+/// all inference slots.
 pub fn create_server_endpoint(addr: SocketAddr) -> Result<quinn::Endpoint> {
     let (certs, key) = generate_self_signed_cert()?;
 
@@ -28,9 +32,14 @@ pub fn create_server_endpoint(addr: SocketAddr) -> Result<quinn::Endpoint> {
         .with_single_cert(certs, key)?;
     server_crypto.alpn_protocols = vec![b"poly/1".to_vec()];
 
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(4u32.into());
+    transport.max_concurrent_uni_streams(4u32.into());
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
+    server_config.transport_config(Arc::new(transport));
 
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
     Ok(endpoint)

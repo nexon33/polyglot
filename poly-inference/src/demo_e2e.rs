@@ -376,7 +376,8 @@ fn print_proof_summary(indent: &str, proof: &VerifiedProof) {
                 eprintln!("{}  blinding:    {}...", indent, &hex::encode(bc)[..16]);
             }
         }
-        VerifiedProof::Mock { .. } => {
+        #[allow(unreachable_patterns)]
+        _ => {
             eprintln!("{}Proof: Mock", indent);
         }
     }

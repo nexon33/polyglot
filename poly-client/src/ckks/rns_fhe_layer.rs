@@ -150,6 +150,7 @@ pub fn rns_ct_add_plain_simd(
         c1: ct.c1.clone(),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 

@@ -28,6 +28,9 @@ use poly_client::encryption::EncryptionBackend;
 use poly_client::protocol::InferRequest;
 use poly_verified::types::VerifiedProof;
 
+/// Maximum allowed value for `max_tokens` in any request.
+const MAX_ALLOWED_TOKENS: u32 = 4096;
+
 // ─── Simple batch request/response types ─────────────────────────────────
 
 /// Simple generation request. Prompt, parameters, and optional privacy mode.
@@ -209,16 +212,15 @@ fn handle_request<B: InferenceBackend>(
     let json_header =
         Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
 
-    // GET /pubkey returns the server's CKKS public key (PFHE-compressed binary)
+    // GET /pubkey returns the server's CKKS public key as JSON with hex-encoded bytes
     if request.url() == "/pubkey" {
-        use poly_client::ckks::compress;
-        let body = compress::compress(server_pk).expect("compress server pubkey");
-        let binary_header =
-            Header::from_bytes(&b"Content-Type"[..], &b"application/x-pfhe"[..]).unwrap();
+        let pk_bytes = serde_json::to_vec(server_pk).unwrap_or_default();
+        let pk_hex = hex::encode(&pk_bytes);
+        let body = serde_json::json!({ "public_key": pk_hex }).to_string();
         return Response::new(
             StatusCode(200),
-            vec![binary_header],
-            std::io::Cursor::new(body),
+            vec![json_header],
+            std::io::Cursor::new(body.into_bytes()),
             None,
             None,
         );
@@ -245,13 +247,24 @@ fn handle_infer<B: InferenceBackend>(
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     let body = match read_body(request) {
         Ok(b) => b,
-        Err(e) => return json_error(400, &format!("read error: {e}"), json_header),
+        Err(e) => {
+            eprintln!("read error: {e}");
+            return json_error(400, "failed to read request body", json_header);
+        }
     };
 
     let infer_request: InferRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}"), json_header),
+        Err(e) => {
+            eprintln!("invalid JSON: {e}");
+            return json_error(400, "invalid request body", json_header);
+        }
     };
+
+    // Validate max_tokens
+    if infer_request.max_tokens > MAX_ALLOWED_TOKENS {
+        return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
+    }
 
     match backend.infer(&infer_request) {
         Ok(response) => {
@@ -264,7 +277,10 @@ fn handle_infer<B: InferenceBackend>(
                 None,
             )
         }
-        Err(e) => json_error(500, &format!("inference failed: {e}"), json_header),
+        Err(e) => {
+            eprintln!("inference failed: {e}");
+            json_error(500, "inference failed", json_header)
+        }
     }
 }
 
@@ -276,13 +292,24 @@ fn handle_generate(
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     let body = match read_body(request) {
         Ok(b) => b,
-        Err(e) => return json_error(400, &format!("read error: {e}"), json_header),
+        Err(e) => {
+            eprintln!("read error: {e}");
+            return json_error(400, "failed to read request body", json_header);
+        }
     };
 
     let req: GenerateRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}"), json_header),
+        Err(e) => {
+            eprintln!("invalid JSON: {e}");
+            return json_error(400, "invalid request body", json_header);
+        }
     };
+
+    // Validate max_tokens
+    if req.max_tokens > MAX_ALLOWED_TOKENS {
+        return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
+    }
 
     // Validate mode
     let mode = req.mode.as_str();
@@ -294,6 +321,12 @@ fn handle_generate(
         );
     }
 
+    if mode != "transparent" && mode != "" {
+        // /generate uses generate_compliant which always produces transparent proofs.
+        // Don't mislead the client by echoing their requested mode.
+        return json_error(400, "POST /generate currently only supports transparent mode. Use POST /infer for private/encrypted modes.", json_header);
+    }
+
     // Pre-inference safety gate: reject jailbreak and harmful prompts
     if let Err(rejection) = check_prompt(&req.prompt) {
         return json_error(403, &format!("prompt rejected: {}", rejection), json_header);
@@ -302,7 +335,10 @@ fn handle_generate(
     // Tokenize
     let token_ids = match crate::model::tokenize(&req.prompt) {
         Ok(ids) => ids,
-        Err(e) => return json_error(500, &format!("tokenization failed: {e}"), json_header),
+        Err(e) => {
+            eprintln!("tokenization failed: {e}");
+            return json_error(500, "tokenization failed", json_header);
+        }
     };
 
     if token_ids.is_empty() {
@@ -399,24 +435,41 @@ fn handle_generate_encrypted<B: InferenceBackend>(
 
     let body = match read_body(request) {
         Ok(b) => b,
-        Err(e) => return json_error(400, &format!("read error: {e}"), json_header),
+        Err(e) => {
+            eprintln!("read error: {e}");
+            return json_error(400, "failed to read request body", json_header);
+        }
     };
 
     // Entire body is PFHE-compressed (bincode + zstd)
     let req: EncryptedGenerateRequest = match compress::decompress(&body) {
         Ok(r) => r,
-        Err(e) => return json_error(400, &format!("invalid PFHE payload: {e}"), json_header),
+        Err(e) => {
+            eprintln!("invalid PFHE payload: {e}");
+            return json_error(400, "invalid encrypted payload", json_header);
+        }
     };
+
+    // Validate max_tokens
+    if req.max_tokens > MAX_ALLOWED_TOKENS {
+        return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
+    }
 
     // Nested PFHE-compressed ciphertext and public key
     let input_ct: CkksCiphertext = match compress::decompress(&req.encrypted_input) {
         Ok(ct) => ct,
-        Err(e) => return json_error(400, &format!("invalid CkksCiphertext: {e}"), json_header),
+        Err(e) => {
+            eprintln!("invalid CkksCiphertext: {e}");
+            return json_error(400, "invalid encrypted input", json_header);
+        }
     };
 
     let client_pk: CkksPublicKey = match compress::decompress(&req.client_public_key) {
         Ok(pk) => pk,
-        Err(e) => return json_error(400, &format!("invalid CkksPublicKey: {e}"), json_header),
+        Err(e) => {
+            eprintln!("invalid CkksPublicKey: {e}");
+            return json_error(400, "invalid client public key", json_header);
+        }
     };
 
     // Decrypt input token IDs using server's secret key
@@ -425,6 +478,12 @@ fn handle_generate_encrypted<B: InferenceBackend>(
 
     if token_ids.is_empty() {
         return json_error(400, "encrypted input decoded to zero tokens", json_header);
+    }
+
+    // Decode tokens to text for compliance check
+    let prompt_text = crate::model::decode(&token_ids);
+    if let Err(rejection) = check_prompt(&prompt_text) {
+        return json_error(403, &format!("prompt rejected: {}", rejection), json_header);
     }
 
     let prompt_len = token_ids.len();
@@ -446,14 +505,20 @@ fn handle_generate_encrypted<B: InferenceBackend>(
 
     let infer_response = match backend.infer(&infer_request) {
         Ok(resp) => resp,
-        Err(e) => return json_error(500, &format!("inference failed: {e}"), json_header),
+        Err(e) => {
+            eprintln!("inference failed: {e}");
+            return json_error(500, "inference failed", json_header);
+        }
     };
 
     // Extract output tokens from backend response
     let output_ct: poly_client::encryption::MockCiphertext =
         match serde_json::from_slice(&infer_response.encrypted_output) {
             Ok(ct) => ct,
-            Err(e) => return json_error(500, &format!("output decode failed: {e}"), json_header),
+            Err(e) => {
+                eprintln!("output decode failed: {e}");
+                return json_error(500, "internal error", json_header);
+            }
         };
     let output_tokens = output_ct.tokens;
     let exec_proof = infer_response.proof;
@@ -575,9 +640,12 @@ fn proof_to_summary(
             input_hash: hex::encode(input_hash),
             output_hash: hex::encode(output_hash),
         },
-        VerifiedProof::Mock { .. } => ProofSummary {
-            backend: "Mock".into(),
-            privacy_mode: "mock".into(),
+        // Handle Mock variant (compiled in when poly-verified has "mock" feature)
+        // and any future variants with a sensible fallback.
+        #[allow(unreachable_patterns)]
+        _ => ProofSummary {
+            backend: "Unknown".into(),
+            privacy_mode: "unknown".into(),
             chain_tip: String::new(),
             merkle_root: String::new(),
             step_count: 0,

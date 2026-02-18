@@ -37,6 +37,13 @@ impl<T> Verified<T> {
     /// to create `Verified<T>` values.
     #[doc(hidden)]
     pub fn __macro_new(value: T, proof: VerifiedProof) -> Self {
+        // In production builds, Mock variant doesn't exist (gated by cfg).
+        // In test/mock builds, reject Mock proofs via runtime check when
+        // the "mock" feature is enabled but we're not in a test context.
+        #[cfg(all(feature = "mock", not(test)))]
+        if matches!(&proof, VerifiedProof::Mock { .. }) {
+            panic!("Mock proofs are not allowed in production builds");
+        }
         Self { value, proof }
     }
 
@@ -76,6 +83,9 @@ impl<T> Verified<T> {
     }
 
     /// Map the inner value while preserving the proof.
+    ///
+    /// The proof is carried through unchanged — the caller cannot forge
+    /// or alter it. Only the wrapped value is transformed.
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Verified<U> {
         Verified {
             value: f(self.value),

@@ -4,6 +4,8 @@
 //! serialization roundtrips, proof count mismatches, boundary values,
 //! and cross-privacy-mode scenarios.
 
+use poly_verified::crypto::hash::hash_leaf;
+use poly_verified::crypto::merkle::MerkleTree;
 use poly_verified::disclosure::*;
 use poly_verified::types::*;
 use poly_verified::verified_type::Verified;
@@ -12,7 +14,14 @@ use poly_verified::verified_type::Verified;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn hash_ivc_proof() -> VerifiedProof {
+/// Compute the Merkle root for a set of tokens (matches create_disclosure logic).
+fn tokens_merkle_root(tokens: &[u32]) -> Hash {
+    let leaves: Vec<Hash> = tokens.iter().map(|&t| hash_leaf(&t.to_le_bytes())).collect();
+    let tree = MerkleTree::build(&leaves);
+    tree.root
+}
+
+fn hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
     VerifiedProof::HashIvc {
         chain_tip: [0x01; 32],
         merkle_root: [0x02; 32],
@@ -22,12 +31,13 @@ fn hash_ivc_proof() -> VerifiedProof {
         blinding_commitment: None,
         checkpoints: vec![[0x04; 32]],
         input_hash: ZERO_HASH,
-        output_hash: ZERO_HASH,
+        output_hash: tokens_merkle_root(tokens),
     }
 }
 
 fn make_verified(tokens: Vec<u32>) -> Verified<Vec<u32>> {
-    Verified::__macro_new(tokens, hash_ivc_proof())
+    let proof = hash_ivc_proof_for_tokens(&tokens);
+    Verified::__macro_new(tokens, proof)
 }
 
 fn make_verified_with(tokens: Vec<u32>, proof: VerifiedProof) -> Verified<Vec<u32>> {
@@ -327,6 +337,7 @@ fn disclosed_token_serialization_roundtrip() {
 
 #[test]
 fn disclosure_with_transparent_proof() {
+    let tokens = vec![10, 20, 30];
     let proof = VerifiedProof::HashIvc {
         chain_tip: [0x01; 32],
         merkle_root: [0x02; 32],
@@ -336,15 +347,16 @@ fn disclosure_with_transparent_proof() {
         blinding_commitment: None,
         checkpoints: vec![[0x04; 32]],
         input_hash: ZERO_HASH,
-        output_hash: ZERO_HASH,
+        output_hash: tokens_merkle_root(&tokens),
     };
-    let verified = make_verified_with(vec![10, 20, 30], proof);
+    let verified = make_verified_with(tokens, proof);
     let disclosure = create_disclosure(&verified, &[0, 2]).unwrap();
     assert!(verify_disclosure(&disclosure));
 }
 
 #[test]
 fn disclosure_with_private_inputs_proof() {
+    let tokens = vec![10, 20, 30];
     let proof = VerifiedProof::HashIvc {
         chain_tip: [0x01; 32],
         merkle_root: [0x02; 32],
@@ -354,9 +366,9 @@ fn disclosure_with_private_inputs_proof() {
         blinding_commitment: Some([0x04; 32]),
         checkpoints: vec![[0x04; 32]],
         input_hash: ZERO_HASH,
-        output_hash: ZERO_HASH,
+        output_hash: tokens_merkle_root(&tokens),
     };
-    let verified = make_verified_with(vec![10, 20, 30], proof);
+    let verified = make_verified_with(tokens, proof);
     let disclosure = create_disclosure(&verified, &[1]).unwrap();
     assert!(verify_disclosure(&disclosure));
 
@@ -371,6 +383,7 @@ fn disclosure_with_private_inputs_proof() {
 
 #[test]
 fn disclosure_with_private_proof() {
+    let tokens = vec![42, 43, 44, 45];
     let proof = VerifiedProof::HashIvc {
         chain_tip: [0x01; 32],
         merkle_root: [0x02; 32],
@@ -380,9 +393,9 @@ fn disclosure_with_private_proof() {
         blinding_commitment: Some([0x04; 32]),
         checkpoints: vec![[0x04; 32]],
         input_hash: ZERO_HASH,
-        output_hash: ZERO_HASH,
+        output_hash: tokens_merkle_root(&tokens),
     };
-    let verified = make_verified_with(vec![42, 43, 44, 45], proof);
+    let verified = make_verified_with(tokens, proof);
     let disclosure = create_disclosure(&verified, &[0, 3]).unwrap();
     assert!(verify_disclosure(&disclosure));
 }

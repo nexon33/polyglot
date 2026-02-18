@@ -184,8 +184,14 @@ fn test_verify_proof_via_backend() {
     let result = add_scores(42, 58);
     let backend = poly_verified::ivc::hash_ivc::HashIvc;
 
+    // Extract the proof's committed I/O hashes for verification
+    let (input_hash, output_hash) = match result.proof() {
+        VerifiedProof::HashIvc { input_hash, output_hash, .. } => (*input_hash, *output_hash),
+        _ => panic!("expected HashIvc proof"),
+    };
+
     let ok = backend
-        .verify(result.proof(), &[0u8; 32], &[0u8; 32])
+        .verify(result.proof(), &input_hash, &output_hash)
         .expect("verification should not error");
     assert!(ok, "proof should verify");
 }

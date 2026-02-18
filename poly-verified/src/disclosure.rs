@@ -76,7 +76,7 @@ pub struct Disclosure {
 }
 
 /// Hash a token ID into a Merkle leaf.
-fn token_leaf(token_id: u32) -> Hash {
+pub fn token_leaf(token_id: u32) -> Hash {
     hash_leaf(&token_id.to_le_bytes())
 }
 
@@ -231,15 +231,22 @@ mod tests {
     use super::*;
     use crate::types::{PrivacyMode, ZERO_HASH};
 
-    fn mock_proof() -> VerifiedProof {
+    /// Compute the Merkle root for a set of tokens (matches create_disclosure logic).
+    fn tokens_merkle_root(tokens: &[u32]) -> Hash {
+        let leaves: Vec<Hash> = tokens.iter().map(|&t| token_leaf(t)).collect();
+        let tree = MerkleTree::build(&leaves);
+        tree.root
+    }
+
+    fn mock_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
         VerifiedProof::Mock {
             input_hash: ZERO_HASH,
-            output_hash: ZERO_HASH,
+            output_hash: tokens_merkle_root(tokens),
             privacy_mode: PrivacyMode::Transparent,
         }
     }
 
-    fn mock_hash_ivc_proof() -> VerifiedProof {
+    fn mock_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
         VerifiedProof::HashIvc {
             chain_tip: [0x01; 32],
             merkle_root: [0x02; 32],
@@ -249,7 +256,7 @@ mod tests {
             blinding_commitment: None,
             checkpoints: vec![[0x04; 32]],
             input_hash: ZERO_HASH,
-            output_hash: ZERO_HASH,
+            output_hash: tokens_merkle_root(tokens),
         }
     }
 
@@ -258,7 +265,8 @@ mod tests {
     }
 
     fn make_verified(tokens: Vec<u32>) -> Verified<Vec<u32>> {
-        Verified::__macro_new(tokens, mock_hash_ivc_proof())
+        let proof = mock_hash_ivc_proof_for_tokens(&tokens);
+        Verified::__macro_new(tokens, proof)
     }
 
     // ── Happy path tests ──────────────────────────────────────────────
@@ -497,7 +505,8 @@ mod tests {
 
     #[test]
     fn test_mock_proof_passes_verification() {
-        let verified = Verified::__macro_new(sample_tokens(), mock_proof());
+        let tokens = sample_tokens();
+        let verified = Verified::__macro_new(tokens.clone(), mock_proof_for_tokens(&tokens));
         let disclosure = create_disclosure(&verified, &[0, 1]).unwrap();
         assert!(verify_disclosure(&disclosure));
     }

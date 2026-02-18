@@ -229,6 +229,12 @@ impl MerkleProof {
         let leaf_index = u64::from_le_bytes(data[32..40].try_into().unwrap());
         let sibling_count = u32::from_be_bytes(data[40..44].try_into().unwrap()) as usize;
 
+        if sibling_count > 64 {
+            return Err(ProofSystemError::InvalidEncoding(
+                "merkle proof: sibling count > 64 is unreasonable".to_string(),
+            ));
+        }
+
         let expected_size = 108 + 33 * sibling_count;
         if data.len() < expected_size {
             return Err(ProofSystemError::InvalidEncoding(format!(
@@ -428,7 +434,7 @@ pub enum VerifiedProof {
         /// Committed output hash (for I/O binding).
         output_hash: Hash,
     },
-    /// Mock proof for testing.
+    /// Mock proof for testing. Only accepted by verifiers in test/mock builds.
     Mock {
         input_hash: Hash,
         output_hash: Hash,

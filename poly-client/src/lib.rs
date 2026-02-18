@@ -161,10 +161,15 @@ impl VerifiedResponse {
 mod tests {
     use super::*;
     use crate::encryption::{MockCiphertext, MockEncryption};
-    use poly_verified::disclosure::verify_disclosure;
+    use poly_verified::crypto::merkle::MerkleTree;
+    use poly_verified::disclosure::{token_leaf, verify_disclosure};
     use poly_verified::types::{PrivacyMode, VerifiedProof};
 
-    fn mock_hash_ivc_proof() -> VerifiedProof {
+    fn mock_hash_ivc_proof_for_tokens(token_ids: &[u32]) -> VerifiedProof {
+        // Build the Merkle tree from the tokens so output_hash matches
+        // what disclosure will compute as output_root.
+        let leaves: Vec<_> = token_ids.iter().map(|&t| token_leaf(t)).collect();
+        let tree = MerkleTree::build(&leaves);
         VerifiedProof::HashIvc {
             chain_tip: [0x01; 32],
             merkle_root: [0x02; 32],
@@ -174,7 +179,7 @@ mod tests {
             blinding_commitment: None,
             checkpoints: vec![[0x04; 32]],
             input_hash: [0u8; 32],
-            output_hash: [0u8; 32],
+            output_hash: tree.root,
         }
     }
 
@@ -184,7 +189,7 @@ mod tests {
         };
         InferResponse {
             encrypted_output: serde_json::to_vec(&ct).unwrap(),
-            proof: mock_hash_ivc_proof(),
+            proof: mock_hash_ivc_proof_for_tokens(token_ids),
             model_id: "Qwen/Qwen3-0.6B".into(),
         }
     }

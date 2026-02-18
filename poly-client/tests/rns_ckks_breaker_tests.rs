@@ -680,6 +680,7 @@ fn attack_additive_malleability() {
         c1: ct.c1.clone(),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     };
 
     // Decrypt the shifted ciphertext
@@ -779,6 +780,7 @@ fn attack_swap_c0_c1() {
         c1: ct.c0.clone(),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     };
 
     let dec_real = rns_decrypt_simd(&ct, &s, &ctx, 8);
@@ -1801,6 +1803,7 @@ fn entropy_synthetic_structured_data_detected() {
         c1: zero_poly,
         scale: 1.0,
         level: 3,
+        auth_tag: None,
     };
 
     let check = compress::entropy_check(&fake_ct);

@@ -61,6 +61,9 @@ const ZSTD_LEVEL_MAX: i32 = 19;
 /// Element size for byte-shuffle (8 = sizeof i64, optimal for CKKS polynomials).
 const SHUFFLE_ELEMENT_SIZE: u8 = 8;
 
+/// Maximum allowed decompressed size (64 MB) to prevent decompression bombs.
+const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+
 // ─── Compression Level ───────────────────────────────────────────────
 
 /// Compression level for the PFHE wire format.
@@ -325,6 +328,7 @@ pub enum CompressError {
     Decompress(std::io::Error),
     InvalidHeader(&'static str),
     SizeMismatch { expected: usize, actual: usize },
+    DecompressedSizeExceeded { claimed: usize, limit: usize },
 }
 
 impl std::fmt::Display for CompressError {
@@ -337,6 +341,9 @@ impl std::fmt::Display for CompressError {
             Self::InvalidHeader(msg) => write!(f, "invalid PFHE header: {msg}"),
             Self::SizeMismatch { expected, actual } => {
                 write!(f, "size mismatch: expected {expected}, got {actual}")
+            }
+            Self::DecompressedSizeExceeded { claimed, limit } => {
+                write!(f, "decompressed size {claimed} exceeds limit {limit}")
             }
         }
     }
@@ -351,8 +358,22 @@ fn decompress_v1<T: DeserializeOwned>(data: &[u8]) -> Result<T, CompressError> {
     let original_size =
         u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
 
+    if original_size > MAX_DECOMPRESSED_SIZE {
+        return Err(CompressError::DecompressedSizeExceeded {
+            claimed: original_size,
+            limit: MAX_DECOMPRESSED_SIZE,
+        });
+    }
+
     let decompressed = zstd::decode_all(&data[HEADER_V1_SIZE..])
         .map_err(CompressError::Decompress)?;
+
+    if decompressed.len() > MAX_DECOMPRESSED_SIZE {
+        return Err(CompressError::DecompressedSizeExceeded {
+            claimed: decompressed.len(),
+            limit: MAX_DECOMPRESSED_SIZE,
+        });
+    }
 
     if decompressed.len() != original_size {
         return Err(CompressError::SizeMismatch {
@@ -396,8 +417,22 @@ fn decompress_v2_raw<T: DeserializeOwned>(data: &[u8]) -> Result<T, CompressErro
     let original_size =
         u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
 
+    if original_size > MAX_DECOMPRESSED_SIZE {
+        return Err(CompressError::DecompressedSizeExceeded {
+            claimed: original_size,
+            limit: MAX_DECOMPRESSED_SIZE,
+        });
+    }
+
     let decompressed = zstd::decode_all(&data[HEADER_V2_SIZE..])
         .map_err(CompressError::Decompress)?;
+
+    if decompressed.len() > MAX_DECOMPRESSED_SIZE {
+        return Err(CompressError::DecompressedSizeExceeded {
+            claimed: decompressed.len(),
+            limit: MAX_DECOMPRESSED_SIZE,
+        });
+    }
 
     let unshuffled = byte_unshuffle(&decompressed, element_size);
 

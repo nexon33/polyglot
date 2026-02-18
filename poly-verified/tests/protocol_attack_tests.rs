@@ -21,7 +21,14 @@ use poly_verified::verified_type::Verified;
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-fn mock_hash_ivc_proof() -> VerifiedProof {
+/// Compute the Merkle root for a set of tokens (matches create_disclosure logic).
+fn tokens_merkle_root(tokens: &[u32]) -> Hash {
+    let leaves: Vec<Hash> = tokens.iter().map(|&t| hash_leaf(&t.to_le_bytes())).collect();
+    let tree = MerkleTree::build(&leaves);
+    tree.root
+}
+
+fn mock_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
     VerifiedProof::HashIvc {
         chain_tip: [0x01; 32],
         merkle_root: [0x02; 32],
@@ -31,7 +38,7 @@ fn mock_hash_ivc_proof() -> VerifiedProof {
         blinding_commitment: None,
         checkpoints: vec![],
         input_hash: ZERO_HASH,
-        output_hash: ZERO_HASH,
+        output_hash: tokens_merkle_root(tokens),
     }
 }
 
@@ -40,7 +47,8 @@ fn sample_tokens() -> Vec<u32> {
 }
 
 fn make_verified(tokens: Vec<u32>) -> Verified<Vec<u32>> {
-    Verified::__macro_new(tokens, mock_hash_ivc_proof())
+    let proof = mock_hash_ivc_proof_for_tokens(&tokens);
+    Verified::__macro_new(tokens, proof)
 }
 
 // ═══════════════════════════════════════════════════════════════════════

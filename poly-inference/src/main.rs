@@ -33,7 +33,8 @@ fn print_proof(_label: &str, proof: &VerifiedProof) {
                 eprintln!("      Blinding:    {}", hex::encode(bc));
             }
         }
-        VerifiedProof::Mock { .. } => {
+        #[allow(unreachable_patterns)]
+        _ => {
             eprintln!("      (mock proof)");
         }
     }
@@ -258,7 +259,8 @@ fn proof_json(proof: &VerifiedProof) -> serde_json::Value {
                 "verified": ok,
             })
         }
-        VerifiedProof::Mock { .. } => serde_json::json!({"mock": true}),
+        #[allow(unreachable_patterns)]
+        _ => serde_json::json!({"mock": true}),
     }
 }
 
