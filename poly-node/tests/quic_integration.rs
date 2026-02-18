@@ -17,9 +17,9 @@ use poly_node::config::NodeConfig;
 use poly_node::identity::NodeIdentity;
 use poly_node::net::transport;
 use poly_node::node::{connect_and_infer, PolyNode};
-use poly_node::protocol::handshake::{self, Hello, PROTOCOL_VERSION};
+use poly_node::protocol::handshake::{self, PROTOCOL_VERSION, Hello};
 use poly_node::protocol::wire::{
-    Frame, MessageType, ModelCapability, NodeCapacity, NodeInfo,
+    Frame, MessageType,
 };
 
 /// Helper: pick a random available port on localhost.
@@ -40,25 +40,25 @@ fn test_config() -> NodeConfig {
     }
 }
 
-/// Helper: create a NodeInfo for testing.
-fn test_node_info(identity: &NodeIdentity) -> NodeInfo {
-    NodeInfo {
-        public_key: identity.public_key_bytes(),
-        addresses: vec!["127.0.0.1:4001".parse().unwrap()],
-        models: vec![ModelCapability {
-            model_name: "mock".into(),
-            gpu: false,
-            throughput_estimate: 10.0,
-        }],
-        relay_capable: false,
-        capacity: NodeCapacity {
-            queue_depth: 0,
-            active_sessions: 0,
-            max_sessions: 8,
-        },
-        timestamp: 0,
-        signature: vec![0; 64],
-    }
+
+/// Helper: perform a Hello handshake on a QUIC connection.
+/// Must be called before sending InferRequest on the same connection.
+async fn do_handshake(conn: &quinn::Connection) {
+    let client_identity = NodeIdentity::generate();
+    let hello = Hello {
+        version: PROTOCOL_VERSION,
+        node_info: poly_node::node::build_signed_node_info(&client_identity),
+    };
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello_payload = handshake::encode_hello(&hello).unwrap();
+    let hello_frame = Frame::new(MessageType::Hello, hello_payload);
+    send.write_all(&hello_frame.encode()).await.unwrap();
+    send.finish().unwrap();
+    let data = recv.read_to_end(64 * 1024).await.unwrap();
+    let (ack_frame, _) = Frame::decode(&data).unwrap();
+    assert_eq!(ack_frame.msg_type, MessageType::HelloAck);
+    let ack: handshake::HelloAck = bincode::deserialize(&ack_frame.payload).unwrap();
+    assert!(ack.accepted, "handshake must be accepted");
 }
 
 /// Helper: create a mock InferRequest.
@@ -140,7 +140,7 @@ async fn hello_handshake_over_quic() {
     let client_identity = NodeIdentity::generate();
     let hello = Hello {
         version: PROTOCOL_VERSION,
-        node_info: test_node_info(&client_identity),
+        node_info: poly_node::node::build_signed_node_info(&client_identity),
     };
 
     let client_endpoint = transport::create_client_endpoint().unwrap();
@@ -235,6 +235,9 @@ async fn multiple_inferences_same_connection() {
         .unwrap()
         .await
         .unwrap();
+
+    // Handshake required before inference
+    do_handshake(&conn).await;
 
     for i in 0..3u32 {
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -345,6 +348,9 @@ async fn mixed_messages_on_connection() {
         .unwrap()
         .await
         .unwrap();
+
+    // Handshake required before inference
+    do_handshake(&conn).await;
 
     // Stream 1: Ping
     {

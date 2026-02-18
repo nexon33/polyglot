@@ -3,6 +3,8 @@
 //! Tests disclosure spoofing, proof replay attacks, hash chain manipulation,
 //! domain separation attacks, and Merkle proof forgery.
 
+use sha2::{Digest, Sha256};
+
 use poly_verified::crypto::hash::{
     hash_blinding, hash_chain_step, hash_combine, hash_data, hash_leaf, hash_transition,
 };
@@ -21,11 +23,13 @@ use poly_verified::verified_type::Verified;
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Compute the Merkle root for a set of tokens (matches create_disclosure logic).
-fn tokens_merkle_root(tokens: &[u32]) -> Hash {
-    let leaves: Vec<Hash> = tokens.iter().map(|&t| hash_leaf(&t.to_le_bytes())).collect();
-    let tree = MerkleTree::build(&leaves);
-    tree.root
+/// Compute SHA-256 of raw token bytes for I/O binding.
+fn tokens_hash(tokens: &[u32]) -> Hash {
+    let mut hasher = Sha256::new();
+    for &t in tokens {
+        hasher.update(t.to_le_bytes());
+    }
+    hasher.finalize().into()
 }
 
 fn mock_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
@@ -38,7 +42,7 @@ fn mock_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
         blinding_commitment: None,
         checkpoints: vec![],
         input_hash: ZERO_HASH,
-        output_hash: tokens_merkle_root(tokens),
+        output_hash: tokens_hash(tokens),
     }
 }
 

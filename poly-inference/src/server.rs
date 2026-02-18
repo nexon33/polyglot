@@ -156,14 +156,14 @@ impl InferenceBackend for RealInferenceBackend {
 /// via `last_compliance_proof()`.
 pub struct ComplianceInferenceBackend {
     policy: ContentPolicy,
-    last_proof: std::cell::RefCell<Option<ComplianceProof>>,
+    last_proof: std::sync::Mutex<Option<ComplianceProof>>,
 }
 
 impl ComplianceInferenceBackend {
     pub fn new(policy: ContentPolicy) -> Self {
         Self {
             policy,
-            last_proof: std::cell::RefCell::new(None),
+            last_proof: std::sync::Mutex::new(None),
         }
     }
 
@@ -173,7 +173,7 @@ impl ComplianceInferenceBackend {
 
     /// Retrieve the compliance proof from the most recent `infer()` call.
     pub fn last_compliance_proof(&self) -> Option<ComplianceProof> {
-        self.last_proof.borrow().clone()
+        self.last_proof.lock().unwrap().clone()
     }
 }
 
@@ -197,7 +197,7 @@ impl InferenceBackend for ComplianceInferenceBackend {
         let proof = create_proof(&input_tokens, &output_tokens, privacy)?;
 
         // 4. Store compliance proof for caller to retrieve
-        *self.last_proof.borrow_mut() = Some(compliance_proof);
+        *self.last_proof.lock().unwrap() = Some(compliance_proof);
 
         // 5. Re-encrypt output
         let output_ct = MockCiphertext {

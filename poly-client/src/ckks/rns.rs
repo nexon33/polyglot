@@ -130,7 +130,7 @@ impl RnsPoly {
             let res: Vec<i64> = self.residues[i]
                 .iter()
                 .zip(other.residues[i].iter())
-                .map(|(&a, &b)| (a + b) % q)
+                .map(|(&a, &b)| ((a + b) % q + q) % q)
                 .collect();
             residues.push(res);
         }
@@ -227,8 +227,8 @@ impl RnsPoly {
     /// because gcd(m, 2N) = 1 guarantees j → m*j mod 2N is a bijection.
     pub fn apply_automorphism(&self, m: usize) -> RnsPoly {
         let two_n = 2 * N;
-        debug_assert!(m % 2 == 1, "automorphism index must be odd");
-        debug_assert!(m < two_n, "automorphism index must be < 2N");
+        assert!(m % 2 == 1, "automorphism index must be odd");
+        assert!(m < two_n, "automorphism index must be < 2N");
 
         let mut residues = Vec::with_capacity(self.num_primes);
         for ch in 0..self.num_primes {

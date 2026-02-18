@@ -61,8 +61,10 @@ const ZSTD_LEVEL_MAX: i32 = 19;
 /// Element size for byte-shuffle (8 = sizeof i64, optimal for CKKS polynomials).
 const SHUFFLE_ELEMENT_SIZE: u8 = 8;
 
-/// Maximum allowed decompressed size (64 MB) to prevent decompression bombs.
-const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+/// Maximum allowed decompressed size (8 MB) to prevent decompression bombs.
+/// For CKKS with N=4096 and 20 primes, a ciphertext is ~1.3 MB uncompressed.
+/// With eval keys and rotation keys, the largest single payload is ~4 MB.
+const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
 
 // ─── Compression Level ───────────────────────────────────────────────
 
@@ -414,6 +416,11 @@ fn decompress_v2_raw<T: DeserializeOwned>(data: &[u8]) -> Result<T, CompressErro
     let _level_byte = data[5];
     let _reserved = data[6];
     let element_size = data[7] as usize;
+    // Validate element_size matches the expected shuffle element size to prevent
+    // an attacker from manipulating the unshuffle step
+    if element_size != SHUFFLE_ELEMENT_SIZE as usize {
+        return Err(CompressError::InvalidHeader("unexpected shuffle element size"));
+    }
     let original_size =
         u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
 

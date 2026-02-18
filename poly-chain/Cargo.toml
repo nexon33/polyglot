@@ -5,9 +5,9 @@ edition = "2021"
 description = "Verify-only blockchain protocol for the Poly programming language"
 
 [features]
-# mock is default-on for development/testing. Production binaries
-# should use --no-default-features to enforce real signature verification.
-default = ["mock"]
+# mock is OFF by default — production binaries enforce real crypto verification.
+# Enable mock for development/testing: cargo test --features mock
+default = []
 mock = ["poly-verified/mock"]
 
 [dependencies]

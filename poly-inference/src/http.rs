@@ -214,6 +214,9 @@ fn handle_request<B: InferenceBackend>(
 
     // GET /pubkey returns the server's CKKS public key as JSON with hex-encoded bytes
     if request.url() == "/pubkey" {
+        if request.method() != &Method::Get {
+            return json_error(405, "method not allowed (use GET)", json_header);
+        }
         let pk_bytes = serde_json::to_vec(server_pk).unwrap_or_default();
         let pk_hex = hex::encode(&pk_bytes);
         let body = serde_json::json!({ "public_key": pk_hex }).to_string();
@@ -309,6 +312,11 @@ fn handle_generate(
     // Validate max_tokens
     if req.max_tokens > MAX_ALLOWED_TOKENS {
         return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
+    }
+
+    // Validate temperature (must be > 0; 0 would cause division issues in sampling)
+    if req.temperature == 0 {
+        return json_error(400, "temperature must be > 0 (use 1 for near-greedy decoding)", json_header);
     }
 
     // Validate mode

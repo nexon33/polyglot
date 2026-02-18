@@ -205,10 +205,25 @@ pub fn encrypt<R: Rng>(tokens: &[u32], pk: &CkksPublicKey, sk: &CkksSecretKey, r
 ///
 /// For each chunk: m_noisy = c0 + c1·s, then decode coefficients back to u32.
 ///
-/// **Note:** Call `verify_integrity()` before decrypting to detect tampering.
-/// This function does not verify the authentication tag — it only decrypts
-/// the ciphertext data as-is.
+/// If the ciphertext has an authentication tag, the MAC is verified
+/// automatically using the mac_key derived from the secret key. Tampered
+/// ciphertexts cause a panic. Use `decrypt_unchecked` to bypass this.
 pub fn decrypt(ct: &CkksCiphertext, sk: &CkksSecretKey) -> Vec<u32> {
+    // Enforce MAC verification if auth_tag is present
+    if let (Some(auth_tag), Some(nonce), Some(key_id)) = (ct.auth_tag, ct.nonce, ct.key_id) {
+        let mac_key = super::keys::derive_mac_key(sk);
+        let expected_tag = compute_auth_tag(&ct.chunks, ct.token_count, ct.scale, &nonce, &key_id, &mac_key);
+        assert!(
+            constant_time_eq(&auth_tag, &expected_tag),
+            "ciphertext integrity check failed: auth_tag mismatch (possible tampering)"
+        );
+    }
+
+    decrypt_unchecked(ct, sk)
+}
+
+/// Decrypt without integrity verification. For internal/testing use only.
+pub fn decrypt_unchecked(ct: &CkksCiphertext, sk: &CkksSecretKey) -> Vec<u32> {
     if ct.token_count == 0 {
         return vec![];
     }

@@ -14,7 +14,8 @@ use poly_inference::server::MockInferenceBackend;
 use poly_node::config::NodeConfig;
 use poly_node::identity::NodeIdentity;
 use poly_node::net::transport;
-use poly_node::node::PolyNode;
+use poly_node::node::{build_signed_node_info, PolyNode};
+use poly_node::protocol::handshake::{self, Hello, PROTOCOL_VERSION};
 use poly_node::protocol::wire::{
     Frame, MessageType, ModelCapability, NodeCapacity, NodeInfo,
 };
@@ -59,15 +60,35 @@ async fn start_test_node() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
+/// Helper: perform a Hello handshake on a QUIC connection.
+/// Must be called before sending InferRequest on the same connection.
+async fn do_handshake(conn: &quinn::Connection) {
+    let client_identity = NodeIdentity::generate();
+    let hello = Hello {
+        version: PROTOCOL_VERSION,
+        node_info: build_signed_node_info(&client_identity),
+    };
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello_payload = handshake::encode_hello(&hello).unwrap();
+    let hello_frame = Frame::new(MessageType::Hello, hello_payload);
+    send.write_all(&hello_frame.encode()).await.unwrap();
+    send.finish().unwrap();
+    let data = recv.read_to_end(64 * 1024).await.unwrap();
+    let (ack_frame, _) = Frame::decode(&data).unwrap();
+    assert_eq!(ack_frame.msg_type, MessageType::HelloAck);
+    let ack: handshake::HelloAck = bincode::deserialize(&ack_frame.payload).unwrap();
+    assert!(ack.accepted, "handshake must be accepted");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CRITICAL: Authentication bypass — skip handshake, go straight to inference
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
 async fn attack_auth_bypass_no_handshake_required() {
-    // VULNERABILITY: A client can send an InferRequest without ever
-    // performing a Hello handshake. The server processes it anyway.
-    // The Ed25519 identity system is entirely decorative.
+    // HARDENED: A client that sends an InferRequest without performing
+    // a Hello handshake is rejected. The server closes the stream
+    // without returning a response.
 
     let (addr, handle) = start_test_node().await;
 
@@ -84,16 +105,13 @@ async fn attack_auth_bypass_no_handshake_required() {
     send.finish().unwrap();
 
     let data = recv.read_to_end(16 * 1024 * 1024).await.unwrap();
-    let (resp, _) = Frame::decode(&data).unwrap();
 
-    // ATTACK SUCCEEDS: Server returns valid inference response
-    // without any authentication
-    assert_eq!(resp.msg_type, MessageType::InferResponse);
-    let response: poly_client::protocol::InferResponse =
-        bincode::deserialize(&resp.payload).unwrap();
-    let ct: MockCiphertext =
-        serde_json::from_slice(&response.encrypted_output).unwrap();
-    assert_eq!(ct.tokens.len(), 8); // 3 input + 5 default generated
+    // HARDENED: Server rejects InferRequest without handshake — stream
+    // closed with no response (empty data, Frame::decode fails)
+    assert!(
+        data.is_empty() || Frame::decode(&data).is_err(),
+        "HARDENED: server must reject inference without handshake"
+    );
 
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
@@ -106,9 +124,8 @@ async fn attack_auth_bypass_no_handshake_required() {
 
 #[tokio::test]
 async fn attack_signature_bypass_fake_identity() {
-    // VULNERABILITY: The Hello handler never verifies the Ed25519 signature
-    // in NodeInfo. An attacker can claim any public_key with a zeroed
-    // signature and the server accepts it.
+    // HARDENED: The Hello handler verifies the Ed25519 signature in NodeInfo.
+    // An attacker who claims a public_key with a zeroed signature is rejected.
 
     let (addr, handle) = start_test_node().await;
 
@@ -147,11 +164,11 @@ async fn attack_signature_bypass_fake_identity() {
     let data = recv.read_to_end(64 * 1024).await.unwrap();
     let (ack_frame, _) = Frame::decode(&data).unwrap();
 
-    // ATTACK SUCCEEDS: Server accepts fake identity without checking signature
+    // HARDENED: Server verifies Ed25519 signature and rejects fake identity
     assert_eq!(ack_frame.msg_type, MessageType::HelloAck);
     let ack: poly_node::protocol::handshake::HelloAck =
         bincode::deserialize(&ack_frame.payload).unwrap();
-    assert!(ack.accepted); // Accepted with a completely fake identity!
+    assert!(!ack.accepted, "HARDENED: server must reject fake Ed25519 signature");
 
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
@@ -588,7 +605,7 @@ async fn attack_hello_amplification() {
 async fn attack_replay_inference_request() {
     // VULNERABILITY: No nonce, request ID, or replay protection.
     // A captured inference request can be replayed indefinitely,
-    // wasting server compute.
+    // wasting server compute. (Handshake is required first.)
 
     let (addr, handle) = start_test_node().await;
 
@@ -598,6 +615,9 @@ async fn attack_replay_inference_request() {
 
     let endpoint = transport::create_client_endpoint().unwrap();
     let conn = endpoint.connect(addr, "poly-node").unwrap().await.unwrap();
+
+    // Must complete handshake before inference is allowed
+    do_handshake(&conn).await;
 
     // Replay the exact same bytes 5 times
     for _ in 0..5 {
@@ -677,9 +697,11 @@ async fn attack_version_mismatch_accepted() {
 
 #[tokio::test]
 async fn attack_max_sessions_not_enforced() {
-    // VULNERABILITY: NodeConfig.max_sessions is defined but never
-    // consulted. Set it to 1 and verify we can still run multiple
-    // concurrent inferences.
+    // Test: max_sessions limits concurrent connections via semaphore.
+    // With max_sessions = 1, only 1 connection is accepted; additional
+    // connections are closed with "overloaded". Within an authenticated
+    // session, inference requests on multiple streams are serialized
+    // by the inference semaphore but still succeed.
 
     let mut config = test_config();
     config.max_sessions = 1; // Only allow 1 session
@@ -692,6 +714,9 @@ async fn attack_max_sessions_not_enforced() {
 
     let endpoint = transport::create_client_endpoint().unwrap();
     let conn = endpoint.connect(addr, "poly-node").unwrap().await.unwrap();
+
+    // Must complete handshake before inference is allowed
+    do_handshake(&conn).await;
 
     // Open 5 concurrent streams, all doing inference
     let mut tasks = Vec::new();
@@ -712,7 +737,7 @@ async fn attack_max_sessions_not_enforced() {
         }));
     }
 
-    // All 5 succeed despite max_sessions = 1
+    // All 5 succeed — inference semaphore serializes but doesn't reject
     for task in tasks {
         let msg_type = task.await.unwrap();
         assert_eq!(msg_type, MessageType::InferResponse);

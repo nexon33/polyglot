@@ -23,11 +23,22 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
+use sha2::{Digest, Sha256};
+
 use crate::crypto::hash::hash_leaf;
 use crate::crypto::merkle::{self, MerkleTree};
 use crate::error::{ProofSystemError, Result};
 use crate::types::{Hash, MerkleProof, VerifiedProof, ZERO_HASH};
 use crate::verified_type::Verified;
+
+/// Compute SHA-256 of raw token bytes for I/O binding.
+fn tokens_hash(tokens: &[u32]) -> Hash {
+    let mut hasher = Sha256::new();
+    for &t in tokens {
+        hasher.update(t.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
 
 /// A single token position in a disclosure — either revealed or redacted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +84,9 @@ pub struct Disclosure {
     pub total_tokens: usize,
     /// The execution proof from `#[verified]` — proves genuine computation.
     pub execution_proof: VerifiedProof,
+    /// SHA-256 hash binding the output tokens to the execution proof.
+    /// Must match the execution proof's `output_hash` to prevent proof detachment.
+    pub output_binding: Hash,
 }
 
 /// Hash a token ID into a Merkle leaf.
@@ -136,12 +150,16 @@ pub fn create_disclosure(
         }
     }
 
+    // Compute binding: SHA-256 of all raw token bytes — matches proof's output_hash
+    let output_binding = tokens_hash(tokens);
+
     Ok(Disclosure {
         tokens: disclosed_tokens,
         proofs,
         output_root: tree.root,
         total_tokens,
         execution_proof: verified.proof().clone(),
+        output_binding,
     })
 }
 
@@ -219,10 +237,29 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
         return false;
     }
 
-    // Execution proof structural check
+    // Verify output binding: disclosure must be tied to the execution proof
     match &disclosure.execution_proof {
-        VerifiedProof::HashIvc { step_count, .. } => *step_count > 0,
-        VerifiedProof::Mock { .. } => true,
+        VerifiedProof::HashIvc {
+            step_count,
+            output_hash,
+            ..
+        } => {
+            if *step_count == 0 {
+                return false;
+            }
+            // The output_binding must match the proof's committed output_hash
+            if disclosure.output_binding != *output_hash {
+                return false;
+            }
+            true
+        }
+        VerifiedProof::Mock { output_hash, .. } => {
+            // For Mock proofs, still check binding if output_hash is non-zero
+            if *output_hash != ZERO_HASH && disclosure.output_binding != *output_hash {
+                return false;
+            }
+            true
+        }
     }
 }
 
@@ -231,17 +268,10 @@ mod tests {
     use super::*;
     use crate::types::{PrivacyMode, ZERO_HASH};
 
-    /// Compute the Merkle root for a set of tokens (matches create_disclosure logic).
-    fn tokens_merkle_root(tokens: &[u32]) -> Hash {
-        let leaves: Vec<Hash> = tokens.iter().map(|&t| token_leaf(t)).collect();
-        let tree = MerkleTree::build(&leaves);
-        tree.root
-    }
-
     fn mock_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
         VerifiedProof::Mock {
             input_hash: ZERO_HASH,
-            output_hash: tokens_merkle_root(tokens),
+            output_hash: tokens_hash(tokens),
             privacy_mode: PrivacyMode::Transparent,
         }
     }
@@ -256,7 +286,7 @@ mod tests {
             blinding_commitment: None,
             checkpoints: vec![[0x04; 32]],
             input_hash: ZERO_HASH,
-            output_hash: tokens_merkle_root(tokens),
+            output_hash: tokens_hash(tokens),
         }
     }
 

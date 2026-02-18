@@ -287,7 +287,11 @@ impl WideInt {
     }
 
     fn low_bits(&self, bits: u32) -> u64 {
-        self.limbs[0] & ((1u64 << bits) - 1)
+        if bits >= 64 {
+            self.limbs[0]
+        } else {
+            self.limbs[0] & ((1u64 << bits) - 1)
+        }
     }
 }
 
