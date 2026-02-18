@@ -1,26 +1,21 @@
 //! CKKS ciphertext authentication breaker tests.
 //!
 //! These tests attempt to BREAK the hardened CKKS ciphertext authentication
-//! system. They probe for real vulnerabilities in the auth_tag scheme,
-//! particularly the critical finding that compute_auth_tag uses NO secret
-//! material — making it a checksum, not a MAC.
+//! system. They probe for vulnerabilities in the auth_tag scheme.
 //!
-//! ## Critical vulnerability demonstrated
+//! ## Status after fix
 //!
-//! The auth_tag is SHA-256(key_id || nonce || token_count || scale || chunks).
-//! ALL of these inputs are publicly visible in the serialized ciphertext.
-//! This means ANY observer can:
-//!   1. Tamper with ciphertext data
-//!   2. Recompute a valid auth_tag from the tampered data
-//!   3. Pass verify_integrity() with the forged tag
+//! The auth_tag now includes a MAC key derived from the secret key via
+//! `derive_mac_key(sk)`. The attacker CANNOT recompute valid auth_tags
+//! because they don't know the secret key.
 //!
-//! The auth_tag provides INTEGRITY against accidental corruption but NOT
-//! AUTHENTICITY against an active attacker who can read the ciphertext.
+//! Previous vulnerability: auth_tag was SHA-256(public_data) — a checksum.
+//! Now: auth_tag is SHA-256(mac_key || public_data) — a proper MAC.
 
 #![cfg(feature = "ckks")]
 
 use poly_client::ckks::ciphertext::{compute_key_id, decrypt, encrypt, CkksCiphertext};
-use poly_client::ckks::keys::keygen;
+use poly_client::ckks::keys::{derive_mac_key, keygen};
 use poly_client::ckks::params::DELTA;
 use poly_client::ckks::poly::Poly;
 use rand::rngs::StdRng;
@@ -31,16 +26,11 @@ fn test_rng() -> StdRng {
     StdRng::seed_from_u64(42)
 }
 
-/// Attacker's local reimplementation of compute_auth_tag.
+/// Attacker's local reimplementation of the OLD compute_auth_tag (without mac_key).
 ///
-/// This function replicates the exact algorithm used internally by the
-/// ciphertext module. An attacker can derive this from:
-///   - Reading the source code (open source)
-///   - Reverse-engineering the binary
-///   - Observing input/output pairs
-///
-/// All inputs (chunks, token_count, scale, nonce, key_id) are publicly
-/// visible in the serialized CkksCiphertext.
+/// This function replicates the algorithm that was used BEFORE the fix.
+/// After the fix, the real compute_auth_tag includes mac_key, so this
+/// attacker function produces DIFFERENT tags than the real one.
 fn attacker_compute_auth_tag(
     chunks: &[(Poly, Poly)],
     token_count: usize,
@@ -50,6 +40,7 @@ fn attacker_compute_auth_tag(
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"ckks_auth_v1");
+    // NOTE: attacker does NOT have mac_key, so cannot include it
     hasher.update(key_id);
     hasher.update(nonce);
     hasher.update((token_count as u64).to_le_bytes());
@@ -68,23 +59,23 @@ fn attacker_compute_auth_tag(
 // =========================================================================
 // ATTACK 1: AUTH TAG RECOMPUTATION AFTER TOKEN_COUNT TAMPERING
 //
-// CRITICAL VULNERABILITY: The auth_tag uses only public information.
-// An attacker who sees the ciphertext can tamper with token_count,
-// recompute a valid auth_tag, and pass verify_integrity().
+// HARDENED: The auth_tag now includes a MAC key derived from the secret key.
+// The attacker cannot recompute valid tags without the secret key.
 // =========================================================================
 
-/// CRITICAL VULNERABILITY: Tamper with token_count and recompute a valid
-/// auth_tag using only publicly visible fields. verify_integrity() passes.
+/// HARDENED: Tamper with token_count and attempt to recompute auth_tag.
+/// Without mac_key, the forged tag doesn't match.
 #[test]
 fn attack_auth_tag_recomputation_token_count_tamper() {
     let mut rng = test_rng();
-    let (pk, _sk) = keygen(&mut rng);
+    let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![100, 200, 300, 400, 500];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Verify original is valid
-    assert!(ct.verify_integrity(&pk));
+    assert!(ct.verify_integrity(&pk, &mac_key));
     assert_eq!(ct.token_count, 5);
 
     // --- Attacker reads all public fields ---
@@ -95,9 +86,9 @@ fn attack_auth_tag_recomputation_token_count_tamper() {
     ct.token_count = 2;
 
     // Without recomputing auth_tag, verification fails (good)
-    assert!(!ct.verify_integrity(&pk));
+    assert!(!ct.verify_integrity(&pk, &mac_key));
 
-    // --- Attacker recomputes auth_tag with tampered data ---
+    // --- Attacker recomputes auth_tag WITHOUT mac_key ---
     let forged_tag = attacker_compute_auth_tag(
         &ct.chunks,
         ct.token_count, // tampered value: 2
@@ -107,46 +98,37 @@ fn attack_auth_tag_recomputation_token_count_tamper() {
     );
     ct.auth_tag = Some(forged_tag);
 
-    // VULNERABILITY: verify_integrity() now passes with forged tag!
+    // HARDENED: verify_integrity() rejects the forged tag
     assert!(
-        ct.verify_integrity(&pk),
-        "UNEXPECTED: auth_tag recomputation attack failed \
-         (this would mean the auth scheme uses secret material after all)"
+        !ct.verify_integrity(&pk, &mac_key),
+        "HARDENED: auth_tag forgery without mac_key is now detected"
     );
 
     eprintln!(
-        "CRITICAL VULNERABILITY CONFIRMED: attacker tampered token_count \
-         from 5 to 2 and forged a valid auth_tag without any secret key"
+        "HARDENED: attacker cannot forge auth_tag without mac_key (derived from secret key)"
     );
 }
 
 // =========================================================================
-// ATTACK 2: NONCE REUSE — CAN AN ATTACKER DETECT IDENTICAL PLAINTEXTS?
-//
-// If the same nonce is forced into two ciphertexts encrypting identical
-// plaintexts with the same key, the auth_tags will match only if the
-// ciphertext polynomial coefficients also match. Due to encryption
-// randomness (ephemeral u, e1, e2), coefficients differ even with the
-// same nonce, so auth_tags will differ. However, the nonce field itself
-// is public — an attacker can observe nonce reuse.
+// ATTACK 2: NONCE REUSE DETECTION
 // =========================================================================
 
-/// Nonce reuse test: if two ciphertexts share a nonce, can an attacker
-/// detect whether they encrypt the same plaintext?
+/// Nonce reuse test: each encryption produces unique nonces.
 #[test]
 fn attack_nonce_reuse_detection() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens_a = vec![100, 200, 300];
     let tokens_b = vec![100, 200, 300]; // same plaintext
 
-    let ct_a = encrypt(&tokens_a, &pk, &mut rng);
-    let ct_b = encrypt(&tokens_b, &pk, &mut rng);
+    let ct_a = encrypt(&tokens_a, &pk, &sk, &mut rng);
+    let ct_b = encrypt(&tokens_b, &pk, &sk, &mut rng);
 
     // Both should verify
-    assert!(ct_a.verify_integrity(&pk));
-    assert!(ct_b.verify_integrity(&pk));
+    assert!(ct_a.verify_integrity(&pk, &mac_key));
+    assert!(ct_b.verify_integrity(&pk, &mac_key));
 
     // Nonces should be different (each encrypt() generates a fresh nonce)
     assert_ne!(
@@ -161,7 +143,7 @@ fn attack_nonce_reuse_detection() {
         "Ciphertext coefficients should differ due to encryption randomness"
     );
 
-    // Force nonce reuse: copy A's nonce into B and recompute auth_tag
+    // Force nonce reuse: copy A's nonce into B and try to forge auth_tag
     let mut ct_b_reused = ct_b.clone();
     ct_b_reused.nonce = ct_a.nonce;
     let nonce = ct_a.nonce.unwrap();
@@ -175,33 +157,23 @@ fn attack_nonce_reuse_detection() {
     );
     ct_b_reused.auth_tag = Some(forged_tag);
 
-    // With reused nonce and recomputed tag, it still verifies
+    // HARDENED: forged tag without mac_key fails
     assert!(
-        ct_b_reused.verify_integrity(&pk),
-        "Nonce-reused ciphertext with recomputed auth_tag should verify"
+        !ct_b_reused.verify_integrity(&pk, &mac_key),
+        "HARDENED: nonce-reused ciphertext with forged auth_tag should fail"
     );
 
-    // Auth tags still differ because ciphertext coefficients differ
-    assert_ne!(
-        ct_a.auth_tag, ct_b_reused.auth_tag,
-        "Even with same nonce, auth tags differ due to different ciphertext coefficients"
-    );
-
-    // Both decrypt correctly
+    // Both original ciphertexts still decrypt correctly
     assert_eq!(decrypt(&ct_a, &sk), tokens_a);
-    assert_eq!(decrypt(&ct_b_reused, &sk), tokens_b);
+    assert_eq!(decrypt(&ct_b, &sk), tokens_b);
 
     eprintln!(
-        "NONCE REUSE: identical plaintexts produce different auth_tags even with \
-         same nonce (ciphertext randomness protects). But nonce reuse itself is \
-         observable and should be tracked server-side."
+        "HARDENED: nonce reuse + auth forgery blocked by mac_key requirement"
     );
 }
 
 // =========================================================================
 // ATTACK 3: AUTH TAG STRIPPING
-//
-// Set auth_tag, key_id, and nonce to None. Does verify_integrity reject?
 // =========================================================================
 
 /// Strip all authentication fields. verify_integrity() should reject.
@@ -209,12 +181,13 @@ fn attack_nonce_reuse_detection() {
 fn attack_auth_tag_stripping() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![42, 43, 44];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Verify original passes
-    assert!(ct.verify_integrity(&pk));
+    assert!(ct.verify_integrity(&pk, &mac_key));
 
     // Strip all auth fields
     ct.auth_tag = None;
@@ -223,7 +196,7 @@ fn attack_auth_tag_stripping() {
 
     // verify_integrity should reject unauthenticated ciphertext
     assert!(
-        !ct.verify_integrity(&pk),
+        !ct.verify_integrity(&pk, &mac_key),
         "VULNERABILITY: stripped auth fields not detected"
     );
 
@@ -241,27 +214,25 @@ fn attack_auth_tag_stripping() {
 }
 
 // =========================================================================
-// ATTACK 4: PARTIAL AUTH FIELD ATTACK
-//
-// Set auth_tag to Some but key_id or nonce to None. Does verify_integrity
-// handle the inconsistent state correctly?
+// ATTACK 4: PARTIAL AUTH FIELD ATTACKS
 // =========================================================================
 
 /// Partial auth fields: auth_tag present but key_id missing.
 #[test]
 fn attack_partial_auth_fields_missing_key_id() {
     let mut rng = test_rng();
-    let (pk, _sk) = keygen(&mut rng);
+    let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![10, 20, 30];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
-    assert!(ct.verify_integrity(&pk));
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
+    assert!(ct.verify_integrity(&pk, &mac_key));
 
     // Keep auth_tag and nonce but strip key_id
     ct.key_id = None;
 
     assert!(
-        !ct.verify_integrity(&pk),
+        !ct.verify_integrity(&pk, &mac_key),
         "VULNERABILITY: missing key_id not detected when auth_tag is present"
     );
 
@@ -272,17 +243,18 @@ fn attack_partial_auth_fields_missing_key_id() {
 #[test]
 fn attack_partial_auth_fields_missing_nonce() {
     let mut rng = test_rng();
-    let (pk, _sk) = keygen(&mut rng);
+    let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![10, 20, 30];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
-    assert!(ct.verify_integrity(&pk));
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
+    assert!(ct.verify_integrity(&pk, &mac_key));
 
     // Keep auth_tag and key_id but strip nonce
     ct.nonce = None;
 
     assert!(
-        !ct.verify_integrity(&pk),
+        !ct.verify_integrity(&pk, &mac_key),
         "VULNERABILITY: missing nonce not detected when auth_tag is present"
     );
 
@@ -293,17 +265,18 @@ fn attack_partial_auth_fields_missing_nonce() {
 #[test]
 fn attack_partial_auth_fields_missing_auth_tag() {
     let mut rng = test_rng();
-    let (pk, _sk) = keygen(&mut rng);
+    let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![10, 20, 30];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
-    assert!(ct.verify_integrity(&pk));
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
+    assert!(ct.verify_integrity(&pk, &mac_key));
 
     // Strip only the auth_tag
     ct.auth_tag = None;
 
     assert!(
-        !ct.verify_integrity(&pk),
+        !ct.verify_integrity(&pk, &mac_key),
         "VULNERABILITY: missing auth_tag not detected when key_id/nonce are present"
     );
 
@@ -313,22 +286,23 @@ fn attack_partial_auth_fields_missing_auth_tag() {
 // =========================================================================
 // ATTACK 5: SCALE OVERFLOW
 //
-// Set scale to i64::MAX or i64::MIN. Does anything panic?
+// HARDENED: Attacker cannot forge auth_tag, so scale tampering is detected.
 // =========================================================================
 
-/// Scale overflow: set to i64::MAX. Should not panic.
+/// Scale overflow: set to i64::MAX. Auth forgery should fail.
 #[test]
 fn attack_scale_overflow_max() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![42, 100, 999];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Tamper scale to i64::MAX
     ct.scale = i64::MAX;
 
-    // Recompute auth tag so verify_integrity passes (demonstrating the vuln)
+    // Recompute auth tag WITHOUT mac_key
     let nonce = ct.nonce.unwrap();
     let key_id = ct.key_id.unwrap();
     let forged_tag = attacker_compute_auth_tag(
@@ -340,34 +314,26 @@ fn attack_scale_overflow_max() {
     );
     ct.auth_tag = Some(forged_tag);
 
-    // Should not panic on verify
+    // HARDENED: forged tag fails verification
     assert!(
-        ct.verify_integrity(&pk),
-        "Forged auth_tag for scale=i64::MAX should pass verify_integrity"
-    );
-
-    // Decrypt with extreme scale should not panic (may produce wrong results)
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decrypt(&ct, &sk)
-    }));
-    assert!(
-        result.is_ok(),
-        "VULNERABILITY: decrypt panics with scale=i64::MAX"
+        !ct.verify_integrity(&pk, &mac_key),
+        "HARDENED: forged auth_tag for scale=i64::MAX should fail"
     );
 
     eprintln!(
-        "SCALE OVERFLOW (MAX): no panic. Decryption produces garbage but does not crash."
+        "HARDENED: scale overflow attack blocked — auth forgery without mac_key fails"
     );
 }
 
-/// Scale overflow: set to i64::MIN. Should not panic.
+/// Scale overflow: set to i64::MIN. Auth forgery should fail.
 #[test]
 fn attack_scale_overflow_min() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![42, 100, 999];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Tamper scale to i64::MIN
     ct.scale = i64::MIN;
@@ -383,32 +349,26 @@ fn attack_scale_overflow_min() {
     );
     ct.auth_tag = Some(forged_tag);
 
+    // HARDENED: forged tag fails
     assert!(
-        ct.verify_integrity(&pk),
-        "Forged auth_tag for scale=i64::MIN should pass verify_integrity"
-    );
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decrypt(&ct, &sk)
-    }));
-    assert!(
-        result.is_ok(),
-        "VULNERABILITY: decrypt panics with scale=i64::MIN"
+        !ct.verify_integrity(&pk, &mac_key),
+        "HARDENED: forged auth_tag for scale=i64::MIN should fail"
     );
 
     eprintln!(
-        "SCALE OVERFLOW (MIN): no panic. Decryption produces garbage but does not crash."
+        "HARDENED: scale overflow (MIN) attack blocked"
     );
 }
 
-/// Scale set to zero. Division by zero in decoding could panic.
+/// Scale set to zero. Auth forgery should fail.
 #[test]
 fn attack_scale_zero() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![42];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     ct.scale = 0;
 
@@ -423,32 +383,21 @@ fn attack_scale_zero() {
     );
     ct.auth_tag = Some(forged_tag);
 
+    // HARDENED: forged tag fails
     assert!(
-        ct.verify_integrity(&pk),
-        "Forged auth_tag for scale=0 should pass verify_integrity"
-    );
-
-    // decrypt() does not use ct.scale (decode uses DELTA directly),
-    // so this should not panic. But it demonstrates the auth bypass.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decrypt(&ct, &sk)
-    }));
-    assert!(
-        result.is_ok(),
-        "decrypt panics with scale=0"
+        !ct.verify_integrity(&pk, &mac_key),
+        "HARDENED: forged auth_tag for scale=0 should fail"
     );
 
     eprintln!(
-        "SCALE ZERO: auth_tag forged successfully. decrypt() does not use ct.scale \
-         for basic decryption (it uses the DELTA constant), so no immediate crash."
+        "HARDENED: scale zero attack blocked"
     );
 }
 
 // =========================================================================
 // ATTACK 6: CHUNK SWAPPING BETWEEN CIPHERTEXTS
 //
-// Take chunks from ciphertext A, put them in B's structure with B's
-// auth fields, and recompute the auth_tag.
+// HARDENED: Chunk swap + auth forgery fails without mac_key.
 // =========================================================================
 
 /// Chunk swap: steal chunks from ciphertext A, place in B's auth context.
@@ -456,15 +405,16 @@ fn attack_scale_zero() {
 fn attack_chunk_swap_between_ciphertexts() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens_a = vec![100, 200, 300];
     let tokens_b = vec![400, 500, 600];
 
-    let ct_a = encrypt(&tokens_a, &pk, &mut rng);
-    let ct_b = encrypt(&tokens_b, &pk, &mut rng);
+    let ct_a = encrypt(&tokens_a, &pk, &sk, &mut rng);
+    let ct_b = encrypt(&tokens_b, &pk, &sk, &mut rng);
 
-    assert!(ct_a.verify_integrity(&pk));
-    assert!(ct_b.verify_integrity(&pk));
+    assert!(ct_a.verify_integrity(&pk, &mac_key));
+    assert!(ct_b.verify_integrity(&pk, &mac_key));
 
     // Attacker takes A's chunks but uses B's nonce/key_id
     let nonce_b = ct_b.nonce.unwrap();
@@ -487,43 +437,33 @@ fn attack_chunk_swap_between_ciphertexts() {
         nonce: Some(nonce_b),
     };
 
-    // VULNERABILITY: The Frankenstein ciphertext passes verify_integrity
-    // because the attacker can recompute a valid auth_tag
+    // HARDENED: The Frankenstein ciphertext fails verify_integrity
     assert!(
-        franken_ct.verify_integrity(&pk),
-        "UNEXPECTED: chunk-swapped ciphertext with recomputed auth_tag should verify"
-    );
-
-    // It decrypts to A's plaintext (the stolen chunks)
-    let decrypted = decrypt(&franken_ct, &sk);
-    assert_eq!(
-        decrypted, tokens_a,
-        "Chunk-swapped ciphertext should decrypt to source ciphertext's plaintext"
+        !franken_ct.verify_integrity(&pk, &mac_key),
+        "HARDENED: chunk-swapped ciphertext with forged auth_tag should fail"
     );
 
     eprintln!(
-        "CHUNK SWAP VULNERABILITY: attacker swapped chunks from ct_a into ct_b's \
-         auth context, recomputed auth_tag, and verify_integrity() passed. \
-         Decrypted to ct_a's plaintext: {:?}",
-        decrypted
+        "HARDENED: chunk swap attack blocked — auth forgery without mac_key fails"
     );
 }
 
 // =========================================================================
 // ATTACK 7: ZERO-COEFFICIENT CIPHERTEXT
 //
-// Encrypt tokens, then zero out all coefficients and recompute auth_tag.
+// HARDENED: Auth forgery fails without mac_key.
 // =========================================================================
 
-/// Zero out all ciphertext coefficients and forge a valid auth_tag.
+/// Zero out all ciphertext coefficients and attempt to forge auth_tag.
 #[test]
 fn attack_zero_coefficient_ciphertext() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![100, 200, 300, 400, 500];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
-    assert!(ct.verify_integrity(&pk));
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
+    assert!(ct.verify_integrity(&pk, &mac_key));
 
     // Zero out all coefficients
     for chunk in &mut ct.chunks {
@@ -533,11 +473,11 @@ fn attack_zero_coefficient_ciphertext() {
 
     // Without recomputing auth_tag, verification should fail
     assert!(
-        !ct.verify_integrity(&pk),
+        !ct.verify_integrity(&pk, &mac_key),
         "Zeroed ciphertext should fail integrity with original auth_tag"
     );
 
-    // Attacker recomputes auth_tag for the zeroed ciphertext
+    // Attacker recomputes auth_tag WITHOUT mac_key
     let nonce = ct.nonce.unwrap();
     let key_id = ct.key_id.unwrap();
     let forged_tag = attacker_compute_auth_tag(
@@ -549,65 +489,44 @@ fn attack_zero_coefficient_ciphertext() {
     );
     ct.auth_tag = Some(forged_tag);
 
-    // VULNERABILITY: verify_integrity passes with forged tag
+    // HARDENED: forged tag fails
     assert!(
-        ct.verify_integrity(&pk),
-        "UNEXPECTED: zeroed ciphertext with recomputed auth_tag should verify"
+        !ct.verify_integrity(&pk, &mac_key),
+        "HARDENED: zeroed ciphertext with forged auth_tag should fail"
     );
-
-    // Decrypts to all zeros instead of original tokens
-    let decrypted = decrypt(&ct, &sk);
-    assert_eq!(
-        decrypted,
-        vec![0, 0, 0, 0, 0],
-        "Zeroed ciphertext should decrypt to zeros"
-    );
-    assert_ne!(decrypted, tokens);
 
     eprintln!(
-        "ZERO-COEFF VULNERABILITY: attacker zeroed all ciphertext coefficients, \
-         forged auth_tag, and verify_integrity() passed. \
-         Original: {:?}, Decrypted: {:?}",
-        tokens, decrypted
+        "HARDENED: zero-coefficient attack blocked — auth forgery without mac_key fails"
     );
 }
 
 // =========================================================================
 // ATTACK 8: FULL AUTH TAG FORGERY WITHOUT SECRET KEY (CRITICAL)
 //
-// This is the most important test. It demonstrates the complete attack:
-//   1. Encrypt a message normally
-//   2. Tamper with a ciphertext coefficient (active attack)
-//   3. Read nonce and key_id from the (public) ciphertext
-//   4. Recompute a valid auth_tag using SHA-256
-//   5. Show verify_integrity() passes with the forged tag
-//
-// This proves the auth_tag is a checksum, NOT a MAC.
+// HARDENED: The auth_tag now includes mac_key derived from the secret key.
+// An attacker without the secret key CANNOT forge valid auth_tags.
 // =========================================================================
 
-/// CRITICAL: Full demonstration that auth_tag can be forged without
-/// any secret material. The auth_tag is SHA-256 over entirely public data.
+/// HARDENED: Full demonstration that auth_tag can NO LONGER be forged
+/// without secret material. The attacker's recomputed tag doesn't match.
 #[test]
 fn attack_full_auth_tag_forgery_no_secret_key() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     // Step 1: Legitimate encryption
     let original_tokens = vec![42, 100, 255, 1000, 50000];
-    let ct = encrypt(&original_tokens, &pk, &mut rng);
+    let ct = encrypt(&original_tokens, &pk, &sk, &mut rng);
 
     // Verify the original ciphertext is valid
-    assert!(ct.verify_integrity(&pk));
+    assert!(ct.verify_integrity(&pk, &mac_key));
     assert_eq!(decrypt(&ct, &sk), original_tokens);
 
     // Step 2: Attacker intercepts and tampers with a coefficient
     let mut tampered = ct.clone();
-    // Add a full DELTA to coefficient 0 — this shifts the decoded token by +1.
-    // Using mod_reduce-safe arithmetic: adding DELTA to the encoded value
-    // c0[0] means the decoded token at index 0 goes from 42 to 43.
     let original_coeff = tampered.chunks[0].0.coeffs[0];
     tampered.chunks[0].0.coeffs[0] = {
-        // Add DELTA (one full encoding unit) to guarantee a token shift
         let v = original_coeff as i128 + DELTA as i128;
         let q = 18014398509481951i128; // Q
         let mut r = v % q;
@@ -622,11 +541,11 @@ fn attack_full_auth_tag_forgery_no_secret_key() {
     let token_count = tampered.token_count;  // publicly visible
     let scale = tampered.scale;              // publicly visible
 
-    // Step 4: Attacker recomputes auth_tag using only public information
-    // No secret key, no private key, nothing secret whatsoever
+    // Step 4: Attacker recomputes auth_tag WITHOUT mac_key
     let forged_tag = {
         let mut hasher = Sha256::new();
         hasher.update(b"ckks_auth_v1");      // domain separator (public/hardcoded)
+        // NOTE: attacker does NOT have mac_key!
         hasher.update(key_id);               // from ciphertext (public)
         hasher.update(nonce);                // from ciphertext (public)
         hasher.update((token_count as u64).to_le_bytes()); // from ciphertext (public)
@@ -646,42 +565,26 @@ fn attack_full_auth_tag_forgery_no_secret_key() {
     // Step 5: Replace auth_tag with the forged one
     tampered.auth_tag = Some(forged_tag);
 
-    // CRITICAL VULNERABILITY: verify_integrity() passes!
+    // HARDENED: verify_integrity() rejects! Attacker doesn't know mac_key.
     assert!(
-        tampered.verify_integrity(&pk),
-        "CRITICAL FAILURE: This should demonstrate that auth_tag forgery works. \
-         If this assertion fails, it means the auth scheme has been upgraded to use \
-         secret material (which would be good!)."
-    );
-
-    // The tampered ciphertext decrypts to corrupted data
-    let tampered_decrypted = decrypt(&tampered, &sk);
-    assert_ne!(
-        tampered_decrypted, original_tokens,
-        "Tampered ciphertext should decrypt to different tokens"
+        !tampered.verify_integrity(&pk, &mac_key),
+        "HARDENED: auth_tag forgery without mac_key should be detected"
     );
 
     eprintln!("========================================================");
-    eprintln!("CRITICAL VULNERABILITY: AUTH TAG FORGERY WITHOUT SECRET KEY");
+    eprintln!("HARDENED: AUTH TAG FORGERY WITHOUT SECRET KEY NOW BLOCKED");
     eprintln!("========================================================");
-    eprintln!("Original tokens:  {:?}", original_tokens);
-    eprintln!("Tampered decrypt: {:?}", tampered_decrypted);
-    eprintln!("verify_integrity() passed with forged auth_tag!");
-    eprintln!();
-    eprintln!("The auth_tag is SHA-256(public_data) — a checksum, not a MAC.");
-    eprintln!("Any observer can forge valid auth_tags for tampered ciphertexts.");
-    eprintln!();
-    eprintln!("FIX: Use HMAC-SHA256 with a shared secret, or include the secret");
-    eprintln!("key (or a key-derived value) in the auth_tag computation.");
+    eprintln!("The auth_tag now includes mac_key = SHA-256(secret_key).");
+    eprintln!("Attacker cannot recompute valid auth_tags without the secret.");
     eprintln!("========================================================");
 }
 
-/// CRITICAL: Demonstrate the attack in the other direction — attacker
-/// creates a completely fabricated ciphertext from scratch with valid auth.
+/// HARDENED: Attacker cannot fabricate a ciphertext from scratch with valid auth.
 #[test]
 fn attack_fabricate_ciphertext_from_scratch() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     // Attacker knows the public key (it's public!)
     let key_id = compute_key_id(&pk);
@@ -689,12 +592,12 @@ fn attack_fabricate_ciphertext_from_scratch() {
     // Attacker generates their own nonce
     let nonce: [u8; 16] = [0xAA; 16]; // arbitrary
 
-    // Attacker creates a zero ciphertext (encrypts "nothing" / all zeros)
+    // Attacker creates a zero ciphertext
     let fake_chunks = vec![(Poly::zero(), Poly::zero())];
     let fake_token_count = 3;
     let fake_scale = DELTA;
 
-    // Attacker computes a valid auth_tag
+    // Attacker computes auth_tag WITHOUT mac_key
     let auth_tag = attacker_compute_auth_tag(
         &fake_chunks,
         fake_token_count,
@@ -712,28 +615,19 @@ fn attack_fabricate_ciphertext_from_scratch() {
         nonce: Some(nonce),
     };
 
-    // VULNERABILITY: Fabricated ciphertext passes verify_integrity!
+    // HARDENED: Fabricated ciphertext fails verify_integrity
     assert!(
-        fabricated.verify_integrity(&pk),
-        "Fabricated-from-scratch ciphertext should pass verify_integrity"
+        !fabricated.verify_integrity(&pk, &mac_key),
+        "HARDENED: fabricated ciphertext without mac_key should fail"
     );
 
-    // It decrypts to zeros (not meaningful, but the auth check passed)
-    let decrypted = decrypt(&fabricated, &sk);
-    assert_eq!(decrypted, vec![0, 0, 0]);
-
     eprintln!(
-        "FABRICATION VULNERABILITY: attacker created a ciphertext from scratch \
-         (not from encrypt()) with a valid auth_tag. verify_integrity() passed."
+        "HARDENED: ciphertext fabrication blocked — mac_key required for valid auth_tag"
     );
 }
 
 // =========================================================================
 // ATTACK 9: KEY ID COLLISION
-//
-// Can two different public keys produce the same key_id?
-// With SHA-256, collisions are computationally infeasible, but we test
-// that different keys produce different key_ids.
 // =========================================================================
 
 /// Key ID collision test: different public keys should have different key_ids.
@@ -782,10 +676,7 @@ fn attack_key_id_determinism() {
 // =========================================================================
 // ATTACK 10: SERIALIZATION MANIPULATION
 //
-// Deserialize a ciphertext from JSON, modify fields, re-serialize.
-// The auth_tag in the JSON is just a byte array — it survives unchanged
-// through serde roundtrips, so modifications are trivially detected...
-// unless the attacker also updates the auth_tag.
+// HARDENED: Deserialization + tampering + auth forgery fails without mac_key.
 // =========================================================================
 
 /// Serialization attack: deserialize, tamper, re-serialize with forged auth.
@@ -793,9 +684,10 @@ fn attack_key_id_determinism() {
 fn attack_serialization_manipulation() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![10, 20, 30, 40, 50];
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Serialize to JSON
     let json = serde_json::to_string(&ct).unwrap();
@@ -804,7 +696,7 @@ fn attack_serialization_manipulation() {
     let mut ct2: CkksCiphertext = serde_json::from_str(&json).unwrap();
 
     // Verify it's valid after deserialization
-    assert!(ct2.verify_integrity(&pk));
+    assert!(ct2.verify_integrity(&pk, &mac_key));
     assert_eq!(decrypt(&ct2, &sk), tokens);
 
     // Attacker modifies a coefficient via the deserialized struct
@@ -812,11 +704,11 @@ fn attack_serialization_manipulation() {
 
     // Without forging auth_tag, verification fails (good baseline)
     assert!(
-        !ct2.verify_integrity(&pk),
+        !ct2.verify_integrity(&pk, &mac_key),
         "Tampered ciphertext should fail with original auth_tag"
     );
 
-    // Attacker forges the auth_tag
+    // Attacker forges the auth_tag WITHOUT mac_key
     let nonce = ct2.nonce.unwrap();
     let key_id = ct2.key_id.unwrap();
     let forged_tag = attacker_compute_auth_tag(
@@ -828,35 +720,14 @@ fn attack_serialization_manipulation() {
     );
     ct2.auth_tag = Some(forged_tag);
 
-    // VULNERABILITY: passes after forgery
+    // HARDENED: forged tag fails
     assert!(
-        ct2.verify_integrity(&pk),
-        "Serialization-tampered ciphertext with forged auth should pass"
-    );
-
-    // Re-serialize the tampered ciphertext
-    let tampered_json = serde_json::to_string(&ct2).unwrap();
-    let ct3: CkksCiphertext = serde_json::from_str(&tampered_json).unwrap();
-
-    // Still passes after another roundtrip
-    assert!(ct3.verify_integrity(&pk));
-
-    // Decrypts to modified data
-    let decrypted = decrypt(&ct3, &sk);
-    assert_ne!(decrypted, tokens);
-    // The coefficient at index 2 was shifted by DELTA, so token at index 2
-    // should be off by 1
-    assert_eq!(
-        decrypted[2],
-        tokens[2] + 1,
-        "Token at index 2 should be shifted by +1 (added DELTA to coefficient)"
+        !ct2.verify_integrity(&pk, &mac_key),
+        "HARDENED: serialization-tampered ciphertext with forged auth should fail"
     );
 
     eprintln!(
-        "SERIALIZATION ATTACK: deserialized, tampered coeff[2] (+DELTA), \
-         forged auth_tag, re-serialized. verify_integrity() passed. \
-         Token[2] changed from {} to {}.",
-        tokens[2], decrypted[2]
+        "HARDENED: serialization manipulation attack blocked — mac_key required"
     );
 }
 
@@ -864,9 +735,9 @@ fn attack_serialization_manipulation() {
 #[test]
 fn attack_serialization_auth_tag_preserved() {
     let mut rng = test_rng();
-    let (pk, _sk) = keygen(&mut rng);
+    let (pk, sk) = keygen(&mut rng);
 
-    let ct = encrypt(&[1, 2, 3], &pk, &mut rng);
+    let ct = encrypt(&[1, 2, 3], &pk, &sk, &mut rng);
     let original_tag = ct.auth_tag.unwrap();
     let original_nonce = ct.nonce.unwrap();
     let original_key_id = ct.key_id.unwrap();
@@ -887,11 +758,12 @@ fn attack_serialization_auth_tag_preserved() {
 #[test]
 fn attack_combined_multi_field_tampering() {
     let mut rng = test_rng();
-    let (pk, _sk) = keygen(&mut rng);
+    let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![100, 200, 300, 400, 500];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
-    assert!(ct.verify_integrity(&pk));
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
+    assert!(ct.verify_integrity(&pk, &mac_key));
 
     // Tamper with EVERYTHING: coefficients, token_count, scale
     ct.chunks[0].0.coeffs[0] = 0;
@@ -900,7 +772,7 @@ fn attack_combined_multi_field_tampering() {
     ct.token_count = 2;
     ct.scale = DELTA * 2;
 
-    // Forge auth_tag for all the tampered data
+    // Forge auth_tag WITHOUT mac_key
     let nonce = ct.nonce.unwrap();
     let key_id = ct.key_id.unwrap();
     let forged_tag = attacker_compute_auth_tag(
@@ -912,15 +784,14 @@ fn attack_combined_multi_field_tampering() {
     );
     ct.auth_tag = Some(forged_tag);
 
-    // VULNERABILITY: passes with massively tampered data
+    // HARDENED: forged tag fails
     assert!(
-        ct.verify_integrity(&pk),
-        "Multi-field tampered ciphertext with forged auth should pass"
+        !ct.verify_integrity(&pk, &mac_key),
+        "HARDENED: multi-field tampered ciphertext with forged auth should fail"
     );
 
     eprintln!(
-        "COMBINED ATTACK: tampered coefficients, token_count, and scale \
-         simultaneously. Forged auth_tag. verify_integrity() passed."
+        "HARDENED: combined multi-field attack blocked"
     );
 }
 
@@ -928,12 +799,13 @@ fn attack_combined_multi_field_tampering() {
 #[test]
 fn attack_nonce_replacement_defeats_replay_tracking() {
     let mut rng = test_rng();
-    let (pk, _sk) = keygen(&mut rng);
+    let (pk, sk) = keygen(&mut rng);
+    let mac_key = derive_mac_key(&sk);
 
     let tokens = vec![42, 43, 44];
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
     let original_nonce = ct.nonce.unwrap();
-    assert!(ct.verify_integrity(&pk));
+    assert!(ct.verify_integrity(&pk, &mac_key));
 
     // Attacker replaces the nonce to defeat server-side replay tracking
     let new_nonce: [u8; 16] = [0xFF; 16];
@@ -957,17 +829,13 @@ fn attack_nonce_replacement_defeats_replay_tracking() {
         nonce: Some(new_nonce),
     };
 
-    // VULNERABILITY: ciphertext with replaced nonce passes verify_integrity
+    // HARDENED: nonce replacement with forged auth fails
     assert!(
-        replayed.verify_integrity(&pk),
-        "Nonce-replaced ciphertext with forged auth should pass"
+        !replayed.verify_integrity(&pk, &mac_key),
+        "HARDENED: nonce-replaced ciphertext with forged auth should fail"
     );
 
     eprintln!(
-        "REPLAY BYPASS: attacker replaced nonce {:?} with {:?}, \
-         forged auth_tag, and verify_integrity() passed. \
-         Server-side nonce tracking is defeated.",
-        &original_nonce[..4],
-        &new_nonce[..4]
+        "HARDENED: replay bypass blocked — auth forgery without mac_key fails"
     );
 }

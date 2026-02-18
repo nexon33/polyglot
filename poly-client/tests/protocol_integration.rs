@@ -331,7 +331,7 @@ fn mock_encryption_large_input() {
     let (pk, sk) = backend.keygen();
 
     let large_input: Vec<u32> = (0..10_000).collect();
-    let ct = backend.encrypt(&large_input, &pk);
+    let ct = backend.encrypt(&large_input, &pk, &sk);
     let decrypted = backend.decrypt(&ct, &sk);
 
     assert_eq!(large_input, decrypted);
@@ -349,10 +349,10 @@ fn mock_encryption_keys_are_deterministic() {
 #[test]
 fn mock_encryption_ciphertext_is_json_stable() {
     let backend = MockEncryption;
-    let (pk, _sk) = backend.keygen();
+    let (pk, sk) = backend.keygen();
 
-    let ct1 = backend.encrypt(&[1, 2, 3], &pk);
-    let ct2 = backend.encrypt(&[1, 2, 3], &pk);
+    let ct1 = backend.encrypt(&[1, 2, 3], &pk, &sk);
+    let ct2 = backend.encrypt(&[1, 2, 3], &pk, &sk);
 
     let json1 = serde_json::to_string(&ct1).unwrap();
     let json2 = serde_json::to_string(&ct2).unwrap();

@@ -14,7 +14,7 @@
 //!   6.  Empty checkpoint injection (ZERO_HASH as checkpoint)
 //!   7.  Chain tip collision via repeated state_hash
 //!   8.  Blinding commitment forgery for different checkpoints
-//!   9.  code_hash is NOT verified (known design decision)
+//!   9.  code_hash substitution (now HARDENED: bound into chain_tip)
 //!  10.  Proof with step_count = u64::MAX
 //!  11.  Self-referential checkpoint (fixed-point)
 //!  12.  Cross-privacy blinding leakage
@@ -109,6 +109,13 @@ fn reassemble(
     }
 }
 
+/// Compute the bound chain_tip: hash_combine(hash_combine(raw_tip, hash_data(code_hash)), hash_data([privacy as u8]))
+fn bind_tip(raw_tip: &Hash, code_hash: &Hash, privacy: PrivacyMode) -> Hash {
+    let code_binding = hash_data(code_hash);
+    let mode_binding = hash_data(&[privacy as u8]);
+    hash_combine(&hash_combine(raw_tip, &code_binding), &mode_binding)
+}
+
 // ============================================================================
 // 1. Second preimage on hash chain
 //
@@ -145,11 +152,13 @@ fn attack_01_second_preimage_on_hash_chain() {
 
     // Build a valid proof from sequence A
     let tree_a = MerkleTree::build(&cp_a);
+    let code = hash_data(b"test");
+    let bound_tip_a = bind_tip(&chain_a.tip, &code, PrivacyMode::Transparent);
     let proof_a = reassemble(
-        chain_a.tip,
+        bound_tip_a,
         tree_a.root,
         2,
-        hash_data(b"test"),
+        code,
         PrivacyMode::Transparent,
         None,
         cp_a.clone(),
@@ -161,13 +170,13 @@ fn attack_01_second_preimage_on_hash_chain() {
         "sanity: valid proof A should verify"
     );
 
-    // Attempt: use sequence B's checkpoints but claim sequence A's chain_tip
+    // Attempt: use sequence B's checkpoints but claim sequence A's bound chain_tip
     let tree_b = MerkleTree::build(&cp_b);
     let forged = reassemble(
-        chain_a.tip, // from sequence A
+        bound_tip_a, // from sequence A (bound)
         tree_b.root, // from sequence B
         2,
-        hash_data(b"test"),
+        code,
         PrivacyMode::Transparent,
         None,
         cp_b,         // sequence B checkpoints
@@ -229,8 +238,9 @@ fn attack_02_merkle_odd_leaf_duplication() {
         forged_chain.append(cp);
     }
 
+    let forged_bound_tip = bind_tip(&forged_chain.tip, &code_hash, privacy);
     let forged_proof = reassemble(
-        forged_chain.tip, // recomputed for 4 steps
+        forged_bound_tip, // recomputed for 4 steps, bound with code_hash + privacy
         forged_tree.root,
         4,
         code_hash,
@@ -346,20 +356,17 @@ fn attack_03_privacy_downgrade_private_to_transparent() {
     let result2 = backend
         .verify(&downgraded_no_blinding, &ih, &oh)
         .unwrap();
-    // This should pass because the proof fields (chain, merkle, I/O) are all valid.
-    // The "downgrade" here means the verifier now DEMANDS I/O match, which they do.
-    // This is actually correct behavior: if the attacker provides valid I/O, the
-    // verifier can see them. But the attacker needed the real I/O values to pass.
-    if result2 {
-        eprintln!(
-            "ATTACK 03 INFO: Stripping blinding and switching to Transparent passes \
-             but ONLY if the attacker already knows the real I/O hashes. \
-             Privacy is a prover-side guarantee, not a verifier-side restriction."
-        );
-    } else {
-        eprintln!("ATTACK 03 RESULT: Downgrade fully rejected even without blinding");
-    }
-    eprintln!("ATTACK 03 RESULT: Privacy downgrade with blinding present is correctly rejected");
+    // HARDENED: privacy_mode is now bound into chain_tip. Switching Private -> Transparent
+    // changes the expected chain_tip, so even stripping the blinding doesn't help.
+    assert!(
+        !result2,
+        "HARDENED: downgrade fully rejected even without blinding \
+         (privacy_mode bound into chain_tip)"
+    );
+    eprintln!(
+        "ATTACK 03 RESULT: Privacy downgrade fully rejected. \
+         privacy_mode is bound into chain_tip."
+    );
 }
 
 // ============================================================================
@@ -452,18 +459,17 @@ fn attack_04b_privacy_upgrade_with_correct_blinding() {
         oh,
     );
 
-    // Private mode: verify() skips I/O checks. With correct blinding, this passes.
-    // This IS a vulnerability: attacker can upgrade any Transparent proof to Private,
-    // bypassing I/O verification, because blinding is computable from public checkpoints.
+    // HARDENED: privacy_mode is now bound into the chain_tip. Switching
+    // Transparent -> Private changes the expected chain_tip, so even with
+    // a correctly computed blinding the proof is rejected.
     let result = backend.verify(&upgraded, &ZERO_HASH, &ZERO_HASH).unwrap();
     assert!(
-        result,
-        "VULNERABILITY: attacker can upgrade Transparent proof to Private by computing \
-         blinding from public checkpoints, bypassing I/O verification entirely"
+        !result,
+        "HARDENED: privacy upgrade now rejected because privacy_mode is bound into chain_tip"
     );
     eprintln!(
-        "ATTACK 04b RESULT: VULNERABILITY FOUND -- Privacy upgrade with computed blinding \
-         passes verification, allowing I/O check bypass"
+        "ATTACK 04b RESULT: HARDENED -- Privacy upgrade with computed blinding \
+         is now rejected (privacy_mode bound into chain_tip)"
     );
 }
 
@@ -502,9 +508,10 @@ fn attack_05_checkpoint_reordering() {
         "HARDENED: reordered checkpoints produce a different chain_tip"
     );
 
-    // Build a self-consistent reordered proof
+    // Build a self-consistent reordered proof (with bound tip)
+    let reordered_bound_tip = bind_tip(&reordered_chain.tip, &code_hash, privacy);
     let reordered_proof = reassemble(
-        reordered_chain.tip,
+        reordered_bound_tip,
         reordered_tree.root,
         3,
         code_hash,
@@ -570,11 +577,13 @@ fn attack_06_empty_checkpoint_injection() {
     chain.append(&zero_cp);
     let tree = MerkleTree::build(&[zero_cp]);
 
+    let code = hash_data(b"test");
+    let bound_tip = bind_tip(&chain.tip, &code, PrivacyMode::Transparent);
     let proof = reassemble(
-        chain.tip,
+        bound_tip,
         tree.root,
         1,
-        hash_data(b"test"),
+        code,
         PrivacyMode::Transparent,
         None,
         vec![zero_cp],
@@ -708,8 +717,9 @@ fn attack_08_blinding_forgery_different_checkpoints() {
     }
     let tree_a = MerkleTree::build(&checkpoints_a);
 
+    let bound_tip_a = bind_tip(&chain_a.tip, &code_hash_a, PrivacyMode::Private);
     let forged = reassemble(
-        chain_a.tip,
+        bound_tip_a,
         tree_a.root,
         checkpoints_a.len() as u64,
         code_hash_a,
@@ -766,10 +776,9 @@ fn attack_09_code_hash_not_verified() {
 
     let result = backend.verify(&tampered, &input, &output).unwrap();
     assert!(
-        result,
-        "VULNERABILITY: code_hash is not verified by HashIvc::verify(). \
-         Any code_hash can be substituted. This is a KNOWN design decision -- \
-         code_hash binding is enforced at the application layer."
+        !result,
+        "HARDENED: code_hash is now bound into chain_tip. \
+         Substituting a different code_hash causes chain_tip mismatch."
     );
 
     // Also try with ZERO_HASH code
@@ -786,13 +795,13 @@ fn attack_09_code_hash_not_verified() {
     );
     let result2 = backend.verify(&zero_code, &input, &output).unwrap();
     assert!(
-        result2,
-        "VULNERABILITY: ZERO code_hash also passes (code_hash completely ignored)"
+        !result2,
+        "HARDENED: ZERO code_hash also rejected (code_hash bound into chain_tip)"
     );
 
     eprintln!(
-        "ATTACK 09 RESULT: CONFIRMED -- code_hash is NOT in the verification path. \
-         Known design decision: application layer must bind code identity."
+        "ATTACK 09 RESULT: HARDENED -- code_hash is now bound into chain_tip. \
+         Substituting any code_hash is detected."
     );
 }
 
@@ -909,11 +918,13 @@ fn attack_11_self_referential_checkpoint() {
     }
     let tree = MerkleTree::build(&checkpoints);
 
+    let code = hash_data(b"test");
+    let bound_tip = bind_tip(&verify_chain.tip, &code, PrivacyMode::Transparent);
     let proof = reassemble(
-        verify_chain.tip,
+        bound_tip,
         tree.root,
         2,
-        hash_data(b"test"),
+        code,
         PrivacyMode::Transparent,
         None,
         checkpoints,
@@ -1056,26 +1067,20 @@ fn attack_bonus_combined_privacy_upgrade_and_code_forgery() {
         oh,
     );
 
-    // The forged proof should pass because:
-    // 1. chain_tip matches (same checkpoints)
-    // 2. merkle_root matches (same checkpoints)
-    // 3. step_count matches (same count)
-    // 4. code_hash is not verified (attack 9)
-    // 5. blinding is correctly computed (attack 4b)
-    // 6. I/O is not checked in Private mode
+    // HARDENED: Both code_hash and privacy_mode are now bound into chain_tip.
+    // Changing either causes chain_tip mismatch, so the combined attack fails.
     let result = backend.verify(&forged, &ZERO_HASH, &ZERO_HASH).unwrap();
     assert!(
-        result,
-        "VULNERABILITY: combined privacy-upgrade + code_hash forgery passes. \
-         Attacker can claim any code identity while hiding I/O."
+        !result,
+        "HARDENED: combined privacy-upgrade + code_hash forgery now rejected. \
+         Both code_hash and privacy_mode are bound into chain_tip."
     );
 
     // The forged proof hides the code hash
     assert_eq!(forged.code_hash(), ZERO_HASH);
 
     eprintln!(
-        "ATTACK BONUS RESULT: VULNERABILITY CONFIRMED -- Combined attack succeeds. \
-         Attacker upgrades to Private (bypasses I/O) and forges code_hash. \
-         Fix: bind privacy_mode into the hash chain or blinding derivation."
+        "ATTACK BONUS RESULT: HARDENED -- Combined attack now rejected. \
+         code_hash and privacy_mode are bound into chain_tip."
     );
 }

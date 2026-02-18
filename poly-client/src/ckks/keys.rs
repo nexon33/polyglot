@@ -47,6 +47,18 @@ pub fn keygen<R: Rng>(rng: &mut R) -> (CkksPublicKey, CkksSecretKey) {
     (CkksPublicKey { b, a }, CkksSecretKey { s })
 }
 
+/// Derive a MAC key from the secret key for ciphertext authentication.
+/// Share this with the server alongside the public key and eval key.
+pub fn derive_mac_key(sk: &CkksSecretKey) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"ckks_mac_key_v1");
+    for c in &sk.s.coeffs {
+        hasher.update(c.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

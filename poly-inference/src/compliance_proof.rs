@@ -131,9 +131,14 @@ impl ComplianceAccumulator {
         let final_state_hash = self.state.to_hash();
 
         // Bind I/O hashes: input is always ZERO_HASH (initial state),
-        // output is the final chained state hash.
+        // output commits final_state_hash + total_tokens + compliant_tokens
+        // so tampering with any of them breaks I/O verification.
         self.acc.input_hash = ZERO_HASH;
-        self.acc.output_hash = final_state_hash;
+        let mut output_data = Vec::with_capacity(48);
+        output_data.extend_from_slice(&final_state_hash);
+        output_data.extend_from_slice(&total_tokens.to_le_bytes());
+        output_data.extend_from_slice(&compliant_tokens.to_le_bytes());
+        self.acc.output_hash = hash_data(&output_data);
 
         let ivc_proof = self
             .backend
@@ -178,7 +183,12 @@ impl ComplianceProof {
 
         // 1. Verify IVC proof with actual I/O binding.
         let input = ZERO_HASH;
-        let output = self.final_state_hash;
+        // Recompute output binding — must match what finalize() committed
+        let mut output_data = Vec::with_capacity(48);
+        output_data.extend_from_slice(&self.final_state_hash);
+        output_data.extend_from_slice(&self.total_tokens.to_le_bytes());
+        output_data.extend_from_slice(&self.compliant_tokens.to_le_bytes());
+        let output = hash_data(&output_data);
         if !backend
             .verify(&self.ivc_proof, &input, &output)
             .map_err(|e| format!("proof verification failed: {e}"))?

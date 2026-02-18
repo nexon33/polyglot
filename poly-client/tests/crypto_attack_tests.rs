@@ -31,7 +31,7 @@ fn attack_ciphertext_bit_flip_c0() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![100, 200, 300, 400, 500];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Flip a significant coefficient in c0
     ct.chunks[0].0.coeffs[0] ^= 0x7FFF_FFFF;
@@ -50,7 +50,7 @@ fn attack_ciphertext_bit_flip_c1() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![42, 43, 44];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Corrupt c1
     ct.chunks[0].1.coeffs[0] = Q / 2;
@@ -70,7 +70,7 @@ fn attack_ciphertext_zeroed_out() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![100, 200, 300];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Zero out both polynomials
     ct.chunks[0].0 = Poly::zero();
@@ -94,7 +94,7 @@ fn attack_ciphertext_noise_injection() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![42, 43, 44, 45, 46];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Add noise = DELTA (one full unit) to each encoded coefficient.
     // This shifts each decoded token by +1.
@@ -128,7 +128,7 @@ fn attack_ciphertext_swap_components() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![10, 20, 30];
-    let mut ct = encrypt(&tokens, &pk, &mut rng);
+    let mut ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Swap c0 and c1
     let temp = ct.chunks[0].0.clone();
@@ -150,7 +150,7 @@ fn attack_ciphertext_negation_malleability() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![100, 200, 300];
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Negate both components
     let negated = CkksCiphertext {
@@ -178,7 +178,7 @@ fn attack_additive_malleability() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
     let original = vec![100];
-    let ct = encrypt(&original, &pk, &mut rng);
+    let ct = encrypt(&original, &pk, &sk, &mut rng);
 
     // Add an encoded plaintext offset to c0 (known-plaintext attack)
     let offset = encode(&[50]);
@@ -210,11 +210,11 @@ fn attack_additive_malleability() {
 fn attack_wrong_key_decryption() {
     let mut rng1 = StdRng::seed_from_u64(1);
     let mut rng2 = StdRng::seed_from_u64(99);
-    let (pk1, _sk1) = keygen(&mut rng1);
+    let (pk1, sk1) = keygen(&mut rng1);
     let (_pk2, sk2) = keygen(&mut rng2);
 
     let tokens = vec![42, 43, 44, 45, 46, 47, 48, 49, 50];
-    let ct = encrypt(&tokens, &pk1, &mut rng1);
+    let ct = encrypt(&tokens, &pk1, &sk1, &mut rng1);
 
     let wrong = decrypt(&ct, &sk2);
     // Not a single token should match (with overwhelmingly high probability)
@@ -234,7 +234,7 @@ fn attack_zero_secret_key() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![100, 200, 300];
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // Create a fake secret key with all zeros
     let fake_sk = CkksSecretKey { s: Poly::zero() };
@@ -255,7 +255,7 @@ fn attack_negated_secret_key() {
     let mut rng = test_rng();
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![42, 100, 999];
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     let neg_sk = CkksSecretKey { s: sk.s.neg() };
     let decrypted = decrypt(&ct, &neg_sk);
@@ -896,15 +896,15 @@ fn attack_key_independence() {
 #[test]
 fn attack_semantic_security() {
     let mut rng = test_rng();
-    let (pk, _sk) = keygen(&mut rng);
+    let (pk, sk) = keygen(&mut rng);
 
     let tokens = vec![42, 42, 42];
 
     let mut rng1 = StdRng::seed_from_u64(100);
     let mut rng2 = StdRng::seed_from_u64(200);
 
-    let ct1 = encrypt(&tokens, &pk, &mut rng1);
-    let ct2 = encrypt(&tokens, &pk, &mut rng2);
+    let ct1 = encrypt(&tokens, &pk, &sk, &mut rng1);
+    let ct2 = encrypt(&tokens, &pk, &sk, &mut rng2);
 
     assert_ne!(
         ct1.chunks[0].0.coeffs, ct2.chunks[0].0.coeffs,

@@ -38,10 +38,11 @@ fn hash_ivc_proof() -> VerifiedProof {
 fn server_response_with_key(
     output_tokens: &[u32],
     pk: &CkksPublicKey,
+    sk: &CkksSecretKey,
     proof: VerifiedProof,
 ) -> InferResponse {
     let mut rng = StdRng::seed_from_u64(77);
-    let ct = encrypt(output_tokens, pk, &mut rng);
+    let ct = encrypt(output_tokens, pk, sk, &mut rng);
     InferResponse {
         encrypted_output: serde_json::to_vec(&ct).unwrap(),
         proof,
@@ -67,7 +68,7 @@ fn ckks_backend_roundtrip() {
     let backend = CkksEncryption;
     let (pk, sk) = backend.keygen();
     let tokens = vec![100, 200, 300, 400, 500];
-    let ct = backend.encrypt(&tokens, &pk);
+    let ct = backend.encrypt(&tokens, &pk, &sk);
     let decrypted = backend.decrypt(&ct, &sk);
     assert_eq!(decrypted, tokens);
 }
@@ -77,7 +78,7 @@ fn ckks_backend_roundtrip_empty() {
     let backend = CkksEncryption;
     let (pk, sk) = backend.keygen();
     let tokens: Vec<u32> = vec![];
-    let ct = backend.encrypt(&tokens, &pk);
+    let ct = backend.encrypt(&tokens, &pk, &sk);
     let decrypted = backend.decrypt(&ct, &sk);
     assert_eq!(decrypted, tokens);
 }
@@ -87,7 +88,7 @@ fn ckks_backend_roundtrip_large_values() {
     let backend = CkksEncryption;
     let (pk, sk) = backend.keygen();
     let tokens = vec![u32::MAX, u32::MAX - 1, 0, 1, 42];
-    let ct = backend.encrypt(&tokens, &pk);
+    let ct = backend.encrypt(&tokens, &pk, &sk);
     let decrypted = backend.decrypt(&ct, &sk);
     assert_eq!(decrypted, tokens);
 }
@@ -99,11 +100,11 @@ fn ckks_backend_roundtrip_large_values() {
 #[test]
 fn protocol_flow_ckks_encrypted_mode() {
     let backend = CkksEncryption;
-    let (pk, _sk) = backend.keygen();
+    let (pk, sk) = backend.keygen();
 
     // Client prepares request
     let input_tokens = vec![1, 2, 3, 4, 5];
-    let ct = backend.encrypt(&input_tokens, &pk);
+    let ct = backend.encrypt(&input_tokens, &pk, &sk);
     let encrypted_input = serde_json::to_vec(&ct).unwrap();
 
     let req = InferRequest {
@@ -146,7 +147,7 @@ fn disclosure_from_ckks_response() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let output = vec![100, 200, 300, 400, 500];
-    let resp = server_response_with_key(&output, &pk, hash_ivc_proof());
+    let resp = server_response_with_key(&output, &pk, &sk, hash_ivc_proof());
 
     // Client decrypts
     let ct: CkksCiphertext = serde_json::from_slice(&resp.encrypted_output).unwrap();
@@ -169,7 +170,7 @@ fn disclosure_range_from_ckks_response() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let output: Vec<u32> = (0..20).collect();
-    let resp = server_response_with_key(&output, &pk, hash_ivc_proof());
+    let resp = server_response_with_key(&output, &pk, &sk, hash_ivc_proof());
 
     let ct: CkksCiphertext = serde_json::from_slice(&resp.encrypted_output).unwrap();
     let decrypted = decrypt(&ct, &sk);
@@ -199,7 +200,7 @@ fn ciphertext_json_roundtrip() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![10, 20, 30, 40, 50];
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     let json = serde_json::to_string(&ct).unwrap();
     let ct2: CkksCiphertext = serde_json::from_str(&json).unwrap();
@@ -239,14 +240,14 @@ fn secret_key_serialization_roundtrip() {
 fn different_keys_different_ciphertexts() {
     let mut rng1 = StdRng::seed_from_u64(1);
     let mut rng2 = StdRng::seed_from_u64(2);
-    let (pk1, _) = keygen(&mut rng1);
-    let (pk2, _) = keygen(&mut rng2);
+    let (pk1, sk1) = keygen(&mut rng1);
+    let (pk2, sk2) = keygen(&mut rng2);
 
     let tokens = vec![42, 43, 44];
     let mut enc_rng = StdRng::seed_from_u64(100);
-    let ct1 = encrypt(&tokens, &pk1, &mut enc_rng);
+    let ct1 = encrypt(&tokens, &pk1, &sk1, &mut enc_rng);
     let mut enc_rng = StdRng::seed_from_u64(100);
-    let ct2 = encrypt(&tokens, &pk2, &mut enc_rng);
+    let ct2 = encrypt(&tokens, &pk2, &sk2, &mut enc_rng);
 
     // Different keys → different ciphertexts (even with same RNG seed for encryption)
     assert_ne!(ct1.chunks[0].0.coeffs, ct2.chunks[0].0.coeffs);
@@ -260,8 +261,8 @@ fn same_plaintext_different_randomness_different_ciphertext() {
     let tokens = vec![100, 200, 300];
     let mut rng1 = StdRng::seed_from_u64(1);
     let mut rng2 = StdRng::seed_from_u64(2);
-    let ct1 = encrypt(&tokens, &pk, &mut rng1);
-    let ct2 = encrypt(&tokens, &pk, &mut rng2);
+    let ct1 = encrypt(&tokens, &pk, &sk, &mut rng1);
+    let ct2 = encrypt(&tokens, &pk, &sk, &mut rng2);
 
     // Same plaintext, different randomness → different ciphertexts
     assert_ne!(ct1.chunks[0].0.coeffs, ct2.chunks[0].0.coeffs);
@@ -275,11 +276,11 @@ fn same_plaintext_different_randomness_different_ciphertext() {
 fn wrong_key_gives_wrong_decryption() {
     let mut rng1 = StdRng::seed_from_u64(1);
     let mut rng2 = StdRng::seed_from_u64(2);
-    let (pk1, _sk1) = keygen(&mut rng1);
+    let (pk1, sk1) = keygen(&mut rng1);
     let (_pk2, sk2) = keygen(&mut rng2);
 
     let tokens = vec![42, 43, 44];
-    let ct = encrypt(&tokens, &pk1, &mut rng1);
+    let ct = encrypt(&tokens, &pk1, &sk1, &mut rng1);
 
     // Decrypt with wrong key
     let wrong_decrypted = decrypt(&ct, &sk2);
@@ -311,7 +312,7 @@ fn large_sequence_1000_tokens() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let tokens: Vec<u32> = (0..1000).collect();
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // 1000 tokens, N=4096, so 1 chunk
     assert_eq!(ct.chunks.len(), 1);
@@ -324,7 +325,7 @@ fn large_sequence_5000_tokens_multi_chunk() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let tokens: Vec<u32> = (0..5000).collect();
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     // 5000 tokens, N=4096, so 2 chunks (4096 + 904)
     assert_eq!(ct.chunks.len(), 2);
@@ -341,7 +342,7 @@ fn single_token_max_value() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![u32::MAX];
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
     let decrypted = decrypt(&ct, &sk);
     assert_eq!(decrypted, tokens);
 }
@@ -351,7 +352,7 @@ fn single_token_zero() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![0];
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
     let decrypted = decrypt(&ct, &sk);
     assert_eq!(decrypted, tokens);
 }
@@ -361,7 +362,7 @@ fn all_same_tokens() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let tokens = vec![42; 100];
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
     let decrypted = decrypt(&ct, &sk);
     assert_eq!(decrypted, tokens);
 }
@@ -371,7 +372,7 @@ fn alternating_zero_max() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let tokens: Vec<u32> = (0..100).map(|i| if i % 2 == 0 { 0 } else { u32::MAX }).collect();
-    let ct = encrypt(&tokens, &pk, &mut rng);
+    let ct = encrypt(&tokens, &pk, &sk, &mut rng);
     let decrypted = decrypt(&ct, &sk);
     assert_eq!(decrypted, tokens);
 }

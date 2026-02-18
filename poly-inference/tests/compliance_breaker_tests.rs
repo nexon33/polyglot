@@ -80,24 +80,15 @@ fn attack_01_compliant_token_count_inflation() {
     // Does verify() catch this?
     let verified = proof.verify().unwrap();
 
-    // verify() check #4 is: compliant_tokens <= total_tokens. After our
-    // inflation compliant_tokens == total_tokens, so that check passes.
-    // The IVC chain itself does NOT commit the compliant_tokens count --
-    // it only commits the per-step verdicts into the state hash chain.
-    // So verify() alone does NOT catch pure count inflation.
-    if verified {
-        // The attack succeeds: verify() does not bind compliant_tokens
-        // into the cryptographic proof.
-        eprintln!(
-            "VULNERABILITY: compliant_tokens inflation bypasses verify(). \
-             The count is metadata-only and not committed into the IVC chain."
-        );
-        // We still assert the attack succeeds so the test is deterministic.
-        assert!(verified);
-    } else {
-        eprintln!("HARDENED: compliant_tokens inflation is caught by verify().");
-        assert!(!verified);
-    }
+    // HARDENED: compliant_tokens is now bound into the IVC output_hash.
+    // Tampering with compliant_tokens causes the recomputed output binding
+    // (H(final_state_hash || total_tokens || compliant_tokens)) to differ
+    // from what was committed during finalize(), so I/O verification fails.
+    assert!(
+        !verified,
+        "HARDENED: compliant_tokens inflation must be detected"
+    );
+    eprintln!("HARDENED: compliant_tokens inflation is caught by verify().");
 }
 
 // ===========================================================================
@@ -500,23 +491,15 @@ fn attack_08_blocked_token_counted_as_compliant() {
 
     let verified = proof.verify().unwrap();
 
-    // The IVC chain commits H(prev_state || token_id || verdict_byte) per step.
-    // The verdict byte (0=blocked, 1=allowed) is baked into the chain.
-    // However, compliant_tokens is NOT directly checked against the chain --
-    // verify() only checks compliant_tokens <= total_tokens.
-    if verified {
-        eprintln!(
-            "VULNERABILITY: blocked token counted as compliant bypasses verify(). \
-             compliant_tokens is not cryptographically bound to the per-step verdicts. \
-             A verifier must replay the token sequence to detect this."
-        );
-        // The attack succeeds because the IVC chain does not expose per-step
-        // verdict counts to the verifier -- only the chained state hash.
-        assert!(verified);
-    } else {
-        eprintln!("HARDENED: blocked token count inflation caught by verify().");
-        assert!(!verified);
-    }
+    // HARDENED: compliant_tokens is now bound into the IVC output_hash.
+    // Tampering compliant_tokens from 1 to 2 causes the recomputed output
+    // binding to differ from what was committed during finalize(), so the
+    // IVC I/O check fails.
+    assert!(
+        !verified,
+        "HARDENED: blocked token count inflation detected"
+    );
+    eprintln!("HARDENED: blocked token count inflation caught by verify().");
 }
 
 // ===========================================================================

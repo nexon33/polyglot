@@ -1,5 +1,5 @@
 use crate::crypto::chain::HashChain;
-use crate::crypto::hash::{hash_blinding, hash_combine, hash_transition};
+use crate::crypto::hash::{hash_blinding, hash_combine, hash_data, hash_transition};
 use crate::crypto::merkle::MerkleTree;
 use crate::error::{ProofSystemError, Result};
 use crate::ivc::IvcBackend;
@@ -90,8 +90,16 @@ impl IvcBackend for HashIvc {
             None
         };
 
+        // Bind code_hash and privacy_mode into chain_tip so they can't be swapped
+        let code_binding = hash_data(&accumulator.code_hash);
+        let mode_binding = hash_data(&[accumulator.privacy_mode as u8]);
+        let bound_tip = hash_combine(
+            &hash_combine(&accumulator.chain.tip, &code_binding),
+            &mode_binding,
+        );
+
         Ok(VerifiedProof::HashIvc {
-            chain_tip: accumulator.chain.tip,
+            chain_tip: bound_tip,
             merkle_root: tree.root,
             step_count: accumulator.chain.length,
             code_hash: accumulator.code_hash,
@@ -114,7 +122,7 @@ impl IvcBackend for HashIvc {
                 chain_tip,
                 merkle_root,
                 step_count,
-                code_hash: _,
+                code_hash,
                 privacy_mode,
                 blinding_commitment,
                 checkpoints,
@@ -131,12 +139,18 @@ impl IvcBackend for HashIvc {
                     return Ok(false);
                 }
 
-                // 3. Rebuild hash chain from checkpoints → verify chain_tip.
+                // 3. Rebuild hash chain from checkpoints, bind code_hash + privacy_mode → verify chain_tip.
                 let mut chain = HashChain::new();
                 for cp in checkpoints {
                     chain.append(cp);
                 }
-                if chain.tip != *chain_tip {
+                let code_binding = hash_data(code_hash);
+                let mode_binding = hash_data(&[*privacy_mode as u8]);
+                let expected_tip = hash_combine(
+                    &hash_combine(&chain.tip, &code_binding),
+                    &mode_binding,
+                );
+                if expected_tip != *chain_tip {
                     return Ok(false);
                 }
 
@@ -205,7 +219,6 @@ impl IvcBackend for HashIvc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::hash::hash_data;
 
     #[test]
     fn test_hash_ivc_roundtrip() {

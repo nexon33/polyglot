@@ -567,7 +567,7 @@ fn http_encrypted_roundtrip() {
     let server_pk: poly_client::ckks::CkksPublicKey =
         serde_json::from_slice(&server_pk_bytes).unwrap();
     let input_tokens: Vec<u32> = vec![100, 200, 300];
-    let input_ct = ckks.encrypt(&input_tokens, &server_pk);
+    let input_ct = ckks.encrypt(&input_tokens, &server_pk, &client_sk);
     let input_ct_hex = hex::encode(serde_json::to_vec(&input_ct).unwrap());
 
     let backend = MockInferenceBackend::default();

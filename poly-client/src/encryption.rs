@@ -24,7 +24,7 @@ pub trait EncryptionBackend {
     fn keygen(&self) -> (Self::PublicKey, Self::SecretKey);
 
     /// Encrypt token IDs for server-side inference.
-    fn encrypt(&self, token_ids: &[u32], pk: &Self::PublicKey) -> Self::Ciphertext;
+    fn encrypt(&self, token_ids: &[u32], pk: &Self::PublicKey, sk: &Self::SecretKey) -> Self::Ciphertext;
 
     /// Decrypt server's response back to token IDs.
     fn decrypt(&self, ciphertext: &Self::Ciphertext, sk: &Self::SecretKey) -> Vec<u32>;
@@ -56,7 +56,7 @@ impl EncryptionBackend for MockEncryption {
         ([0xAA; 32], [0xBB; 32])
     }
 
-    fn encrypt(&self, token_ids: &[u32], _pk: &Self::PublicKey) -> MockCiphertext {
+    fn encrypt(&self, token_ids: &[u32], _pk: &Self::PublicKey, _sk: &Self::SecretKey) -> MockCiphertext {
         MockCiphertext {
             tokens: token_ids.to_vec(),
         }
@@ -84,7 +84,7 @@ mod tests {
         let (pk, sk) = backend.keygen();
 
         let original = vec![100, 200, 300, 400, 500];
-        let ct = backend.encrypt(&original, &pk);
+        let ct = backend.encrypt(&original, &pk, &sk);
         let decrypted = backend.decrypt(&ct, &sk);
 
         assert_eq!(original, decrypted);
@@ -96,7 +96,7 @@ mod tests {
         let (pk, sk) = backend.keygen();
 
         let original: Vec<u32> = vec![];
-        let ct = backend.encrypt(&original, &pk);
+        let ct = backend.encrypt(&original, &pk, &sk);
         let decrypted = backend.decrypt(&ct, &sk);
 
         assert_eq!(original, decrypted);

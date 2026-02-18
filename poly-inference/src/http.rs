@@ -494,7 +494,7 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     let comp_proof = acc.finalize().expect("compliance finalize");
 
     // Re-encrypt output token IDs with client's CKKS public key
-    let output_ckks_ct = ckks.encrypt(&output_tokens, &client_pk);
+    let output_ckks_ct = ckks.encrypt(&output_tokens, &client_pk, server_sk);
     let output_ct_bytes = serde_json::to_vec(&output_ckks_ct).unwrap();
     let encrypted_output_hex = hex::encode(&output_ct_bytes);
 

@@ -158,7 +158,7 @@ fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, 
     let ckks = CkksEncryption;
     let (client_pk, client_sk) = ckks.keygen();
     let client_pk_hex = hex::encode(serde_json::to_vec(&client_pk).unwrap());
-    let input_ct = ckks.encrypt(&token_ids, &server_pk);
+    let input_ct = ckks.encrypt(&token_ids, &server_pk, &client_sk);
     let input_ct_hex = hex::encode(serde_json::to_vec(&input_ct).unwrap());
     eprintln!(" done ({:.0}ms, {} KB ciphertext)", t.elapsed().as_millis(), input_ct_hex.len() / 2048);
 

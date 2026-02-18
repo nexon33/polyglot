@@ -87,7 +87,7 @@ impl<E: EncryptionBackend> PolyClient<E> {
         temperature: u32,
         seed: u64,
     ) -> InferRequest {
-        let ct = self.encryption.encrypt(token_ids, &self.public_key);
+        let ct = self.encryption.encrypt(token_ids, &self.public_key, &self.secret_key);
         let encrypted_input = serde_json::to_vec(&ct).unwrap_or_default();
 
         InferRequest {
