@@ -248,6 +248,34 @@ fn main() {
     eprintln!(" done ({:.0}ms, N=4096, {} primes)", keygen_ms, num_primes);
     eprintln!();
 
+    // Compression stats + entropy validation for key material
+    {
+        use poly_client::ckks::compress;
+        let sample_input = replicate_vector(&vec![1.0f64; d], d);
+        let sample_ct = rns_encrypt_simd(&sample_input, &keys.pk_b, &keys.pk_a, &ctx, &mut rng);
+        let ct_stats = compress::compression_stats(&sample_ct);
+        let ek_stats = compress::compression_stats(&keys.eval_key);
+        let rk_stats = compress::compression_stats(&keys.rotation_keys);
+        eprintln!("  [B1+] Wire compression (bincode + zstd, PFHE format):");
+        eprintln!("           Ciphertext:    {}", ct_stats);
+        eprintln!("           Eval key:      {}", ek_stats);
+        eprintln!("           Rotation keys: {}", rk_stats);
+
+        // Entropy validation: compression ratio as continuous IND-CPA monitor
+        let ct_entropy = compress::entropy_check(&sample_ct);
+        let ek_entropy = compress::entropy_check(&keys.eval_key);
+        let rk_entropy = compress::entropy_check(&keys.rotation_keys);
+        eprintln!("  [B1+] Entropy validation (compression-as-IND-CPA):");
+        eprintln!("           Ciphertext:    {}", ct_entropy);
+        eprintln!("           Eval key:      {}", ek_entropy);
+        eprintln!("           Rotation keys: {}", rk_entropy);
+        if !ct_entropy.pass || !ek_entropy.pass || !rk_entropy.pass {
+            eprintln!("  *** WARNING: Anomalous ciphertext compressibility detected!");
+            eprintln!("  *** This may indicate an IND-CPA violation — ciphertext has structure.");
+        }
+        eprintln!();
+    }
+
     // [B1.5] Compliance gate setup
     let policy = default_policy();
     let client_checker = PolicyChecker::new(policy.clone());

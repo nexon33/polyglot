@@ -13,10 +13,12 @@
 //!   poly-client-cli --mode transparent "What is AI?"
 //!   poly-client-cli --mode encrypted "Patient medical record summary"
 
+use std::io::Read;
 use std::time::Instant;
 
 use poly_client::ckks::{CkksCiphertext, CkksEncryption, CkksPublicKey};
 use poly_client::encryption::EncryptionBackend;
+use poly_inference::http;
 use poly_inference::model;
 
 fn main() {
@@ -144,63 +146,65 @@ fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, 
     let token_ids = model::tokenize(prompt).expect("tokenization failed");
     eprintln!("[2/7] Tokenized: {} tokens", token_ids.len());
 
-    // [3] Fetch server's CKKS public key
+    // [3] Fetch server's CKKS public key (PFHE-compressed binary)
     eprint!("[3/7] Fetching server public key...");
     let t = Instant::now();
+    use poly_client::ckks::compress;
     let mut resp = ureq::get(&format!("{}/pubkey", server))
         .call()
         .expect("GET /pubkey failed — is the server running?");
-    let body = resp.body_mut().read_to_string().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let server_pk_hex = parsed["public_key"].as_str().unwrap();
-    let server_pk_bytes = hex::decode(server_pk_hex).unwrap();
-    let server_pk: CkksPublicKey = serde_json::from_slice(&server_pk_bytes).unwrap();
-    eprintln!(" done ({:.0}ms, {} KB key)", t.elapsed().as_millis(), server_pk_bytes.len() / 1024);
+    let mut pk_bytes = Vec::new();
+    resp.body_mut().as_reader().read_to_end(&mut pk_bytes).unwrap();
+    let server_pk: CkksPublicKey = compress::decompress(&pk_bytes)
+        .expect("decompress server public key");
+    eprintln!(" done ({:.0}ms, {} KB compressed)", t.elapsed().as_millis(), pk_bytes.len() / 1024);
 
     // [4] Generate client key pair + encrypt prompt
     eprint!("[4/7] Encrypting prompt with CKKS...");
     let t = Instant::now();
     let ckks = CkksEncryption;
     let (client_pk, client_sk) = ckks.keygen();
-    let client_pk_hex = hex::encode(serde_json::to_vec(&client_pk).unwrap());
+    let client_pk_compressed = compress::compress(&client_pk).expect("compress client pk");
     let input_ct = ckks.encrypt(&token_ids, &server_pk, &client_sk);
-    let input_ct_hex = hex::encode(serde_json::to_vec(&input_ct).unwrap());
-    eprintln!(" done ({:.0}ms, {} KB ciphertext)", t.elapsed().as_millis(), input_ct_hex.len() / 2048);
+    let input_ct_compressed = compress::compress(&input_ct).expect("compress input ct");
+    eprintln!(" done ({:.0}ms, {} KB ciphertext)", t.elapsed().as_millis(), input_ct_compressed.len() / 1024);
 
-    // [5] Send encrypted request
+    // [5] Send encrypted request (PFHE-compressed binary, no JSON)
     eprint!("[5/7] Sending encrypted request...");
     let t = Instant::now();
-    let req_body = serde_json::json!({
-        "encrypted_input": input_ct_hex,
-        "client_public_key": client_pk_hex,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "seed": seed,
-    });
+    let req = crate::http::EncryptedGenerateRequest {
+        encrypted_input: input_ct_compressed,
+        client_public_key: client_pk_compressed,
+        max_tokens,
+        temperature,
+        seed,
+    };
+    let req_body = compress::compress(&req).expect("compress request");
 
     let mut resp = ureq::post(&format!("{}/generate/encrypted", server))
-        .content_type("application/json")
-        .send(&serde_json::to_string(&req_body).unwrap())
+        .content_type("application/x-pfhe")
+        .send(&req_body)
         .expect("POST /generate/encrypted failed");
 
-    let resp_body = resp.body_mut().read_to_string().unwrap();
+    let mut resp_bytes = Vec::new();
+    resp.body_mut().as_reader().read_to_end(&mut resp_bytes).unwrap();
     let inference_time = t.elapsed();
-    eprintln!(" done ({:.3}s)", inference_time.as_secs_f64());
+    eprintln!(" done ({:.3}s, {} KB response)", inference_time.as_secs_f64(), resp_bytes.len() / 1024);
 
-    let resp_json: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
+    let resp_data: crate::http::EncryptedGenerateResponse =
+        compress::decompress(&resp_bytes).expect("decompress response");
 
     // [6] Decrypt response
     eprint!("[6/7] Decrypting response...");
     let t = Instant::now();
-    let output_ct_hex = resp_json["encrypted_output"].as_str().unwrap();
-    let output_ct_bytes = hex::decode(output_ct_hex).unwrap();
-    let output_ct: CkksCiphertext = serde_json::from_slice(&output_ct_bytes).unwrap();
+    let output_ct: CkksCiphertext = compress::decompress(&resp_data.encrypted_output)
+        .expect("decompress output ciphertext");
     let output_tokens = ckks.decrypt(&output_ct, &client_sk);
     let text = model::decode(&output_tokens);
     let completion = model::decode(&output_tokens[token_ids.len()..]);
     eprintln!(" done ({:.0}ms)", t.elapsed().as_millis());
 
-    let generated = resp_json["generated_tokens"].as_u64().unwrap();
+    let generated = resp_data.generated_tokens;
     let tok_s = generated as f64 / inference_time.as_secs_f64();
 
     // [7] Display results
@@ -214,29 +218,32 @@ fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, 
     eprintln!();
 
     // Proof info
-    let proof = &resp_json["proof"];
+    let proof = &resp_data.proof;
     eprintln!("  Proof:");
-    eprintln!("    Privacy:   {} (ZK)", proof["privacy_mode"].as_str().unwrap_or("?"));
-    eprintln!("    Verified:  {}", proof["verified"]);
-    if let Some(bc) = proof["blinding_commitment"].as_str() {
-        eprintln!("    Blinding:  {}...{}", &bc[..12], &bc[bc.len()-8..]);
+    eprintln!("    Privacy:   {} (ZK)", proof.privacy_mode);
+    eprintln!("    Verified:  {}", proof.verified);
+    if let Some(ref bc) = proof.blinding_commitment {
+        if bc.len() > 20 {
+            eprintln!("    Blinding:  {}...{}", &bc[..12], &bc[bc.len()-8..]);
+        }
     }
-    eprintln!("    Code hash: {}", proof["code_hash"].as_str().unwrap_or("?"));
+    eprintln!("    Code hash: {}", proof.code_hash);
     eprintln!();
 
     // Compliance info
-    let comp = &resp_json["compliance"];
+    let comp = &resp_data.compliance;
     eprintln!("  Compliance:");
-    eprintln!("    Verified:  {}", comp["verified"]);
-    eprintln!("    Compliant: {}/{}", comp["compliant_tokens"], comp["total_tokens"]);
-    eprintln!("    Policy:    v{}", comp["policy_version"]);
+    eprintln!("    Verified:  {}", comp.verified);
+    eprintln!("    Compliant: {}/{}", comp.compliant_tokens, comp.total_tokens);
+    eprintln!("    Policy:    v{}", comp.policy_version);
     eprintln!();
 
     // Encryption stats
+    let ct_stats = compress::compression_stats(&input_ct);
     eprintln!("  Encryption:");
     eprintln!("    Scheme:    CKKS (Ring-LWE, N=4096, ~128-bit security)");
-    eprintln!("    Input:     {} KB ciphertext", input_ct_hex.len() / 2048);
-    eprintln!("    Output:    {} KB ciphertext", output_ct_hex.len() / 2048);
+    eprintln!("    Input:     {}", ct_stats);
+    eprintln!("    Output:    {} KB compressed", resp_data.encrypted_output.len() / 1024);
     eprintln!("    Wire:      Plaintext tokens NEVER appeared in request or response");
     eprintln!();
 

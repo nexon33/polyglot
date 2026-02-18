@@ -30,6 +30,7 @@ pub mod rns_fhe_layer;
 pub mod simd;
 pub mod poly;
 pub mod sampling;
+pub mod compress;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 

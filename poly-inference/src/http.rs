@@ -78,7 +78,7 @@ pub struct GenerateResponse {
 }
 
 /// Execution proof summary.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProofSummary {
     pub backend: String,
     pub privacy_mode: String,
@@ -95,7 +95,7 @@ pub struct ProofSummary {
 }
 
 /// Compliance proof summary in the response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ComplianceSummary {
     pub verified: bool,
     pub total_tokens: u64,
@@ -110,54 +110,34 @@ pub struct ComplianceSummary {
 
 // ─── Encrypted batch request/response types ─────────────────────────────
 
-/// Encrypted generation request. Token IDs encrypted with CKKS.
+/// Binary request for encrypted generation.
 ///
-/// The client encrypts their token IDs with the server's CKKS public key,
-/// and provides their own public key so the server can encrypt the response.
-///
-/// ```json
-/// {
-///   "encrypted_input": "<hex-encoded CkksCiphertext>",
-///   "client_public_key": "<hex-encoded CkksPublicKey>",
-///   "max_tokens": 50,
-///   "temperature": 700,
-///   "seed": 42
-/// }
-/// ```
-#[derive(Debug, Deserialize)]
+/// The entire request body is PFHE-compressed (bincode + zstd).
+/// Ciphertext and public key are nested PFHE-compressed blobs.
+/// No JSON, no hex, no base64 — raw binary throughout.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EncryptedGenerateRequest {
-    /// Hex-encoded serialized `CkksCiphertext` containing encrypted token IDs.
-    pub encrypted_input: String,
-    /// Hex-encoded serialized `CkksPublicKey` for encrypting the response.
-    pub client_public_key: String,
-    #[serde(default = "default_max_tokens")]
+    /// PFHE-compressed `CkksCiphertext`.
+    pub encrypted_input: Vec<u8>,
+    /// PFHE-compressed `CkksPublicKey`.
+    pub client_public_key: Vec<u8>,
     pub max_tokens: u32,
-    #[serde(default = "default_temperature")]
     pub temperature: u32,
-    #[serde(default = "default_seed")]
     pub seed: u64,
 }
 
-/// Encrypted generation response. Output tokens encrypted with client's CKKS key.
-#[derive(Debug, Serialize)]
+/// Binary response for encrypted generation.
+///
+/// The entire response body is PFHE-compressed (bincode + zstd).
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EncryptedGenerateResponse {
-    /// Hex-encoded serialized `CkksCiphertext` containing encrypted output token IDs.
-    pub encrypted_output: String,
-    /// Number of new tokens generated.
+    /// PFHE-compressed `CkksCiphertext`.
+    pub encrypted_output: Vec<u8>,
     pub generated_tokens: usize,
-    /// Total tokens (prompt + generated).
     pub total_tokens: usize,
-    /// Execution proof (always private/ZK for encrypted mode).
+    /// JSON-compatible proof metadata (serialized inline via bincode).
     pub proof: ProofSummary,
-    /// Compliance proof summary.
     pub compliance: ComplianceSummary,
-}
-
-/// Server's CKKS public key (returned by GET /pubkey).
-#[derive(Debug, Serialize)]
-pub struct ServerPublicKey {
-    /// Hex-encoded serialized `CkksPublicKey`.
-    pub public_key: String,
 }
 
 // ─── HTTP Server ─────────────────────────────────────────────────────────
@@ -229,14 +209,15 @@ fn handle_request<B: InferenceBackend>(
     let json_header =
         Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
 
-    // GET /pubkey returns the server's CKKS public key
+    // GET /pubkey returns the server's CKKS public key (PFHE-compressed binary)
     if request.url() == "/pubkey" {
-        let pk_hex = hex::encode(serde_json::to_vec(server_pk).unwrap());
-        let resp = ServerPublicKey { public_key: pk_hex };
-        let body = serde_json::to_vec(&resp).unwrap();
+        use poly_client::ckks::compress;
+        let body = compress::compress(server_pk).expect("compress server pubkey");
+        let binary_header =
+            Header::from_bytes(&b"Content-Type"[..], &b"application/x-pfhe"[..]).unwrap();
         return Response::new(
             StatusCode(200),
-            vec![json_header],
+            vec![binary_header],
             std::io::Cursor::new(body),
             None,
             None,
@@ -414,32 +395,26 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     server_sk: &CkksSecretKey,
     json_header: Header,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
+    use poly_client::ckks::compress;
+
     let body = match read_body(request) {
         Ok(b) => b,
         Err(e) => return json_error(400, &format!("read error: {e}"), json_header),
     };
 
-    let req: EncryptedGenerateRequest = match serde_json::from_slice(&body) {
+    // Entire body is PFHE-compressed (bincode + zstd)
+    let req: EncryptedGenerateRequest = match compress::decompress(&body) {
         Ok(r) => r,
-        Err(e) => return json_error(400, &format!("invalid JSON: {e}"), json_header),
+        Err(e) => return json_error(400, &format!("invalid PFHE payload: {e}"), json_header),
     };
 
-    // Decode hex → bytes → deserialize CKKS ciphertext
-    let ct_bytes = match hex::decode(&req.encrypted_input) {
-        Ok(b) => b,
-        Err(e) => return json_error(400, &format!("invalid hex in encrypted_input: {e}"), json_header),
-    };
-    let input_ct: CkksCiphertext = match serde_json::from_slice(&ct_bytes) {
+    // Nested PFHE-compressed ciphertext and public key
+    let input_ct: CkksCiphertext = match compress::decompress(&req.encrypted_input) {
         Ok(ct) => ct,
         Err(e) => return json_error(400, &format!("invalid CkksCiphertext: {e}"), json_header),
     };
 
-    // Decode client's public key (for encrypting the response)
-    let client_pk_bytes = match hex::decode(&req.client_public_key) {
-        Ok(b) => b,
-        Err(e) => return json_error(400, &format!("invalid hex in client_public_key: {e}"), json_header),
-    };
-    let client_pk: CkksPublicKey = match serde_json::from_slice(&client_pk_bytes) {
+    let client_pk: CkksPublicKey = match compress::decompress(&req.client_public_key) {
         Ok(pk) => pk,
         Err(e) => return json_error(400, &format!("invalid CkksPublicKey: {e}"), json_header),
     };
@@ -493,10 +468,10 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     }
     let comp_proof = acc.finalize().expect("compliance finalize");
 
-    // Re-encrypt output token IDs with client's CKKS public key
+    // Re-encrypt output token IDs with client's CKKS public key, then compress
     let output_ckks_ct = ckks.encrypt(&output_tokens, &client_pk, server_sk);
-    let output_ct_bytes = serde_json::to_vec(&output_ckks_ct).unwrap();
-    let encrypted_output_hex = hex::encode(&output_ct_bytes);
+    let encrypted_output = compress::compress(&output_ckks_ct)
+        .expect("compress output ciphertext");
 
     // Build proof summary with I/O binding
     let proof_summary = proof_to_summary(
@@ -522,7 +497,7 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     };
 
     let resp = EncryptedGenerateResponse {
-        encrypted_output: encrypted_output_hex,
+        encrypted_output,
         generated_tokens,
         total_tokens: output_tokens.len(),
         proof: proof_summary,
@@ -539,10 +514,13 @@ fn handle_generate_encrypted<B: InferenceBackend>(
         },
     };
 
-    let response_body = serde_json::to_vec(&resp).unwrap();
+    // Entire response is PFHE-compressed binary
+    let binary_header =
+        Header::from_bytes(&b"Content-Type"[..], &b"application/x-pfhe"[..]).unwrap();
+    let response_body = compress::compress(&resp).expect("compress response");
     Response::new(
         StatusCode(200),
-        vec![json_header],
+        vec![binary_header],
         std::io::Cursor::new(response_body),
         None,
         None,
