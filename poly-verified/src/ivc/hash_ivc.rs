@@ -3,7 +3,7 @@ use crate::crypto::hash::{hash_blinding, hash_combine, hash_data, hash_transitio
 use crate::crypto::merkle::MerkleTree;
 use crate::error::{ProofSystemError, Result};
 use crate::ivc::IvcBackend;
-use crate::types::{Hash, PrivacyMode, StepWitness, VerifiedProof, ZERO_HASH};
+use crate::types::{hash_eq, Hash, PrivacyMode, StepWitness, VerifiedProof, ZERO_HASH};
 
 /// Hash-chain based Incrementally Verifiable Computation.
 ///
@@ -150,29 +150,29 @@ impl IvcBackend for HashIvc {
                     &hash_combine(&chain.tip, &code_binding),
                     &mode_binding,
                 );
-                if expected_tip != *chain_tip {
+                if !hash_eq(&expected_tip, chain_tip) {
                     return Ok(false);
                 }
 
                 // 4. Rebuild Merkle tree from checkpoints → verify merkle_root.
                 let tree = MerkleTree::build(checkpoints);
-                if tree.root != *merkle_root {
+                if !hash_eq(&tree.root, merkle_root) {
                     return Ok(false);
                 }
 
-                // 5. I/O hash verification (privacy-aware).
+                // 5. I/O hash verification (privacy-aware, constant-time).
                 match privacy_mode {
                     PrivacyMode::Transparent => {
-                        if input_hash != expected_input {
+                        if !hash_eq(input_hash, expected_input) {
                             return Ok(false);
                         }
-                        if output_hash != expected_output {
+                        if !hash_eq(output_hash, expected_output) {
                             return Ok(false);
                         }
                     }
                     PrivacyMode::PrivateInputs => {
                         // Inputs hidden, but output must match.
-                        if output_hash != expected_output {
+                        if !hash_eq(output_hash, expected_output) {
                             return Ok(false);
                         }
                     }
@@ -195,8 +195,9 @@ impl IvcBackend for HashIvc {
                         let blinding = hash_blinding(&blinding_input);
                         expected_blinding = hash_combine(&expected_blinding, &blinding);
                     }
-                    if *blinding_commitment != Some(expected_blinding) {
-                        return Ok(false);
+                    match blinding_commitment {
+                        Some(bc) if hash_eq(bc, &expected_blinding) => {}
+                        _ => return Ok(false),
                     }
                 } else if blinding_commitment.is_some() {
                     // Transparent mode shouldn't have a blinding commitment.

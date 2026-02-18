@@ -9,6 +9,8 @@
 //! - Bincode deserialization limits
 //! - Version mismatch rejection
 //! - Wrong-direction message rejection
+//! - Stale Hello timestamps (>5 min drift rejected)
+//! - Client-side HelloAck signature verification
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +34,9 @@ const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum size for a serialized Hello message (64 KB).
 const MAX_HELLO_SIZE: u64 = 64 * 1024;
+
+/// Maximum acceptable Hello timestamp drift (5 minutes).
+const MAX_HELLO_TIMESTAMP_DRIFT_SECS: u64 = 300;
 
 /// A running Poly Network compute node.
 pub struct PolyNode {
@@ -198,7 +203,14 @@ async fn handle_stream(
     let (frame, _) = Frame::decode(&data).map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let response_frame = match frame.msg_type {
-        MessageType::Ping => Frame::new(MessageType::Pong, vec![]),
+        MessageType::Ping => {
+            // Allow Ping only after successful handshake
+            if !handshake_done.load(std::sync::atomic::Ordering::Acquire) {
+                warn!("Rejected Ping: handshake not completed");
+                return Ok(());
+            }
+            Frame::new(MessageType::Pong, vec![])
+        }
 
         MessageType::Hello => {
             // Size-limited bincode deserialization
@@ -243,6 +255,23 @@ async fn handle_stream(
                     let _ = expected_id; // NodeId binding reserved for Phase 2 routing
                 } else {
                     warn!("Rejecting Hello: invalid public key");
+                    accepted = false;
+                }
+            }
+
+            // Check timestamp freshness — reject stale Hellos (replay defense)
+            if accepted {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let ts = hello.node_info.timestamp;
+                let drift = if now > ts { now - ts } else { ts - now };
+                if drift > MAX_HELLO_TIMESTAMP_DRIFT_SECS {
+                    warn!(
+                        "Rejecting Hello: timestamp too stale (drift {}s, max {}s)",
+                        drift, MAX_HELLO_TIMESTAMP_DRIFT_SECS
+                    );
                     accepted = false;
                 }
             }
@@ -362,6 +391,25 @@ pub async fn connect_and_infer(
         let ack: handshake::HelloAck = bincode::deserialize(&ack_frame.payload)?;
         if !ack.accepted {
             anyhow::bail!("handshake rejected by server");
+        }
+        // Verify server's Ed25519 signature on its NodeInfo
+        let server_pk = ack.node_info.public_key;
+        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&server_pk) {
+            let sig_bytes = &ack.node_info.signature;
+            if sig_bytes.len() == 64 {
+                let mut sig_arr = [0u8; 64];
+                sig_arr.copy_from_slice(sig_bytes);
+                let mut msg = Vec::new();
+                msg.extend_from_slice(&server_pk);
+                msg.extend_from_slice(&ack.node_info.timestamp.to_le_bytes());
+                if !crate::identity::verify_signature(&vk, &msg, &sig_arr) {
+                    anyhow::bail!("server HelloAck has invalid Ed25519 signature");
+                }
+            } else {
+                anyhow::bail!("server HelloAck signature wrong length");
+            }
+        } else {
+            anyhow::bail!("server HelloAck has invalid public key");
         }
     }
 

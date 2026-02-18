@@ -3,7 +3,7 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use crate::crypto::chain::HashChain;
 use crate::error::{ProofSystemError, Result};
 use crate::crypto::merkle::MerkleTree;
-use crate::types::{Commitment, Hash, SignedCommitment};
+use crate::types::{hash_eq, Commitment, Hash, SignedCommitment};
 
 /// Build a Commitment from an ordered sequence of checkpoint hashes.
 ///
@@ -56,7 +56,7 @@ pub fn verify_chain_tip(commitment: &Commitment, checkpoints: &[Hash]) -> bool {
     for cp in checkpoints {
         chain.append(cp);
     }
-    chain.tip == commitment.chain_tip
+    hash_eq(&chain.tip, &commitment.chain_tip)
 }
 
 /// Verify a SignedCommitment's Ed25519 signature.

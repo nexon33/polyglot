@@ -32,18 +32,20 @@ fn tokens_hash(tokens: &[u32]) -> Hash {
     hasher.finalize().into()
 }
 
-fn mock_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
-    VerifiedProof::HashIvc {
-        chain_tip: [0x01; 32],
-        merkle_root: [0x02; 32],
-        step_count: 1,
-        code_hash: [0x03; 32],
-        privacy_mode: PrivacyMode::Transparent,
-        blinding_commitment: None,
-        checkpoints: vec![],
-        input_hash: ZERO_HASH,
-        output_hash: tokens_hash(tokens),
-    }
+/// Build a valid HashIvc proof whose output_hash matches the given tokens.
+fn valid_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
+    let ivc = HashIvc;
+    let code_hash = [0x03; 32];
+    let mut acc = ivc.init(&code_hash, PrivacyMode::Transparent);
+    let witness = StepWitness {
+        state_before: hash_data(b"before"),
+        state_after: hash_data(b"after"),
+        step_inputs: hash_data(b"inputs"),
+    };
+    ivc.fold_step(&mut acc, &witness).unwrap();
+    acc.input_hash = ZERO_HASH;
+    acc.output_hash = tokens_hash(tokens);
+    ivc.finalize(acc).unwrap()
 }
 
 fn sample_tokens() -> Vec<u32> {
@@ -51,7 +53,7 @@ fn sample_tokens() -> Vec<u32> {
 }
 
 fn make_verified(tokens: Vec<u32>) -> Verified<Vec<u32>> {
-    let proof = mock_hash_ivc_proof_for_tokens(&tokens);
+    let proof = valid_hash_ivc_proof_for_tokens(&tokens);
     Verified::__macro_new(tokens, proof)
 }
 

@@ -69,6 +69,15 @@ pub enum ChainError {
     #[error("invalid timestamp: outside acceptable drift window")]
     InvalidTimestamp,
 
+    #[error("block height overflow")]
+    BlockHeightOverflow,
+
+    #[error("invalid swap ID derivation")]
+    InvalidSwapId,
+
+    #[error("unauthorized STP action: {0}")]
+    UnauthorizedSTPAction(String),
+
     #[error("proof system error: {0}")]
     ProofSystem(#[from] poly_verified::error::ProofSystemError),
 }

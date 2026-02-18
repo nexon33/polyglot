@@ -88,7 +88,8 @@ impl<E: EncryptionBackend> PolyClient<E> {
         seed: u64,
     ) -> InferRequest {
         let ct = self.encryption.encrypt(token_ids, &self.public_key, &self.secret_key);
-        let encrypted_input = serde_json::to_vec(&ct).unwrap_or_default();
+        let encrypted_input = serde_json::to_vec(&ct)
+            .expect("encryption backend produced unserializable ciphertext");
 
         InferRequest {
             model_id: self.model_id.clone(),
@@ -161,8 +162,11 @@ impl VerifiedResponse {
 mod tests {
     use super::*;
     use crate::encryption::{MockCiphertext, MockEncryption};
+    use poly_verified::crypto::hash::hash_data;
     use poly_verified::disclosure::verify_disclosure;
-    use poly_verified::types::{PrivacyMode, VerifiedProof};
+    use poly_verified::ivc::hash_ivc::HashIvc;
+    use poly_verified::ivc::IvcBackend;
+    use poly_verified::types::{PrivacyMode, StepWitness, VerifiedProof, ZERO_HASH};
     use sha2::{Digest, Sha256};
 
     /// SHA-256 of raw token bytes — matches disclosure's output_binding computation.
@@ -174,18 +178,20 @@ mod tests {
         hasher.finalize().into()
     }
 
-    fn mock_hash_ivc_proof_for_tokens(token_ids: &[u32]) -> VerifiedProof {
-        VerifiedProof::HashIvc {
-            chain_tip: [0x01; 32],
-            merkle_root: [0x02; 32],
-            step_count: 1,
-            code_hash: [0x03; 32],
-            privacy_mode: PrivacyMode::Transparent,
-            blinding_commitment: None,
-            checkpoints: vec![[0x04; 32]],
-            input_hash: [0u8; 32],
-            output_hash: tokens_hash(token_ids),
-        }
+    /// Build a valid HashIvc proof whose output_hash matches the given tokens.
+    fn valid_hash_ivc_proof_for_tokens(token_ids: &[u32]) -> VerifiedProof {
+        let ivc = HashIvc;
+        let code_hash = [0x03; 32];
+        let mut acc = ivc.init(&code_hash, PrivacyMode::Transparent);
+        let witness = StepWitness {
+            state_before: hash_data(b"before"),
+            state_after: hash_data(b"after"),
+            step_inputs: hash_data(b"inputs"),
+        };
+        ivc.fold_step(&mut acc, &witness).unwrap();
+        acc.input_hash = ZERO_HASH;
+        acc.output_hash = tokens_hash(token_ids);
+        ivc.finalize(acc).unwrap()
     }
 
     fn mock_server_response(token_ids: &[u32]) -> InferResponse {
@@ -194,7 +200,7 @@ mod tests {
         };
         InferResponse {
             encrypted_output: serde_json::to_vec(&ct).unwrap(),
-            proof: mock_hash_ivc_proof_for_tokens(token_ids),
+            proof: valid_hash_ivc_proof_for_tokens(token_ids),
             model_id: "Qwen/Qwen3-0.6B".into(),
         }
     }

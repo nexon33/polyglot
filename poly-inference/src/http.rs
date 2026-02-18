@@ -31,6 +31,11 @@ use poly_verified::types::VerifiedProof;
 /// Maximum allowed value for `max_tokens` in any request.
 const MAX_ALLOWED_TOKENS: u32 = 4096;
 
+/// Maximum allowed size of `encrypted_input` field in bytes (~1 MB).
+/// This bounds the token count to roughly 8192 encrypted tokens, preventing
+/// memory exhaustion from oversized payloads.
+const MAX_ENCRYPTED_INPUT_SIZE: usize = 1_048_576;
+
 // ─── Simple batch request/response types ─────────────────────────────────
 
 /// Simple generation request. Prompt, parameters, and optional privacy mode.
@@ -269,6 +274,24 @@ fn handle_infer<B: InferenceBackend>(
         return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
     }
 
+    // Validate temperature
+    if let Err(msg) = crate::inference::validate_temperature(infer_request.temperature) {
+        return json_error(400, msg, json_header);
+    }
+
+    // Validate encrypted_input size (max 1 MB / ~8192 encrypted tokens)
+    if infer_request.encrypted_input.len() > MAX_ENCRYPTED_INPUT_SIZE {
+        return json_error(
+            400,
+            &format!(
+                "encrypted_input too large: {} bytes (max {})",
+                infer_request.encrypted_input.len(),
+                MAX_ENCRYPTED_INPUT_SIZE
+            ),
+            json_header,
+        );
+    }
+
     match backend.infer(&infer_request) {
         Ok(response) => {
             let response_body = serde_json::to_vec(&response).unwrap();
@@ -314,9 +337,10 @@ fn handle_generate(
         return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
     }
 
-    // Validate temperature (must be > 0; 0 would cause division issues in sampling)
-    if req.temperature == 0 {
-        return json_error(400, "temperature must be > 0 (use 1 for near-greedy decoding)", json_header);
+    // Validate temperature (must be in 1..=2000; 0 causes divide-by-zero, high values
+    // produce degenerate sampling distributions)
+    if let Err(msg) = crate::inference::validate_temperature(req.temperature) {
+        return json_error(400, msg, json_header);
     }
 
     // Validate mode
@@ -373,16 +397,17 @@ fn handle_generate(
         (tokens, comp_proof.ivc_proof.clone(), comp_proof)
     };
 
-    // Decode
+    // Decode — use saturating_sub to prevent underflow if backend returns fewer tokens
     let text = crate::model::decode(&output_tokens);
-    let completion = crate::model::decode(&output_tokens[prompt_len..]);
-    let generated_tokens = output_tokens.len() - prompt_len;
+    let safe_prompt_len = prompt_len.min(output_tokens.len());
+    let completion = crate::model::decode(&output_tokens[safe_prompt_len..]);
+    let generated_tokens = output_tokens.len().saturating_sub(prompt_len);
 
     // Build execution proof summary with I/O binding
     let proof_summary = proof_to_summary(
         &exec_proof,
         &token_ids,
-        &output_tokens[prompt_len..],
+        &output_tokens[safe_prompt_len..],
     );
 
     // Build compliance summary
@@ -463,6 +488,24 @@ fn handle_generate_encrypted<B: InferenceBackend>(
         return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
     }
 
+    // Validate temperature
+    if let Err(msg) = crate::inference::validate_temperature(req.temperature) {
+        return json_error(400, msg, json_header);
+    }
+
+    // Validate encrypted_input size
+    if req.encrypted_input.len() > MAX_ENCRYPTED_INPUT_SIZE {
+        return json_error(
+            400,
+            &format!(
+                "encrypted_input too large: {} bytes (max {})",
+                req.encrypted_input.len(),
+                MAX_ENCRYPTED_INPUT_SIZE
+            ),
+            json_header,
+        );
+    }
+
     // Nested PFHE-compressed ciphertext and public key
     let input_ct: CkksCiphertext = match compress::decompress(&req.encrypted_input) {
         Ok(ct) => ct,
@@ -530,13 +573,14 @@ fn handle_generate_encrypted<B: InferenceBackend>(
         };
     let output_tokens = output_ct.tokens;
     let exec_proof = infer_response.proof;
-    let generated_tokens = output_tokens.len() - prompt_len;
+    let safe_enc_prompt_len = prompt_len.min(output_tokens.len());
+    let generated_tokens = output_tokens.len().saturating_sub(prompt_len);
 
     // Post-hoc compliance attestation (the ComplianceInferenceBackend already
     // enforced per-token compliance in-loop via generate_compliant())
     let checker = crate::compliance::PolicyChecker::new(policy.clone());
     let mut acc = crate::compliance_proof::ComplianceAccumulator::new(checker);
-    for &token in &output_tokens[prompt_len..] {
+    for &token in &output_tokens[safe_enc_prompt_len..] {
         let _ = acc.check_and_fold(token);
     }
     let comp_proof = acc.finalize().expect("compliance finalize");
@@ -550,7 +594,7 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     let proof_summary = proof_to_summary(
         &exec_proof,
         &token_ids,
-        &output_tokens[prompt_len..],
+        &output_tokens[safe_enc_prompt_len..],
     );
 
     // Build compliance summary

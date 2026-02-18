@@ -254,6 +254,17 @@ impl WideInt {
             result[i] = prod as u64;
             carry = prod >> 64;
         }
+        // If carry remains, extend the result to avoid silent overflow.
+        if carry != 0 {
+            result.push(carry as u64);
+            if carry >> 64 != 0 {
+                result.push((carry >> 64) as u64);
+            }
+        }
+        debug_assert!(
+            carry >> 64 == 0 || result.len() > n + 1,
+            "WideInt::mul_u64 carry overflow: carry={carry:#x}"
+        );
         Self { limbs: result }
     }
 
@@ -277,11 +288,28 @@ impl WideInt {
         }
         let n = self.limbs.len();
         let mut result = vec![0u64; n];
+
+        // Handle shifts >= 64 by first shifting whole limbs, then remaining bits.
+        let limb_shift = (bits / 64) as usize; // number of whole limbs to skip
+        let bit_shift = bits % 64; // remaining bits within a limb
+
         for i in 0..n {
-            result[i] = self.limbs[i] >> bits;
-            if i + 1 < n {
-                result[i] |= self.limbs[i + 1] << (64 - bits);
+            let src = i + limb_shift;
+            if src >= n {
+                // All higher limbs are zero; result[i] stays 0
+                break;
             }
+            result[i] = if bit_shift == 0 {
+                self.limbs[src]
+            } else {
+                let lo = self.limbs[src] >> bit_shift;
+                let hi = if src + 1 < n {
+                    self.limbs[src + 1] << (64 - bit_shift)
+                } else {
+                    0
+                };
+                lo | hi
+            };
         }
         Self { limbs: result }
     }

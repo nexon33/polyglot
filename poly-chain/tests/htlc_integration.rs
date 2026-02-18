@@ -200,10 +200,10 @@ fn double_refund_fails() {
 fn multiple_concurrent_swaps() {
     let (state, alice, bob) = setup_wallets();
 
-    // Create 3 independent swaps with different nonces
+    // Create 3 independent swaps (nonces are per-account: alice=0,1; bob=0)
     let swap1 = make_swap(alice, bob, 1000, 100, 0);
     let swap2 = make_swap(alice, bob, 2000, 200, 1);
-    let swap3 = make_swap(bob, alice, 3000, 300, 2);
+    let swap3 = make_swap(bob, alice, 3000, 300, 0); // bob's first swap as initiator
 
     // All three should be unique swap IDs
     assert_ne!(swap1.swap_id, swap2.swap_id);

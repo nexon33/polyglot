@@ -28,7 +28,9 @@ use sha2::{Digest, Sha256};
 use crate::crypto::hash::hash_leaf;
 use crate::crypto::merkle::{self, MerkleTree};
 use crate::error::{ProofSystemError, Result};
-use crate::types::{Hash, MerkleProof, VerifiedProof, ZERO_HASH};
+use crate::ivc::hash_ivc::HashIvc;
+use crate::ivc::IvcBackend;
+use crate::types::{hash_eq, Hash, MerkleProof, VerifiedProof, ZERO_HASH};
 use crate::verified_type::Verified;
 
 /// Compute SHA-256 of raw token bytes for I/O binding.
@@ -205,9 +207,9 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
                 }
                 let proof = &disclosure.proofs[proof_idx];
 
-                // Check leaf matches the token
+                // Check leaf matches the token (constant-time)
                 let expected_leaf = token_leaf(*token_id);
-                if proof.leaf != expected_leaf {
+                if !hash_eq(&proof.leaf, &expected_leaf) {
                     return false;
                 }
 
@@ -216,16 +218,16 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
                     return false;
                 }
 
-                // Check proof root matches disclosure root
-                if proof.root != disclosure.output_root {
+                // Check proof root matches disclosure root (constant-time)
+                if !hash_eq(&proof.root, &disclosure.output_root) {
                     return false;
                 }
 
                 proof_idx += 1;
             }
             DisclosedToken::Redacted { leaf_hash, .. } => {
-                // Redacted positions must have a real commitment
-                if *leaf_hash == ZERO_HASH {
+                // Redacted positions must have a real commitment (constant-time)
+                if hash_eq(leaf_hash, &ZERO_HASH) {
                     return false;
                 }
             }
@@ -241,21 +243,29 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
     match &disclosure.execution_proof {
         VerifiedProof::HashIvc {
             step_count,
+            input_hash,
             output_hash,
             ..
         } => {
             if *step_count == 0 {
                 return false;
             }
-            // The output_binding must match the proof's committed output_hash
-            if disclosure.output_binding != *output_hash {
+            // The output_binding must match the proof's committed output_hash (constant-time)
+            if !hash_eq(&disclosure.output_binding, output_hash) {
                 return false;
             }
-            true
+            // Verify the cryptographic chain integrity (chain_tip, merkle_root,
+            // checkpoints, blinding commitment). Without this, an attacker could
+            // fabricate a proof with correct output_hash but invalid chain.
+            let ivc = HashIvc;
+            match ivc.verify(&disclosure.execution_proof, input_hash, output_hash) {
+                Ok(true) => true,
+                _ => false,
+            }
         }
         VerifiedProof::Mock { output_hash, .. } => {
-            // For Mock proofs, still check binding if output_hash is non-zero
-            if *output_hash != ZERO_HASH && disclosure.output_binding != *output_hash {
+            // For Mock proofs, still check binding if output_hash is non-zero (constant-time)
+            if !hash_eq(output_hash, &ZERO_HASH) && !hash_eq(&disclosure.output_binding, output_hash) {
                 return false;
             }
             true
@@ -266,7 +276,10 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PrivacyMode, ZERO_HASH};
+    use crate::crypto::hash::hash_data;
+    use crate::ivc::hash_ivc::HashIvc;
+    use crate::ivc::IvcBackend;
+    use crate::types::{PrivacyMode, StepWitness, ZERO_HASH};
 
     fn mock_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
         VerifiedProof::Mock {
@@ -276,18 +289,21 @@ mod tests {
         }
     }
 
-    fn mock_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
-        VerifiedProof::HashIvc {
-            chain_tip: [0x01; 32],
-            merkle_root: [0x02; 32],
-            step_count: 1,
-            code_hash: [0x03; 32],
-            privacy_mode: PrivacyMode::Transparent,
-            blinding_commitment: None,
-            checkpoints: vec![[0x04; 32]],
-            input_hash: ZERO_HASH,
-            output_hash: tokens_hash(tokens),
-        }
+    /// Build a valid HashIvc proof whose output_hash matches the given tokens.
+    fn valid_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
+        let ivc = HashIvc;
+        let code_hash = [0x03; 32];
+        let mut acc = ivc.init(&code_hash, PrivacyMode::Transparent);
+        let witness = StepWitness {
+            state_before: hash_data(b"before"),
+            state_after: hash_data(b"after"),
+            step_inputs: hash_data(b"inputs"),
+        };
+        ivc.fold_step(&mut acc, &witness).unwrap();
+        // Patch I/O hashes to match the disclosure context
+        acc.input_hash = ZERO_HASH;
+        acc.output_hash = tokens_hash(tokens);
+        ivc.finalize(acc).unwrap()
     }
 
     fn sample_tokens() -> Vec<u32> {
@@ -295,7 +311,7 @@ mod tests {
     }
 
     fn make_verified(tokens: Vec<u32>) -> Verified<Vec<u32>> {
-        let proof = mock_hash_ivc_proof_for_tokens(&tokens);
+        let proof = valid_hash_ivc_proof_for_tokens(&tokens);
         Verified::__macro_new(tokens, proof)
     }
 

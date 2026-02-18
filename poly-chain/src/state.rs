@@ -117,6 +117,9 @@ pub struct GlobalState {
     pub stp: SparseMerkleTree,
     pub applications: SparseMerkleTree,
     pub swaps: SparseMerkleTree,
+    /// Per-account nonce tracking: prevents transaction replay.
+    #[serde(default)]
+    nonces: BTreeMap<AccountId, Nonce>,
 }
 
 impl GlobalState {
@@ -131,6 +134,7 @@ impl GlobalState {
             stp: SparseMerkleTree::new(),
             applications: SparseMerkleTree::new(),
             swaps: SparseMerkleTree::new(),
+            nonces: BTreeMap::new(),
         }
     }
 
@@ -245,6 +249,20 @@ impl GlobalState {
 
     pub fn remove_swap(&mut self, swap_id: &Hash) {
         self.swaps.delete(swap_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Nonce accessors
+    // -----------------------------------------------------------------------
+
+    /// Get the current nonce for an account (0 if never seen).
+    pub fn get_nonce(&self, account_id: &AccountId) -> Nonce {
+        self.nonces.get(account_id).copied().unwrap_or(0)
+    }
+
+    /// Set the nonce for an account.
+    pub fn set_nonce(&mut self, account_id: AccountId, nonce: Nonce) {
+        self.nonces.insert(account_id, nonce);
     }
 }
 

@@ -89,6 +89,18 @@ fn validate_timestamp(tx_timestamp: Timestamp, now: Timestamp) -> Result<()> {
     Ok(())
 }
 
+/// Validate and increment account nonce to prevent transaction replay.
+fn validate_nonce(state: &GlobalState, account_id: &AccountId, tx_nonce: Nonce) -> Result<()> {
+    let expected = state.get_nonce(account_id);
+    if tx_nonce != expected {
+        return Err(ChainError::InvalidNonce {
+            expected,
+            actual: tx_nonce,
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Signing message constructors — canonical byte representations of
 // transaction fields EXCLUDING the signature field.
@@ -325,15 +337,9 @@ fn validate_cash_transfer(
         )));
     }
 
-    // TODO: Nonce validation — the transaction nonce should match the expected
-    // next nonce from the sender's wallet state. Currently the on-chain state
-    // stores only a wallet commitment hash, not the full WalletState struct,
-    // so we cannot extract the current nonce. Once the state model is extended
-    // to track nonces per account, add:
-    //   let expected_nonce = state.get_nonce(&tx.from).unwrap_or(0);
-    //   if tx.nonce != expected_nonce {
-    //       return Err(ChainError::InvalidNonce { expected: expected_nonce, actual: tx.nonce });
-    //   }
+    // 1f. Nonce validation — prevents transaction replay
+    validate_nonce(state, &tx.from, tx.nonce)?;
+    new_state.set_nonce(tx.from, tx.nonce + 1);
 
     // 2. Verify proof (the circuit verified the computation was correct)
     let input_hash = hash_with_domain(
@@ -427,6 +433,10 @@ fn validate_wallet_sync(
     let signing_msg = wallet_sync_signing_message(tx);
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
 
+    // 0c. Nonce validation
+    validate_nonce(state, &tx.account_id, tx.nonce)?;
+    new_state.set_nonce(tx.account_id, tx.nonce + 1);
+
     // 1. Wallet must exist
     let current_hash = state
         .get_wallet(&tx.account_id)
@@ -519,6 +529,10 @@ fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp)
     let signing_msg = backup_store_signing_message(tx);
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
 
+    // 0b. Nonce validation
+    validate_nonce(state, &tx.account_id, tx.nonce)?;
+    new_state.set_nonce(tx.account_id, tx.nonce + 1);
+
     // 1. Wallet must exist
     let current_hash = state
         .get_wallet(&tx.account_id)
@@ -546,11 +560,15 @@ fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp)
 // ---------------------------------------------------------------------------
 
 fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timestamp) -> Result<GlobalState> {
-    let new_state = state.clone();
+    let mut new_state = state.clone();
 
     // 0. Verify signature — only the account owner can restore backups
     let signing_msg = backup_restore_signing_message(tx);
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+
+    // 0b. Nonce validation
+    validate_nonce(state, &tx.account_id, tx.nonce)?;
+    new_state.set_nonce(tx.account_id, tx.nonce + 1);
 
     // 1. Verify backup exists
     let backup_hash = state
@@ -668,6 +686,12 @@ fn validate_stp_action(
 
     match &tx.action {
         STPAction::RegisterContract(contract) => {
+            // Only the official themselves can register their own contract
+            if tx.submitter != contract.official {
+                return Err(ChainError::UnauthorizedSTPAction(
+                    "only the official can register their own service contract".into(),
+                ));
+            }
             // Store contract hash in STP subtree
             let contract_hash = contract.contract_hash();
             new_state.set_stp_record(contract.official, contract_hash);
@@ -684,9 +708,12 @@ fn validate_stp_action(
             investigation_id,
             data_hash,
         } => {
-            // Update investigation status to DataProvided
-            // In practice this would load and update the investigation record
-            // For now, store the data hash
+            // Only the investigation target can provide data.
+            // Load investigation record to verify submitter is the target.
+            let _ = state.get_stp_record(investigation_id).ok_or_else(|| {
+                ChainError::STPError("investigation not found".into())
+            })?;
+            // Store the data hash (in full impl, would verify submitter == target)
             new_state.set_stp_record(*investigation_id, *data_hash);
         }
 
@@ -719,6 +746,10 @@ fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState, now: Time
     // 0b. Verify signature — only the account owner can update app state
     let signing_msg = app_state_update_signing_message(tx);
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+
+    // 0c. Nonce validation
+    validate_nonce(state, &tx.account_id, tx.nonce)?;
+    new_state.set_nonce(tx.account_id, tx.nonce + 1);
 
     // 1. Wallet must exist
     let current_hash = state
@@ -766,12 +797,25 @@ fn validate_atomic_swap_init(
     let signing_msg = atomic_swap_init_signing_message(tx);
     verify_signature_if_not_mock(&tx.responder, &signing_msg, &tx.signature)?;
 
+    // 0d. Nonce validation (initiator's nonce — they create the swap)
+    validate_nonce(state, &tx.initiator, tx.nonce)?;
+    new_state.set_nonce(tx.initiator, tx.nonce + 1);
+
     // 1. Responder wallet must exist (they're locking funds)
     let _ = state
         .get_wallet(&tx.responder)
         .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.responder[..4])))?;
 
-    // 2. Swap must not already exist
+    // 2. Verify swap_id is canonically derived: H(initiator || responder || nonce)
+    let expected_swap_id = hash_with_domain(
+        DOMAIN_SWAP,
+        &[tx.initiator.as_slice(), tx.responder.as_slice(), &tx.nonce.to_le_bytes()].concat(),
+    );
+    if tx.swap_id != expected_swap_id {
+        return Err(ChainError::InvalidSwapId);
+    }
+
+    // 3. Swap must not already exist
     if state.get_swap(&tx.swap_id).is_some() {
         return Err(ChainError::SwapAlreadyExists(hex_encode(&tx.swap_id[..4])));
     }
@@ -1353,9 +1397,22 @@ mod tests {
         let tx = Transaction::AtomicSwapInit(swap.clone());
         let new_state = validate_transaction(&tx, &state, 1000, 50).unwrap();
 
-        // Try to init the same swap again
-        let result = validate_transaction(&tx, &new_state, 1000, 50);
-        assert!(matches!(result, Err(ChainError::SwapAlreadyExists(_))));
+        // Try to replay the exact same swap — nonce validation rejects it
+        let tx2 = Transaction::AtomicSwapInit(swap);
+        let result = validate_transaction(&tx2, &new_state, 1000, 50);
+        assert!(matches!(result, Err(ChainError::InvalidNonce { .. })));
+    }
+
+    #[test]
+    fn atomic_swap_init_invalid_swap_id() {
+        let (state, _sender, responder) = setup_state_with_wallets();
+        let initiator = [3u8; 32];
+        let mut swap = make_swap_init(initiator, responder, 5000, 100);
+        swap.swap_id = [0xFF; 32]; // tampered swap_id
+
+        let tx = Transaction::AtomicSwapInit(swap);
+        let result = validate_transaction(&tx, &state, 1000, 50);
+        assert!(matches!(result, Err(ChainError::InvalidSwapId)));
     }
 
     #[test]

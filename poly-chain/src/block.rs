@@ -101,12 +101,31 @@ impl Block {
     }
 
     /// Create a new block on top of a parent block.
+    ///
+    /// Panics if the parent block height is `u64::MAX` (overflow).
+    /// Prefer `try_new` for fallible construction.
     pub fn new(
         parent: &BlockHeader,
         transactions: Vec<Transaction>,
         state_root: Hash,
         timestamp: Timestamp,
     ) -> Self {
+        Self::try_new(parent, transactions, state_root, timestamp)
+            .expect("block height overflow")
+    }
+
+    /// Fallible block construction -- returns an error on block height overflow.
+    pub fn try_new(
+        parent: &BlockHeader,
+        transactions: Vec<Transaction>,
+        state_root: Hash,
+        timestamp: Timestamp,
+    ) -> Result<Self> {
+        let new_height = parent
+            .height
+            .checked_add(1)
+            .ok_or(ChainError::BlockHeightOverflow)?;
+
         let tx_count = transactions.len() as u32;
         let leaves: Vec<Hash> = transactions.iter().map(|tx| tx.tx_hash()).collect();
         let transactions_root = if leaves.is_empty() {
@@ -116,7 +135,7 @@ impl Block {
         };
 
         let header = BlockHeader {
-            height: parent.height + 1,
+            height: new_height,
             timestamp,
             prev_block_hash: parent.block_hash(),
             state_root,
@@ -124,10 +143,10 @@ impl Block {
             tx_count,
         };
 
-        Block {
+        Ok(Block {
             header,
             transactions,
-        }
+        })
     }
 }
 

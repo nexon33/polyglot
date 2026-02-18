@@ -101,8 +101,28 @@ macro_rules! generate_body {
     }};
 }
 
+/// Maximum allowed temperature value.
+/// Temperature is divided by 1000.0 before use, so 2000 means T=2.0.
+/// Zero is rejected (divide-by-zero risk in sampling).
+pub const MAX_TEMPERATURE: u32 = 2000;
+
+/// Validate temperature parameter. Returns an error message if invalid.
+pub fn validate_temperature(temperature: u32) -> Result<(), &'static str> {
+    if temperature == 0 {
+        return Err("temperature must be > 0 (division by zero risk)");
+    }
+    if temperature > MAX_TEMPERATURE {
+        return Err("temperature exceeds maximum allowed value of 2000");
+    }
+    Ok(())
+}
+
 /// Unverified generation — same logic, no proof overhead.
+///
+/// # Panics
+/// Panics if temperature is 0 or exceeds `MAX_TEMPERATURE`.
 pub fn generate(input_ids: Vec<u32>, max_tokens: u32, temperature: u32, seed: u64) -> Vec<u32> {
+    assert!(validate_temperature(temperature).is_ok(), "invalid temperature: {}", temperature);
     generate_body!(input_ids, max_tokens, temperature, seed)
 }
 
