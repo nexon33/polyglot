@@ -144,8 +144,15 @@ fn identity_register_signing_message(tx: &IdentityRegister) -> Vec<u8> {
     msg.extend_from_slice(&tx.identity_hash);
     msg.extend_from_slice(&tx.jurisdiction.to_le_bytes());
     msg.push(if tx.is_public_official { 1 } else { 0 });
-    if let Some(ref office) = tx.office {
-        msg.extend_from_slice(office.as_bytes());
+    match &tx.office {
+        Some(office) => {
+            let bytes = office.as_bytes();
+            msg.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            msg.extend_from_slice(bytes);
+        }
+        None => {
+            msg.extend_from_slice(&0u32.to_le_bytes());
+        }
     }
     msg
 }
@@ -200,8 +207,14 @@ fn atomic_swap_init_signing_message(tx: &AtomicSwapInit) -> Vec<u8> {
     msg.extend_from_slice(&tx.timeout.to_le_bytes());
     msg.extend_from_slice(&tx.nonce.to_le_bytes());
     msg.extend_from_slice(&tx.timestamp.to_le_bytes());
-    if let Some(ref root) = tx.disclosure_root {
-        msg.extend_from_slice(root);
+    match &tx.disclosure_root {
+        Some(root) => {
+            msg.push(0x01); // present discriminator
+            msg.extend_from_slice(root);
+        }
+        None => {
+            msg.push(0x00); // absent discriminator
+        }
     }
     msg
 }

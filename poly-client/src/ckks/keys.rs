@@ -47,16 +47,28 @@ pub fn keygen<R: Rng>(rng: &mut R) -> (CkksPublicKey, CkksSecretKey) {
     (CkksPublicKey { b, a }, CkksSecretKey { s })
 }
 
-/// Derive a MAC key from the secret key for ciphertext authentication.
-/// Share this with the server alongside the public key and eval key.
+/// Derive a MAC key from the secret key using HKDF-SHA256.
+///
+/// Uses proper HKDF extract-then-expand (not bare SHA-256) to provide
+/// domain separation via the `context` parameter. Different contexts
+/// (e.g., different server identities) produce different MAC keys from
+/// the same secret key, preventing cross-context replay attacks.
 pub fn derive_mac_key(sk: &CkksSecretKey) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"ckks_mac_key_v1");
-    for c in &sk.s.coeffs {
-        hasher.update(c.to_le_bytes());
-    }
-    hasher.finalize().into()
+    derive_mac_key_with_context(sk, b"default")
+}
+
+/// Derive a MAC key with a specific context string.
+pub fn derive_mac_key_with_context(sk: &CkksSecretKey, context: &[u8]) -> [u8; 32] {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let ikm: Vec<u8> = sk.s.coeffs.iter()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    let hk = Hkdf::<Sha256>::new(Some(context), &ikm);
+    let mut okm = [0u8; 32];
+    hk.expand(b"ckks_mac_key_v1", &mut okm)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    okm
 }
 
 #[cfg(test)]

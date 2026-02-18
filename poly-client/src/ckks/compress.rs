@@ -61,10 +61,10 @@ const ZSTD_LEVEL_MAX: i32 = 19;
 /// Element size for byte-shuffle (8 = sizeof i64, optimal for CKKS polynomials).
 const SHUFFLE_ELEMENT_SIZE: u8 = 8;
 
-/// Maximum allowed decompressed size (8 MB) to prevent decompression bombs.
+/// Maximum allowed decompressed size (32 MB) to prevent decompression bombs.
 /// For CKKS with N=4096 and 20 primes, a ciphertext is ~1.3 MB uncompressed.
-/// With eval keys and rotation keys, the largest single payload is ~4 MB.
-const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
+/// Rotation keys (one key-switch matrix per rotation step) can reach ~16 MB.
+const MAX_DECOMPRESSED_SIZE: usize = 32 * 1024 * 1024;
 
 // ─── Compression Level ───────────────────────────────────────────────
 
@@ -97,6 +97,12 @@ pub fn compress<T: Serialize>(value: &T) -> Result<Vec<u8>, CompressError> {
     let compressed =
         zstd::encode_all(raw.as_slice(), ZSTD_LEVEL).map_err(CompressError::Compress)?;
 
+    if original_size > u32::MAX as usize {
+        return Err(CompressError::Compress(
+            std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("payload too large for PFHE v1 header: {} bytes", original_size))
+        ));
+    }
     let mut out = Vec::with_capacity(HEADER_V1_SIZE + compressed.len());
     out.extend_from_slice(MAGIC);
     out.push(1); // version 1
@@ -395,6 +401,12 @@ fn compress_v2_raw(raw: &[u8], zstd_level: i32, level_byte: u8) -> Result<Vec<u8
     let compressed =
         zstd::encode_all(shuffled.as_slice(), zstd_level).map_err(CompressError::Compress)?;
 
+    if original_size > u32::MAX as usize {
+        return Err(CompressError::Compress(
+            std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("payload too large for PFHE v2 header: {} bytes", original_size))
+        ));
+    }
     let mut out = Vec::with_capacity(HEADER_V2_SIZE + compressed.len());
     out.extend_from_slice(MAGIC);
     out.push(2); // version 2

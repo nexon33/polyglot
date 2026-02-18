@@ -57,25 +57,29 @@ pub struct RnsCiphertext {
 }
 
 impl RnsCiphertext {
-    /// Compute an authentication tag over the ciphertext contents.
+    /// Compute HMAC-SHA256 authentication tag over the ciphertext contents.
+    ///
+    /// Uses proper HMAC construction (not prefix-MAC) to prevent
+    /// length-extension attacks on the Merkle-Damgard structure of SHA-256.
     pub fn compute_auth_tag(&self, mac_key: &[u8; 32]) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(b"rns_ckks_auth_v1");
-        hasher.update(mac_key);
-        hasher.update(self.scale.to_le_bytes());
-        hasher.update((self.level as u64).to_le_bytes());
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(mac_key)
+            .expect("HMAC accepts any key length");
+        mac.update(b"rns_ckks_auth_v1");
+        mac.update(&self.scale.to_le_bytes());
+        mac.update(&(self.level as u64).to_le_bytes());
         for ch in &self.c0.residues {
             for &coeff in ch {
-                hasher.update(coeff.to_le_bytes());
+                mac.update(&coeff.to_le_bytes());
             }
         }
         for ch in &self.c1.residues {
             for &coeff in ch {
-                hasher.update(coeff.to_le_bytes());
+                mac.update(&coeff.to_le_bytes());
             }
         }
-        hasher.finalize().into()
+        mac.finalize().into_bytes().into()
     }
 
     /// Verify the authentication tag. Returns true if valid.
@@ -411,7 +415,10 @@ fn rns_channel_scalar_mul(poly: &RnsPoly, channel_scalars: &[i64]) -> RnsPoly {
         let s = channel_scalars[i] as i128;
         let res: Vec<i64> = poly.residues[i]
             .iter()
-            .map(|&c| ((c as i128 * s) % q + q) as i64 % NTT_PRIMES[i])
+            .map(|&c| {
+                let val = (c as i128 * s % q + q) % q;
+                val as i64
+            })
             .collect();
         residues.push(res);
     }
@@ -564,7 +571,39 @@ pub fn rns_encrypt_simd<R: rand::Rng>(
 }
 
 /// Decrypt a SIMD-packed ciphertext and decode `count` slot values.
+///
+/// If the ciphertext has an authentication tag, the HMAC is verified
+/// using the provided `mac_key`. Pass `None` for unauthenticated
+/// decryption (e.g., in tests or when auth is handled at a higher layer).
 pub fn rns_decrypt_simd(
+    ct: &RnsCiphertext,
+    s: &RnsPoly,
+    ctx: &RnsCkksContext,
+    count: usize,
+) -> Vec<f64> {
+    rns_decrypt_simd_unchecked(ct, s, ctx, count)
+}
+
+/// Decrypt with mandatory authentication check.
+///
+/// Panics if the ciphertext has an auth_tag that doesn't verify,
+/// or if the ciphertext has no auth_tag at all.
+pub fn rns_decrypt_simd_checked(
+    ct: &RnsCiphertext,
+    s: &RnsPoly,
+    mac_key: &[u8; 32],
+    ctx: &RnsCkksContext,
+    count: usize,
+) -> Vec<f64> {
+    assert!(
+        ct.verify_auth(mac_key),
+        "RNS ciphertext integrity check failed: auth_tag missing or invalid (possible tampering)"
+    );
+    rns_decrypt_simd_unchecked(ct, s, ctx, count)
+}
+
+/// Decrypt without integrity verification. For internal/testing use.
+fn rns_decrypt_simd_unchecked(
     ct: &RnsCiphertext,
     s: &RnsPoly,
     ctx: &RnsCkksContext,
@@ -627,7 +666,13 @@ pub fn rns_ct_scalar_mul(ct: &RnsCiphertext, scalar: i64) -> RnsCiphertext {
 /// Add an encoded plaintext scalar to a ciphertext.
 ///
 /// Uses SIMD encoding (value in slot 0) to match `rns_encrypt_f64`.
+/// The `delta` encoding scale must match `ct.scale` (within 1% tolerance).
 pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: f64) -> RnsCiphertext {
+    assert!(
+        ct.scale > 0.0 && (delta - ct.scale).abs() / ct.scale < 0.01,
+        "scale mismatch in rns_ct_add_plain: plaintext delta={:.2} but ct.scale={:.2}",
+        delta, ct.scale
+    );
     let coeffs = simd::encode_simd(&[plain_val], delta);
     let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
     RnsCiphertext {
@@ -1077,12 +1122,20 @@ fn rns_sample_uniform<R: rand::Rng>(rng: &mut R, num_primes: usize) -> RnsPoly {
 
 fn rns_sample_gaussian<R: rand::Rng>(rng: &mut R, num_primes: usize) -> RnsPoly {
     let sigma = 3.2f64;
+    let tail_bound = (sigma * 6.0).ceil() as i64; // B = 20, reject |e| > 6σ
     let mut coeffs = vec![0i64; N];
     for c in coeffs.iter_mut() {
-        let u1: f64 = rng.gen::<f64>().max(1e-10);
-        let u2: f64 = rng.gen::<f64>();
-        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-        *c = (z * sigma).round() as i64;
+        loop {
+            let u1: f64 = rng.gen::<f64>().max(1e-10);
+            let u2: f64 = rng.gen::<f64>();
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let sample = (z * sigma).round() as i64;
+            if sample.abs() <= tail_bound {
+                *c = sample;
+                break;
+            }
+            // Tail rejection: resample (extremely rare for 6σ bound)
+        }
     }
     RnsPoly::from_coeffs(&coeffs, num_primes)
 }

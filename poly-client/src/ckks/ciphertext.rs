@@ -10,9 +10,12 @@
 //! a `key_id` (SHA-256 hash of the encrypting public key), and a random `nonce`
 //! for replay protection. Use `verify_integrity()` to check before decrypting.
 
+use hmac::{Hmac, Mac};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 use super::encoding::{decode, encode};
 use super::keys::{CkksPublicKey, CkksSecretKey};
@@ -56,6 +59,7 @@ pub struct CkksCiphertext {
 
 /// Compute SHA-256 hash of a public key to create a key identifier.
 pub fn compute_key_id(pk: &CkksPublicKey) -> [u8; 32] {
+    use sha2::Digest;
     let mut hasher = Sha256::new();
     hasher.update(b"ckks_key_id_v1");
     for c in &pk.a.coeffs {
@@ -67,9 +71,10 @@ pub fn compute_key_id(pk: &CkksPublicKey) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Compute authentication tag over ciphertext data + metadata.
-/// Includes `mac_key` (derived from the secret key) to produce a
-/// proper MAC rather than a public-data-only checksum.
+/// Compute HMAC-SHA256 authentication tag over ciphertext data + metadata.
+///
+/// Uses proper HMAC construction (not prefix-MAC) to prevent
+/// length-extension attacks on the Merkle-Damgard structure of SHA-256.
 fn compute_auth_tag(
     chunks: &[(Poly, Poly)],
     token_count: usize,
@@ -78,22 +83,22 @@ fn compute_auth_tag(
     key_id: &[u8; 32],
     mac_key: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"ckks_auth_v1");
-    hasher.update(mac_key);
-    hasher.update(key_id);
-    hasher.update(nonce);
-    hasher.update((token_count as u64).to_le_bytes());
-    hasher.update(scale.to_le_bytes());
+    let mut mac = HmacSha256::new_from_slice(mac_key)
+        .expect("HMAC accepts any key length");
+    mac.update(b"ckks_auth_v1");
+    mac.update(key_id);
+    mac.update(nonce);
+    mac.update(&(token_count as u64).to_le_bytes());
+    mac.update(&scale.to_le_bytes());
     for (c0, c1) in chunks {
         for c in &c0.coeffs {
-            hasher.update(c.to_le_bytes());
+            mac.update(&c.to_le_bytes());
         }
         for c in &c1.coeffs {
-            hasher.update(c.to_le_bytes());
+            mac.update(&c.to_le_bytes());
         }
     }
-    hasher.finalize().into()
+    mac.finalize().into_bytes().into()
 }
 
 /// Constant-time comparison of two byte slices.

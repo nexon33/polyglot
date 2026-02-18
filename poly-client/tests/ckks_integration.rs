@@ -5,33 +5,48 @@
 
 #![cfg(feature = "ckks")]
 
-use poly_client::ckks::ciphertext::{decrypt, encrypt};
+use poly_client::ckks::ciphertext::{decrypt, decrypt_unchecked, encrypt};
 use poly_client::ckks::keys::keygen;
 use poly_client::ckks::{CkksCiphertext, CkksEncryption, CkksPublicKey, CkksSecretKey};
 use poly_client::encryption::EncryptionBackend;
 use poly_client::protocol::{InferRequest, InferResponse, Mode};
 use poly_client::PolyClient;
+use poly_verified::crypto::hash::hash_data;
 use poly_verified::disclosure::verify_disclosure;
-use poly_verified::types::{PrivacyMode, VerifiedProof, ZERO_HASH};
+use poly_verified::ivc::hash_ivc::HashIvc;
+use poly_verified::ivc::IvcBackend;
+use poly_verified::types::{PrivacyMode, StepWitness, VerifiedProof, ZERO_HASH};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn hash_ivc_proof() -> VerifiedProof {
-    VerifiedProof::HashIvc {
-        chain_tip: [0x01; 32],
-        merkle_root: [0x02; 32],
-        step_count: 1,
-        code_hash: [0x03; 32],
-        privacy_mode: PrivacyMode::Transparent,
-        blinding_commitment: None,
-        checkpoints: vec![[0x04; 32]],
-        input_hash: ZERO_HASH,
-        output_hash: ZERO_HASH,
+/// Compute SHA-256 of raw token bytes — matches `tokens_hash()` inside disclosure.rs.
+fn tokens_hash(tokens: &[u32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for &t in tokens {
+        hasher.update(t.to_le_bytes());
     }
+    hasher.finalize().into()
+}
+
+/// Build a valid HashIvc proof whose output_hash matches the given tokens.
+fn valid_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
+    let ivc = HashIvc;
+    let code_hash = [0x03; 32];
+    let mut acc = ivc.init(&code_hash, PrivacyMode::Transparent);
+    let witness = StepWitness {
+        state_before: hash_data(b"before"),
+        state_after: hash_data(b"after"),
+        step_inputs: hash_data(b"inputs"),
+    };
+    ivc.fold_step(&mut acc, &witness).unwrap();
+    acc.input_hash = ZERO_HASH;
+    acc.output_hash = tokens_hash(tokens);
+    ivc.finalize(acc).unwrap()
 }
 
 /// Create a server response using the client's own public key for proper roundtrip.
@@ -147,7 +162,8 @@ fn disclosure_from_ckks_response() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let output = vec![100, 200, 300, 400, 500];
-    let resp = server_response_with_key(&output, &pk, &sk, hash_ivc_proof());
+    let proof = valid_hash_ivc_proof_for_tokens(&output);
+    let resp = server_response_with_key(&output, &pk, &sk, proof);
 
     // Client decrypts
     let ct: CkksCiphertext = serde_json::from_slice(&resp.encrypted_output).unwrap();
@@ -170,7 +186,8 @@ fn disclosure_range_from_ckks_response() {
     let mut rng = StdRng::seed_from_u64(42);
     let (pk, sk) = keygen(&mut rng);
     let output: Vec<u32> = (0..20).collect();
-    let resp = server_response_with_key(&output, &pk, &sk, hash_ivc_proof());
+    let proof = valid_hash_ivc_proof_for_tokens(&output);
+    let resp = server_response_with_key(&output, &pk, &sk, proof);
 
     let ct: CkksCiphertext = serde_json::from_slice(&resp.encrypted_output).unwrap();
     let decrypted = decrypt(&ct, &sk);
@@ -282,8 +299,9 @@ fn wrong_key_gives_wrong_decryption() {
     let tokens = vec![42, 43, 44];
     let ct = encrypt(&tokens, &pk1, &sk1, &mut rng1);
 
-    // Decrypt with wrong key
-    let wrong_decrypted = decrypt(&ct, &sk2);
+    // Decrypt with wrong key — bypasses auth check since we're testing wrong-key behavior,
+    // not auth verification (which would panic because the MAC key differs).
+    let wrong_decrypted = decrypt_unchecked(&ct, &sk2);
     assert_ne!(wrong_decrypted, tokens);
 }
 

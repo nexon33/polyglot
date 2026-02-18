@@ -6,7 +6,7 @@
 
 #![cfg(feature = "ckks")]
 
-use poly_client::ckks::ciphertext::{decrypt, encrypt, CkksCiphertext};
+use poly_client::ckks::ciphertext::{decrypt, decrypt_unchecked, encrypt, CkksCiphertext};
 use poly_client::ckks::encoding::{decode, encode};
 use poly_client::ckks::keys::{keygen, CkksSecretKey};
 use poly_client::ckks::ntt::{is_prime, mod_inv, mod_pow, NttContext, NTT_PRIMES};
@@ -37,7 +37,8 @@ fn attack_ciphertext_bit_flip_c0() {
     ct.chunks[0].0.coeffs[0] ^= 0x7FFF_FFFF;
     ct.chunks[0].0.coeffs[1] ^= 0x3FFF_FFFF;
 
-    let decrypted = decrypt(&ct, &sk);
+    // Use unchecked: auth tag catches this (tested elsewhere), here we verify algebraic corruption.
+    let decrypted = decrypt_unchecked(&ct, &sk);
     assert_ne!(
         decrypted, tokens,
         "VULNERABILITY: ciphertext manipulation did not affect decryption"
@@ -56,7 +57,8 @@ fn attack_ciphertext_bit_flip_c1() {
     ct.chunks[0].1.coeffs[0] = Q / 2;
     ct.chunks[0].1.coeffs[1] = -Q / 3;
 
-    let decrypted = decrypt(&ct, &sk);
+    // Use unchecked: auth tag catches this (tested elsewhere), here we verify algebraic corruption.
+    let decrypted = decrypt_unchecked(&ct, &sk);
     assert_ne!(
         decrypted, tokens,
         "VULNERABILITY: c1 manipulation did not affect decryption"
@@ -76,7 +78,8 @@ fn attack_ciphertext_zeroed_out() {
     ct.chunks[0].0 = Poly::zero();
     ct.chunks[0].1 = Poly::zero();
 
-    let decrypted = decrypt(&ct, &sk);
+    // Use unchecked: auth tag catches this (tested elsewhere), here we verify algebraic behavior.
+    let decrypted = decrypt_unchecked(&ct, &sk);
     // Zero ciphertext should decrypt to all zeros
     assert_eq!(
         decrypted,
@@ -104,7 +107,8 @@ fn attack_ciphertext_noise_injection() {
         ct.chunks[0].0.coeffs[i] = mod_reduce(ct.chunks[0].0.coeffs[i] + DELTA);
     }
 
-    let decrypted = decrypt(&ct, &sk);
+    // Use unchecked: auth tag catches this (tested elsewhere), here we verify algebraic corruption.
+    let decrypted = decrypt_unchecked(&ct, &sk);
     assert_ne!(
         decrypted, tokens,
         "VULNERABILITY: noise exceeding DELTA did not affect decryption"
@@ -135,7 +139,8 @@ fn attack_ciphertext_swap_components() {
     ct.chunks[0].0 = ct.chunks[0].1.clone();
     ct.chunks[0].1 = temp;
 
-    let decrypted = decrypt(&ct, &sk);
+    // Use unchecked: auth tag catches this (tested elsewhere), here we verify algebraic corruption.
+    let decrypted = decrypt_unchecked(&ct, &sk);
     assert_ne!(
         decrypted, tokens,
         "VULNERABILITY: swapping c0/c1 did not affect decryption"
@@ -216,7 +221,8 @@ fn attack_wrong_key_decryption() {
     let tokens = vec![42, 43, 44, 45, 46, 47, 48, 49, 50];
     let ct = encrypt(&tokens, &pk1, &sk1, &mut rng1);
 
-    let wrong = decrypt(&ct, &sk2);
+    // Use unchecked: auth tag catches wrong-key (tested elsewhere), here we verify RLWE security.
+    let wrong = decrypt_unchecked(&ct, &sk2);
     // Not a single token should match (with overwhelmingly high probability)
     let matches: usize = wrong.iter().zip(tokens.iter()).filter(|(a, b)| a == b).count();
     assert!(
@@ -240,7 +246,8 @@ fn attack_zero_secret_key() {
     let fake_sk = CkksSecretKey { s: Poly::zero() };
 
     let correct = decrypt(&ct, &sk);
-    let wrong = decrypt(&ct, &fake_sk);
+    // Use unchecked: auth tag catches wrong-key (tested elsewhere), here we verify RLWE security.
+    let wrong = decrypt_unchecked(&ct, &fake_sk);
 
     assert_eq!(correct, tokens);
     assert_ne!(
@@ -258,7 +265,8 @@ fn attack_negated_secret_key() {
     let ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
     let neg_sk = CkksSecretKey { s: sk.s.neg() };
-    let decrypted = decrypt(&ct, &neg_sk);
+    // Use unchecked: auth tag catches wrong-key (tested elsewhere), here we verify RLWE security.
+    let decrypted = decrypt_unchecked(&ct, &neg_sk);
     assert_ne!(
         decrypted, tokens,
         "VULNERABILITY: negated key decrypts correctly"

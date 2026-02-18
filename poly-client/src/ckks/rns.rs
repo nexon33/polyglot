@@ -180,11 +180,12 @@ impl RnsPoly {
     pub fn scalar_mul(&self, scalar: i64) -> RnsPoly {
         let mut residues = Vec::with_capacity(self.num_primes);
         for i in 0..self.num_primes {
-            let q = NTT_PRIMES[i];
-            let s = ((scalar as i128 % q as i128) + q as i128) as i64;
+            let q = NTT_PRIMES[i] as i128;
+            // Normalize scalar to [0, q) to avoid intermediate values in [0, 2q)
+            let s = ((scalar as i128 % q) + q) % q;
             let res: Vec<i64> = self.residues[i]
                 .iter()
-                .map(|&a| (a as i128 * s as i128 % q as i128) as i64)
+                .map(|&a| (a as i128 * s % q) as i64)
                 .collect();
             residues.push(res);
         }
@@ -400,11 +401,24 @@ fn garner_reconstruct_wide(residues: &[i64], primes: &[i64]) -> i64 {
     // Step 4: Center — if result > Q/2, return result - Q (negative)
     let half_q = wide_shr(&q_total, 1);
     if wide_gt(&result, &half_q) {
-        // Centered value = result - Q (negative, fits in i64)
         let diff = wide_sub(&q_total, &result);
+        // Verify the centered value fits in i64 (upper limbs must be zero)
+        for i in 1..diff.len() {
+            debug_assert!(
+                diff[i] == 0,
+                "CRT result exceeds i64 range: limb[{}] = {} (need 4+ primes?)",
+                i, diff[i]
+            );
+        }
         -(diff[0] as i64)
     } else {
-        // Positive value, fits in i64
+        for i in 1..result.len() {
+            debug_assert!(
+                result[i] == 0,
+                "CRT result exceeds i64 range: limb[{}] = {} (need 4+ primes?)",
+                i, result[i]
+            );
+        }
         result[0] as i64
     }
 }

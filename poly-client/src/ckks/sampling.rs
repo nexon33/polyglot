@@ -31,8 +31,9 @@ pub fn sample_ternary<R: Rng>(rng: &mut R) -> Poly {
 }
 
 /// Sample a polynomial from the discrete Gaussian distribution with σ = SIGMA.
-/// Uses Box-Muller transform + rounding.
+/// Uses Box-Muller transform + rounding with 6σ tail rejection.
 pub fn sample_gaussian<R: Rng>(rng: &mut R) -> Poly {
+    let tail_bound = (SIGMA * 6.0).ceil() as i64; // reject |e| > 6σ
     let mut coeffs = vec![0i64; N];
     let mut i = 0;
     while i < N {
@@ -43,11 +44,17 @@ pub fn sample_gaussian<R: Rng>(rng: &mut R) -> Poly {
         let z0 = r * u2.cos();
         let z1 = r * u2.sin();
 
-        coeffs[i] = z0.round() as i64;
-        i += 1;
-        if i < N {
-            coeffs[i] = z1.round() as i64;
+        let s0 = z0.round() as i64;
+        if s0.abs() <= tail_bound {
+            coeffs[i] = s0;
             i += 1;
+        }
+        if i < N {
+            let s1 = z1.round() as i64;
+            if s1.abs() <= tail_bound {
+                coeffs[i] = s1;
+                i += 1;
+            }
         }
     }
     Poly { coeffs }

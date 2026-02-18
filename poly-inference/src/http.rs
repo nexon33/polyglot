@@ -523,9 +523,12 @@ fn handle_generate_encrypted<B: InferenceBackend>(
         }
     };
 
-    // Decrypt input token IDs using server's secret key
+    // Decrypt input token IDs using server's secret key.
+    // Use decrypt_unchecked because the auth tag was created by the client
+    // (using the client's MAC key), not the server's.
+    use poly_client::ckks::ciphertext::decrypt_unchecked;
+    let token_ids = decrypt_unchecked(&input_ct, server_sk);
     let ckks = CkksEncryption;
-    let token_ids = ckks.decrypt(&input_ct, server_sk);
 
     if token_ids.is_empty() {
         return json_error(400, "encrypted input decoded to zero tokens", json_header);

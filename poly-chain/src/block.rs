@@ -126,7 +126,10 @@ impl Block {
             .checked_add(1)
             .ok_or(ChainError::BlockHeightOverflow)?;
 
-        let tx_count = transactions.len() as u32;
+        let tx_count: u32 = transactions.len().try_into()
+            .map_err(|_| ChainError::InvalidEncoding(
+                format!("too many transactions in block: {}", transactions.len())
+            ))?;
         let leaves: Vec<Hash> = transactions.iter().map(|tx| tx.tx_hash()).collect();
         let transactions_root = if leaves.is_empty() {
             ZERO_HASH
