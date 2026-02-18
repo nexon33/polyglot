@@ -20,6 +20,9 @@ fn hash_ivc_proof() -> VerifiedProof {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::Transparent,
         blinding_commitment: None,
+        checkpoints: vec![[0x04; 32]],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     }
 }
 
@@ -331,6 +334,9 @@ fn disclosure_with_transparent_proof() {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::Transparent,
         blinding_commitment: None,
+        checkpoints: vec![[0x04; 32]],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
     let verified = make_verified_with(vec![10, 20, 30], proof);
     let disclosure = create_disclosure(&verified, &[0, 2]).unwrap();
@@ -346,6 +352,9 @@ fn disclosure_with_private_inputs_proof() {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::PrivateInputs,
         blinding_commitment: Some([0x04; 32]),
+        checkpoints: vec![[0x04; 32]],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
     let verified = make_verified_with(vec![10, 20, 30], proof);
     let disclosure = create_disclosure(&verified, &[1]).unwrap();
@@ -369,6 +378,9 @@ fn disclosure_with_private_proof() {
         code_hash: ZERO_HASH, // private mode hides code
         privacy_mode: PrivacyMode::Private,
         blinding_commitment: Some([0x04; 32]),
+        checkpoints: vec![[0x04; 32]],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
     let verified = make_verified_with(vec![42, 43, 44, 45], proof);
     let disclosure = create_disclosure(&verified, &[0, 3]).unwrap();
@@ -384,6 +396,9 @@ fn disclosure_with_zero_step_count_fails_verification() {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::Transparent,
         blinding_commitment: None,
+        checkpoints: vec![],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
     let verified = make_verified_with(vec![10, 20], proof);
     let disclosure = create_disclosure(&verified, &[0]).unwrap();

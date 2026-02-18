@@ -240,6 +240,10 @@ fn create_proof(output_tokens: &[u32], privacy: PrivacyMode) -> Result<VerifiedP
     };
     backend.fold_step(&mut acc, &witness)?;
 
+    // Bind I/O hashes to the proof before finalize.
+    acc.input_hash = input_hash;
+    acc.output_hash = output_hash;
+
     let proof = backend.finalize(acc)?;
     Ok(proof)
 }

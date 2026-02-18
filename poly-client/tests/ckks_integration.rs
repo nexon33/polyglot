@@ -12,7 +12,7 @@ use poly_client::encryption::EncryptionBackend;
 use poly_client::protocol::{InferRequest, InferResponse, Mode};
 use poly_client::PolyClient;
 use poly_verified::disclosure::verify_disclosure;
-use poly_verified::types::{PrivacyMode, VerifiedProof};
+use poly_verified::types::{PrivacyMode, VerifiedProof, ZERO_HASH};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -28,6 +28,9 @@ fn hash_ivc_proof() -> VerifiedProof {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::Transparent,
         blinding_commitment: None,
+        checkpoints: vec![[0x04; 32]],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     }
 }
 

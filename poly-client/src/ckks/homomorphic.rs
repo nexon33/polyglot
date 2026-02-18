@@ -64,6 +64,9 @@ fn wrap(c0: Poly, c1: Poly, scale: i64) -> CkksCiphertext {
         chunks: vec![(c0, c1)],
         token_count: 0, // token_count is meaningless for homomorphic results
         scale,
+        auth_tag: None,
+        key_id: None,
+        nonce: None,
     }
 }
 
@@ -230,6 +233,9 @@ mod tests {
             chunks: vec![(c0, c1)],
             token_count: 0,
             scale: DELTA,
+            auth_tag: None,
+            key_id: None,
+            nonce: None,
         }
     }
 
@@ -422,6 +428,9 @@ mod tests {
             ],
             token_count: 0,
             scale: DELTA,
+            auth_tag: None,
+            key_id: None,
+            nonce: None,
         };
         ct_negate(&ct); // should panic
     }

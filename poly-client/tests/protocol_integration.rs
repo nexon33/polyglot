@@ -30,6 +30,9 @@ fn hash_ivc_proof() -> VerifiedProof {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::Transparent,
         blinding_commitment: None,
+        checkpoints: vec![[0x04; 32]],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     }
 }
 
@@ -45,6 +48,9 @@ fn hash_ivc_proof_with_mode(mode: PrivacyMode) -> VerifiedProof {
         } else {
             Some([0x04; 32])
         },
+        checkpoints: vec![[0x04; 32]],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     }
 }
 

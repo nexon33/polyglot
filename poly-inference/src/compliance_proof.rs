@@ -124,11 +124,16 @@ impl ComplianceAccumulator {
     }
 
     /// Finalize the accumulator and produce the compliance proof.
-    pub fn finalize(self) -> Result<ComplianceProof, String> {
+    pub fn finalize(mut self) -> Result<ComplianceProof, String> {
         let policy_hash = *self.checker.policy_hash();
         let total_tokens = self.state.token_history.len() as u64;
         let compliant_tokens = self.state.compliant_count;
         let final_state_hash = self.state.to_hash();
+
+        // Bind I/O hashes: input is always ZERO_HASH (initial state),
+        // output is the final chained state hash.
+        self.acc.input_hash = ZERO_HASH;
+        self.acc.output_hash = final_state_hash;
 
         let ivc_proof = self
             .backend
@@ -161,15 +166,55 @@ pub struct ComplianceProof {
 }
 
 impl ComplianceProof {
-    /// Verify the structural validity of this proof.
+    /// Verify the structural and cryptographic validity of this proof.
+    ///
+    /// Checks:
+    /// 1. IVC proof verifies with actual I/O (ZERO_HASH → final_state_hash)
+    /// 2. total_tokens matches IVC step_count
+    /// 3. policy_hash is bound to code_hash via `H("compliance_check_v1" || policy_hash)`
+    /// 4. compliant_tokens does not exceed total_tokens
     pub fn verify(&self) -> Result<bool, String> {
         let backend = HashIvc;
-        backend
-            .verify(&self.ivc_proof, &ZERO_HASH, &ZERO_HASH)
-            .map_err(|e| format!("proof verification failed: {e}"))
+
+        // 1. Verify IVC proof with actual I/O binding.
+        let input = ZERO_HASH;
+        let output = self.final_state_hash;
+        if !backend
+            .verify(&self.ivc_proof, &input, &output)
+            .map_err(|e| format!("proof verification failed: {e}"))?
+        {
+            return Ok(false);
+        }
+
+        // 2. Cross-check: total_tokens must match IVC step_count.
+        if let VerifiedProof::HashIvc { step_count, .. } = &self.ivc_proof {
+            if *step_count != self.total_tokens {
+                return Ok(false);
+            }
+        }
+
+        // 3. Verify policy_hash is bound to code_hash.
+        let mut code_input = b"compliance_check_v1".to_vec();
+        code_input.extend_from_slice(&self.policy_hash);
+        let expected_code = hash_data(&code_input);
+        if let VerifiedProof::HashIvc { code_hash, .. } = &self.ivc_proof {
+            if *code_hash != expected_code {
+                return Ok(false);
+            }
+        }
+
+        // 4. compliant_tokens must not exceed total_tokens.
+        if self.compliant_tokens > self.total_tokens {
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     /// True if every token passed the policy.
+    ///
+    /// This is a convenience check on the metadata fields. For full verification,
+    /// call `verify()` first to ensure the metadata hasn't been tampered with.
     pub fn all_compliant(&self) -> bool {
         self.total_tokens == self.compliant_tokens
     }

@@ -421,6 +421,12 @@ pub enum VerifiedProof {
         privacy_mode: PrivacyMode,
         /// H(blinding_factors) — present when privacy_mode != Transparent.
         blinding_commitment: Option<Hash>,
+        /// Step transition hashes — verifier reconstructs chain and Merkle tree from these.
+        checkpoints: Vec<Hash>,
+        /// Committed input hash (for I/O binding).
+        input_hash: Hash,
+        /// Committed output hash (for I/O binding).
+        output_hash: Hash,
     },
     /// Mock proof for testing.
     Mock {

@@ -247,6 +247,9 @@ mod tests {
             code_hash: [0x03; 32],
             privacy_mode: PrivacyMode::Transparent,
             blinding_commitment: None,
+            checkpoints: vec![[0x04; 32]],
+            input_hash: ZERO_HASH,
+            output_hash: ZERO_HASH,
         }
     }
 

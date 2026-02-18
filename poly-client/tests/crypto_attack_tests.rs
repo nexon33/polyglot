@@ -157,6 +157,9 @@ fn attack_ciphertext_negation_malleability() {
         chunks: vec![(ct.chunks[0].0.neg(), ct.chunks[0].1.neg())],
         token_count: ct.token_count,
         scale: ct.scale,
+        auth_tag: None,
+        key_id: None,
+        nonce: None,
     };
 
     let decrypted = decrypt(&negated, &sk);
@@ -183,6 +186,9 @@ fn attack_additive_malleability() {
         chunks: vec![(ct.chunks[0].0.add(&offset), ct.chunks[0].1.clone())],
         token_count: ct.token_count,
         scale: ct.scale,
+        auth_tag: None,
+        key_id: None,
+        nonce: None,
     };
 
     let decrypted = decrypt(&tampered, &sk);

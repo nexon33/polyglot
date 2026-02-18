@@ -98,6 +98,9 @@ pub fn expand(args: TokenStream, input: TokenStream) -> TokenStream {
         };
         poly_verified::ivc::IvcBackend::fold_step(&__backend, &mut __acc, &__witness)
             .expect("verified execution: IVC fold step failed");
+        // Bind I/O hashes to the proof before finalize.
+        __acc.input_hash = __input_hash;
+        __acc.output_hash = __output_hash;
         let __proof = poly_verified::ivc::IvcBackend::finalize(&__backend, __acc)
             .expect("verified execution: IVC finalize failed");
     };

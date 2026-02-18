@@ -17,6 +17,7 @@ fn print_proof(_label: &str, proof: &VerifiedProof) {
             code_hash,
             privacy_mode,
             blinding_commitment,
+            ..
         } => {
             eprintln!("      Backend:     HashIvc (quantum-resistant)");
             eprintln!("      Chain tip:   {}", hex::encode(chain_tip));
@@ -244,7 +245,7 @@ fn proof_json(proof: &VerifiedProof) -> serde_json::Value {
     match proof {
         VerifiedProof::HashIvc {
             chain_tip, merkle_root, step_count, code_hash,
-            privacy_mode, blinding_commitment,
+            privacy_mode, blinding_commitment, ..
         } => {
             serde_json::json!({
                 "backend": "HashIvc",

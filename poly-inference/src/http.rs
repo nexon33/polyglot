@@ -580,6 +580,7 @@ fn proof_to_summary(
             code_hash,
             privacy_mode,
             blinding_commitment,
+            ..
         } => ProofSummary {
             backend: "HashIvc".into(),
             privacy_mode: format!("{:?}", privacy_mode),

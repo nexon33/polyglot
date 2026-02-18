@@ -29,6 +29,9 @@ fn mock_hash_ivc_proof() -> VerifiedProof {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::Transparent,
         blinding_commitment: None,
+        checkpoints: vec![],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     }
 }
 
@@ -313,6 +316,9 @@ fn attack_proof_zero_step_count() {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::Transparent,
         blinding_commitment: None,
+        checkpoints: vec![],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
 
     let backend = HashIvc;
@@ -333,6 +339,9 @@ fn attack_proof_private_without_blinding() {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::Private,
         blinding_commitment: None, // missing!
+        checkpoints: vec![],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
 
     let backend = HashIvc;
@@ -353,6 +362,9 @@ fn attack_proof_private_inputs_without_blinding() {
         code_hash: [0x03; 32],
         privacy_mode: PrivacyMode::PrivateInputs,
         blinding_commitment: None, // missing!
+        checkpoints: vec![],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
 
     let backend = HashIvc;
@@ -832,6 +844,9 @@ fn attack_private_mode_hides_code_hash() {
         code_hash: real_code,
         privacy_mode: PrivacyMode::Private,
         blinding_commitment: Some([0xAA; 32]),
+        checkpoints: vec![],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
 
     assert_eq!(
@@ -852,6 +867,9 @@ fn attack_private_inputs_shows_code_hash() {
         code_hash: real_code,
         privacy_mode: PrivacyMode::PrivateInputs,
         blinding_commitment: Some([0xAA; 32]),
+        checkpoints: vec![],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
 
     assert_eq!(
@@ -872,6 +890,9 @@ fn attack_transparent_shows_code_hash() {
         code_hash: real_code,
         privacy_mode: PrivacyMode::Transparent,
         blinding_commitment: None,
+        checkpoints: vec![],
+        input_hash: ZERO_HASH,
+        output_hash: ZERO_HASH,
     };
 
     assert_eq!(

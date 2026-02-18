@@ -33,7 +33,7 @@ pub mod sampling;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 
-pub use ciphertext::CkksCiphertext;
+pub use ciphertext::{compute_key_id, CkksCiphertext};
 pub use eval_key::CkksEvalKey;
 pub use keys::{CkksPublicKey, CkksSecretKey};
 

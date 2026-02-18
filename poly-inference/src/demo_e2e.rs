@@ -360,6 +360,7 @@ fn print_proof_summary(indent: &str, proof: &VerifiedProof) {
             code_hash,
             privacy_mode,
             blinding_commitment,
+            ..
         } => {
             eprintln!("{}Proof: HashIvc (quantum-resistant)", indent);
             eprintln!("{}  chain_tip:   {}...", indent, &hex::encode(chain_tip)[..16]);
