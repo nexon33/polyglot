@@ -373,15 +373,11 @@ fn decompress_v1<T: DeserializeOwned>(data: &[u8]) -> Result<T, CompressError> {
         });
     }
 
-    let decompressed = zstd::decode_all(&data[HEADER_V1_SIZE..])
-        .map_err(CompressError::Decompress)?;
-
-    if decompressed.len() > MAX_DECOMPRESSED_SIZE {
-        return Err(CompressError::DecompressedSizeExceeded {
-            claimed: decompressed.len(),
-            limit: MAX_DECOMPRESSED_SIZE,
-        });
-    }
+    // R8: Use size-limited decompression to prevent decompression bombs.
+    // Without this, zstd::decode_all would decompress the entire payload into
+    // memory before checking the size limit — a crafted payload with high
+    // compression ratio could exhaust memory (e.g. 1KB compressed → 4GB).
+    let decompressed = decompress_with_limit(&data[HEADER_V1_SIZE..], MAX_DECOMPRESSED_SIZE)?;
 
     if decompressed.len() != original_size {
         return Err(CompressError::SizeMismatch {
@@ -443,15 +439,8 @@ fn decompress_v2_raw<T: DeserializeOwned>(data: &[u8]) -> Result<T, CompressErro
         });
     }
 
-    let decompressed = zstd::decode_all(&data[HEADER_V2_SIZE..])
-        .map_err(CompressError::Decompress)?;
-
-    if decompressed.len() > MAX_DECOMPRESSED_SIZE {
-        return Err(CompressError::DecompressedSizeExceeded {
-            claimed: decompressed.len(),
-            limit: MAX_DECOMPRESSED_SIZE,
-        });
-    }
+    // R8: Use size-limited decompression to prevent decompression bombs.
+    let decompressed = decompress_with_limit(&data[HEADER_V2_SIZE..], MAX_DECOMPRESSED_SIZE)?;
 
     let unshuffled = byte_unshuffle(&decompressed, element_size);
 
@@ -463,6 +452,36 @@ fn decompress_v2_raw<T: DeserializeOwned>(data: &[u8]) -> Result<T, CompressErro
     }
 
     bincode::deserialize(&unshuffled).map_err(CompressError::Deserialize)
+}
+
+/// Decompress zstd data with a streaming size limit.
+///
+/// R8: Prevents decompression bombs by reading at most `max_bytes` from the
+/// zstd stream. If the decompressed output exceeds the limit, returns an error
+/// before the full payload is materialized in memory.
+fn decompress_with_limit(compressed: &[u8], max_bytes: usize) -> Result<Vec<u8>, CompressError> {
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::new(compressed)
+        .map_err(CompressError::Decompress)?;
+    // Allocate up to max_bytes + 1 so we can detect overflow
+    let mut buf = vec![0u8; max_bytes + 1];
+    let mut total = 0usize;
+    loop {
+        let n = decoder.read(&mut buf[total..])
+            .map_err(CompressError::Decompress)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if total > max_bytes {
+            return Err(CompressError::DecompressedSizeExceeded {
+                claimed: total,
+                limit: max_bytes,
+            });
+        }
+    }
+    buf.truncate(total);
+    Ok(buf)
 }
 
 /// Byte-shuffle: transpose an array of `element_size`-byte elements so that

@@ -762,6 +762,13 @@ pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: f64) -> RnsCi
 /// the encrypted value or scale. Used to align levels before ct-ct multiply
 /// when operands are at different depths.
 pub fn rns_ct_mod_switch_to(ct: &RnsCiphertext, target_primes: usize) -> RnsCiphertext {
+    // R8: Reject NaN/Inf/negative scales — mod-switching preserves scale, but if
+    // the input has a corrupted scale it will propagate through all downstream ops.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_mod_switch_to: scale must be finite and positive, got {}",
+        ct.scale
+    );
     assert!(target_primes >= 1 && target_primes <= ct.c0.num_primes);
     if target_primes == ct.c0.num_primes {
         return ct.clone();
@@ -809,6 +816,19 @@ pub fn rns_ct_mul_leveled(
     b: &RnsCiphertext,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertextTriple {
+    // R8: Reject NaN/Inf/negative scales — without this, NaN scales bypass the
+    // downstream scale arithmetic (NaN * anything = NaN) and propagate silently
+    // through rescale and decrypt, producing garbage output.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_mul_leveled: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_mul_leveled: b.scale must be finite and positive, got {}",
+        b.scale
+    );
     let target = a.c0.num_primes.min(b.c0.num_primes);
     let a_m = rns_ct_mod_switch_to(a, target);
     let b_m = rns_ct_mod_switch_to(b, target);
@@ -873,6 +893,19 @@ pub fn rns_ct_mul(
     b: &RnsCiphertext,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertextTriple {
+    // R8: Reject NaN/Inf/negative scales — NaN==NaN is false, so the assert_eq
+    // below would pass for NaN scales (not flagging a mismatch), and the product
+    // scale NaN*NaN = NaN would silently propagate through the entire pipeline.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_mul: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_mul: b.scale must be finite and positive, got {}",
+        b.scale
+    );
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
 
@@ -901,6 +934,18 @@ pub fn rns_relinearize(
 ) -> RnsCiphertext {
     let digits = decompose_digits(&triple.d2, DECOMP_BITS_RELIN);
     let np = triple.d0.num_primes;
+
+    // R8: Validate eval key has enough digit pairs for the decomposition.
+    // A mismatched eval key (generated with fewer primes) would cause an
+    // out-of-bounds panic in the loop below, or worse, silently use wrong
+    // keys leading to decryption failure.
+    assert!(
+        evk.keys.len() >= digits.len(),
+        "rns_relinearize: eval key has {} digit pairs but ciphertext requires {} \
+         (eval key was generated for fewer primes than the ciphertext)",
+        evk.keys.len(),
+        digits.len()
+    );
 
     let mut c0 = triple.d0;
     let mut c1 = triple.d1;
@@ -1202,10 +1247,17 @@ pub fn rns_matvec(
     let mut result = rns_ct_mul_plain_simd(ct_x, &diag_0, ctx);
 
     // k = 1..d-1: rotate then multiply by tiled diagonal
+    // R8: Skip all-zero diagonals — these arise naturally for sparse matrices
+    // (e.g., identity matrix has all off-diagonals zero). Multiplying by zero
+    // wastes computation and adds unnecessary noise.
     for k in 1..d {
         let diag_k: Vec<f64> = (0..simd::NUM_SLOTS)
             .map(|i| matrix[(i % d) * d + ((i % d) + k) % d])
             .collect();
+        // R8: Skip zero diagonals — no contribution to the result
+        if diag_k.iter().all(|&v| v == 0.0) {
+            continue;
+        }
         let ct_rot = rns_rotate(ct_x, k as i32, rot_keys, ctx);
         let term = rns_ct_mul_plain_simd(&ct_rot, &diag_k, ctx);
         result = rns_ct_add(&result, &term);

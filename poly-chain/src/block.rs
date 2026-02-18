@@ -114,6 +114,60 @@ impl Block {
             .expect("block height overflow")
     }
 
+    /// R8: Validate a block against its expected parent.
+    ///
+    /// Checks:
+    /// 1. Height is exactly parent.height + 1 (no gaps, no rewrites)
+    /// 2. prev_block_hash matches the parent's actual block hash
+    /// 3. Timestamp is >= parent timestamp (monotonically non-decreasing)
+    /// 4. tx_count matches the actual number of transactions
+    /// 5. transactions_root matches the computed Merkle root
+    pub fn validate_against_parent(&self, parent: &BlockHeader) -> Result<()> {
+        // 1. Height continuity
+        let expected_height = parent.height.checked_add(1).ok_or(ChainError::BlockHeightOverflow)?;
+        if self.header.height != expected_height {
+            return Err(ChainError::InvalidEncoding(format!(
+                "block height gap: expected {}, got {}",
+                expected_height, self.header.height,
+            )));
+        }
+
+        // 2. Parent hash chain integrity
+        let expected_parent_hash = parent.block_hash();
+        if self.header.prev_block_hash != expected_parent_hash {
+            return Err(ChainError::InvalidEncoding(format!(
+                "parent hash mismatch: expected {}, got {}",
+                hex_encode(&expected_parent_hash[..4]),
+                hex_encode(&self.header.prev_block_hash[..4]),
+            )));
+        }
+
+        // 3. Timestamp ordering (must be non-decreasing)
+        if self.header.timestamp < parent.timestamp {
+            return Err(ChainError::InvalidTimestamp);
+        }
+
+        // 4. tx_count consistency
+        let actual_count: u32 = self.transactions.len().try_into().map_err(|_| {
+            ChainError::InvalidEncoding(format!("too many transactions: {}", self.transactions.len()))
+        })?;
+        if self.header.tx_count != actual_count {
+            return Err(ChainError::InvalidEncoding(format!(
+                "tx_count mismatch: header says {}, actual {}",
+                self.header.tx_count, actual_count,
+            )));
+        }
+
+        // 5. Transactions root integrity
+        if !self.verify_transactions_root() {
+            return Err(ChainError::InvalidEncoding(
+                "transactions_root does not match computed Merkle root".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Fallible block construction -- returns an error on block height overflow.
     pub fn try_new(
         parent: &BlockHeader,

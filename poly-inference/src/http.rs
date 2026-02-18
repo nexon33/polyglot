@@ -73,7 +73,10 @@ pub struct GenerateRequest {
 
 fn default_max_tokens() -> u32 { 50 }
 fn default_temperature() -> u32 { 700 }
-fn default_seed() -> u64 { 42 }
+/// R8: Default seed uses system entropy to prevent output prediction.
+/// Previously hardcoded to 42, which meant all requests without an explicit seed
+/// produced identical outputs, allowing attackers to predict completions.
+fn default_seed() -> u64 { rand::random::<u64>() }
 fn default_mode() -> String { "transparent".into() }
 
 /// Simple generation response. Text, tokens, execution proof, and compliance proof.
@@ -227,8 +230,19 @@ fn handle_request<B: InferenceBackend>(
     let json_header =
         Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
 
+    // R8: Normalize URL by stripping query string and trailing slashes for routing.
+    // This prevents bypass via `/generate?smuggle=true` or `/generate/` returning 404
+    // while the canonical path works. Only the path component is used for matching.
+    let raw_url = request.url().to_string();
+    let url_path = raw_url.split('?').next().unwrap_or(&raw_url);
+    let url_path = url_path.trim_end_matches('/');
+    // Reject path traversal attempts (e.g., `/generate/../admin`)
+    if url_path.contains("..") {
+        return json_error(400, "invalid request path", json_header);
+    }
+
     // GET /pubkey returns the server's CKKS public key as JSON with hex-encoded bytes
-    if request.url() == "/pubkey" {
+    if url_path == "/pubkey" {
         if request.method() != &Method::Get {
             return json_error(405, "method not allowed (use GET)", json_header);
         }
@@ -248,10 +262,44 @@ fn handle_request<B: InferenceBackend>(
         return json_error(405, "method not allowed", json_header);
     }
 
-    match request.url() {
-        "/infer" => handle_infer(request, backend, json_header),
-        "/generate" => handle_generate(request, json_header),
-        "/generate/encrypted" => handle_generate_encrypted(request, backend, server_sk, json_header),
+    // R8: Validate Content-Type on POST endpoints.
+    // JSON endpoints require application/json; encrypted endpoint requires application/x-pfhe.
+    // Without this check, a reverse proxy routing on Content-Type could be tricked into
+    // forwarding requests to the wrong backend (request smuggling via Content-Type mismatch).
+    let content_type = request.headers().iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_lowercase())
+        .unwrap_or_default();
+
+    match url_path {
+        "/infer" | "/generate" => {
+            if !content_type.is_empty() && !content_type.starts_with("application/json") {
+                return json_error(
+                    415,
+                    "unsupported media type: expected application/json",
+                    json_header,
+                );
+            }
+            if url_path == "/infer" {
+                handle_infer(request, backend, json_header)
+            } else {
+                handle_generate(request, json_header)
+            }
+        }
+        "/generate/encrypted" => {
+            // Accept application/x-pfhe or application/octet-stream for binary payloads
+            if !content_type.is_empty()
+                && !content_type.starts_with("application/x-pfhe")
+                && !content_type.starts_with("application/octet-stream")
+            {
+                return json_error(
+                    415,
+                    "unsupported media type: expected application/x-pfhe",
+                    json_header,
+                );
+            }
+            handle_generate_encrypted(request, backend, server_sk, json_header)
+        }
         _ => json_error(404, "not found", json_header),
     }
 }
@@ -630,7 +678,11 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     // Decode tokens to text for compliance check
     let prompt_text = crate::model::decode(&token_ids);
     if let Err(rejection) = check_prompt(&prompt_text) {
-        return json_error(403, &format!("prompt rejected: {}", rejection), json_header);
+        // R8: Don't echo the specific rejection reason to the client on encrypted endpoint
+        // (same fix as R7 applied to /generate). Prevents attackers from learning which
+        // pattern matched to craft more precise evasions.
+        eprintln!("prompt rejected on /generate/encrypted: {}", rejection);
+        return json_error(403, "prompt rejected by safety filter", json_header);
     }
 
     let prompt_len = token_ids.len();
@@ -653,8 +705,10 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     let infer_response = match backend.infer(&infer_request) {
         Ok(resp) => resp,
         Err(e) => {
-            eprintln!("inference failed: {e}");
-            return json_error(500, "inference failed", json_header);
+            // R8: Return generic message to prevent information leakage about backend internals.
+            // Same pattern as /infer endpoint (which returns "internal server error").
+            eprintln!("inference failed on /generate/encrypted: {e}");
+            return json_error(500, "internal server error", json_header);
         }
     };
 

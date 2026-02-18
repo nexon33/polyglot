@@ -81,8 +81,28 @@ impl FixedPoint {
     }
 
     /// Convert to i64, truncating the fractional part.
+    ///
+    /// **Warning:** If the integer part exceeds `i64` range, the result wraps
+    /// silently. Use [`to_i64_saturating`](Self::to_i64_saturating) for safe conversion.
     pub fn to_i64(&self) -> i64 {
         (self.raw / SCALE) as i64
+    }
+
+    /// Convert to i64 with saturation: clamps at `i64::MIN` / `i64::MAX`
+    /// instead of wrapping on overflow.
+    ///
+    /// [V8-05 FIX] This prevents silent truncation when the integer part
+    /// exceeds the i64 range, which could produce incorrect results in
+    /// verified computations.
+    pub fn to_i64_saturating(&self) -> i64 {
+        let int = self.raw / SCALE;
+        if int > i64::MAX as i128 {
+            i64::MAX
+        } else if int < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            int as i64
+        }
     }
 
     /// Convert to u64, saturating at 0 and u64::MAX.
@@ -232,7 +252,9 @@ impl fmt::Debug for FixedPoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let int_part = self.raw / SCALE;
         let frac_part = ((self.raw % SCALE).abs() * 1_000_000) / SCALE;
-        write!(f, "FixedPoint({int_part}.{frac_part:06})")
+        // [V8-01 FIX] Same negative-fractional sign fix as Display.
+        let sign = if self.raw < 0 && int_part == 0 { "-" } else { "" };
+        write!(f, "FixedPoint({sign}{int_part}.{frac_part:06})")
     }
 }
 
@@ -243,7 +265,11 @@ impl fmt::Display for FixedPoint {
         if frac_part == 0 {
             write!(f, "{int_part}")
         } else {
-            write!(f, "{int_part}.{frac_part:06}")
+            // [V8-01 FIX] For negative values in the range (-1, 0), int_part is 0
+            // which loses the sign. We must explicitly print "-" when the raw
+            // value is negative but int_part rounds to zero.
+            let sign = if self.raw < 0 && int_part == 0 { "-" } else { "" };
+            write!(f, "{sign}{int_part}.{frac_part:06}")
         }
     }
 }

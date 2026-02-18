@@ -34,6 +34,10 @@
 //! - R7: Phase 2/3 message types require handshake authentication
 //! - R7: Client-side HelloAck deserialization uses size-limited bincode (prevents OOM)
 //! - R7: Client-side HelloAck timestamp freshness check (prevents replay)
+//! - R8: InferRequest.model_id length capped at 256 bytes (prevents echo amplification)
+//! - R8: Error message type requires handshake (was falling through to unguarded catch-all)
+//! - R8: decode_hello/decode_hello_ack use size-limited bincode (public API hardening)
+//! - R8: Client-side HelloAck NodeInfo field validation (addresses, models, model_name, throughput)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,6 +98,13 @@ const MAX_SIGNATURE_LEN: usize = 64;
 /// Prevents a single request from passing an oversized encrypted payload
 /// that wastes memory in the inference backend's spawn_blocking task.
 const MAX_ENCRYPTED_INPUT_SIZE: usize = 1 * 1024 * 1024;
+
+/// Maximum allowed length for InferRequest.model_id (bytes).
+/// Even when model_name == "mock" (which skips the match check), we still
+/// need to bound this string to prevent memory waste. The model_id passes
+/// through to the InferResponse and is echoed back to the client, so a
+/// 4 MB model_id in the request would cause a 4 MB model_id in the response.
+pub const MAX_MODEL_ID_LEN: usize = 256;
 
 /// Client-side timeout for reading inference response.
 /// Prevents a malicious/slow server from tying up the client indefinitely.
@@ -522,6 +533,19 @@ async fn handle_stream(
             // tying up compute slots with requests that will always fail.
             let request = inference::decode_infer_request(&frame.payload)?;
 
+            // R8: Cap model_id length. Even for "mock" mode, an oversized
+            // model_id wastes memory because it passes through to the
+            // InferResponse (echoed back to the client), and is logged on
+            // rejection. Without this, model_id can be up to ~4MB.
+            if request.model_id.len() > MAX_MODEL_ID_LEN {
+                warn!(
+                    "Rejected InferRequest: model_id too long ({} bytes, max {})",
+                    request.model_id.len(),
+                    MAX_MODEL_ID_LEN
+                );
+                return Ok(());
+            }
+
             // R5: Validate model_id matches what this node serves.
             // Prevents confusion attacks where a client asks for a different
             // model than what the node advertises.
@@ -605,7 +629,27 @@ async fn handle_stream(
             return Ok(());
         }
 
+        // R8: Explicitly handle Error message type. Before this fix,
+        // Error fell into the catch-all `other` arm, which was not gated
+        // by handshake_done. An unauthenticated client could send Error
+        // frames to burn stream counter slots without authenticating.
+        MessageType::Error => {
+            if !handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
+                warn!("Rejected unauthenticated Error message from client");
+                return Ok(());
+            }
+            warn!("Received Error message from client: {} bytes payload", frame.payload.len());
+            return Ok(());
+        }
+
+        // Catch-all for any new message types added in the future.
+        // This arm requires handshake to prevent unauthenticated probing.
+        #[allow(unreachable_patterns)]
         other => {
+            if !handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
+                warn!("Rejected unauthenticated unknown message type: {:?}", other);
+                return Ok(());
+            }
             warn!("Unhandled message type: {:?}", other);
             return Ok(());
         }
@@ -719,6 +763,40 @@ pub async fn connect_and_infer(
                 anyhow::bail!(
                     "server HelloAck timestamp too stale (drift={}s, max={}s)",
                     now - ts, MAX_HELLO_TIMESTAMP_DRIFT_SECS
+                );
+            }
+        }
+        // R8: Validate server's HelloAck NodeInfo field lengths. The server
+        // performs these checks on the client's Hello, but the client did not
+        // validate the server's HelloAck. A malicious server could send a
+        // bloated HelloAck with hundreds of addresses/models within the 64KB
+        // bincode limit, wasting client memory.
+        if ack.node_info.addresses.len() > MAX_NODEINFO_ADDRESSES {
+            anyhow::bail!(
+                "server HelloAck has too many addresses ({}, max {})",
+                ack.node_info.addresses.len(),
+                MAX_NODEINFO_ADDRESSES
+            );
+        }
+        if ack.node_info.models.len() > MAX_NODEINFO_MODELS {
+            anyhow::bail!(
+                "server HelloAck has too many models ({}, max {})",
+                ack.node_info.models.len(),
+                MAX_NODEINFO_MODELS
+            );
+        }
+        for m in &ack.node_info.models {
+            if m.model_name.len() > MAX_MODEL_NAME_LEN {
+                anyhow::bail!(
+                    "server HelloAck model_name too long ({} bytes, max {})",
+                    m.model_name.len(),
+                    MAX_MODEL_NAME_LEN
+                );
+            }
+            if !m.throughput_estimate.is_finite() || m.throughput_estimate < 0.0 {
+                anyhow::bail!(
+                    "server HelloAck has invalid throughput_estimate ({})",
+                    m.throughput_estimate
                 );
             }
         }

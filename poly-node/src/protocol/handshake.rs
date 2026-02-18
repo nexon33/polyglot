@@ -3,8 +3,13 @@
 //! The first exchange on a new QUIC connection. Both sides send their
 //! NodeInfo so each knows the other's identity, capabilities, and addresses.
 
+use bincode::Options;
 use crate::protocol::wire::NodeInfo;
 use serde::{Deserialize, Serialize};
+
+/// Maximum size for deserialization of Hello/HelloAck (64 KB).
+/// Matches the limit used in node.rs for server-side Hello deserialization.
+const MAX_HANDSHAKE_MSG_SIZE: u64 = 64 * 1024;
 
 /// Initial handshake message sent by the connecting peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,14 +38,28 @@ pub fn encode_hello(hello: &Hello) -> anyhow::Result<Vec<u8>> {
     Ok(bincode::serialize(hello)?)
 }
 
+/// R8: Use size-limited bincode for Hello deserialization.
+/// Before this fix, decode_hello used raw bincode::deserialize which could
+/// allocate unbounded memory on crafted payloads. While the server's Hello
+/// handler in node.rs already uses size-limited bincode, this public API
+/// function was unprotected and could be called by other code paths.
 pub fn decode_hello(data: &[u8]) -> anyhow::Result<Hello> {
-    Ok(bincode::deserialize(data)?)
+    Ok(bincode::DefaultOptions::new()
+        .with_limit(MAX_HANDSHAKE_MSG_SIZE)
+        .with_fixint_encoding()
+        .deserialize(data)?)
 }
 
 pub fn encode_hello_ack(ack: &HelloAck) -> anyhow::Result<Vec<u8>> {
     Ok(bincode::serialize(ack)?)
 }
 
+/// R8: Use size-limited bincode for HelloAck deserialization.
+/// Before this fix, decode_hello_ack used raw bincode::deserialize which
+/// could allocate unbounded memory on crafted payloads from a malicious server.
 pub fn decode_hello_ack(data: &[u8]) -> anyhow::Result<HelloAck> {
-    Ok(bincode::deserialize(data)?)
+    Ok(bincode::DefaultOptions::new()
+        .with_limit(MAX_HANDSHAKE_MSG_SIZE)
+        .with_fixint_encoding()
+        .deserialize(data)?)
 }

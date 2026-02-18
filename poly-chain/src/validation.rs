@@ -475,6 +475,15 @@ fn validate_wallet_sync(
     // 0. Validate timestamp
     validate_timestamp(tx.timestamp, now)?;
 
+    // R8: Reject ZERO_HASH as new_state_hash. The SMT treats ZERO_HASH as
+    // a delete sentinel — setting a wallet to ZERO_HASH effectively removes it,
+    // allowing an attacker to delete their own wallet and evade fraud tracking.
+    if tx.new_state_hash == ZERO_HASH {
+        return Err(ChainError::InvalidEncoding(
+            "new_state_hash must not be zero (would delete wallet)".into(),
+        ));
+    }
+
     // 0b. Verify signature — only the account owner can sync their wallet
     let signing_msg = wallet_sync_signing_message(tx);
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
@@ -523,6 +532,16 @@ fn validate_identity_register(
     // Check for duplicate identity registration
     if state.get_identity(&tx.account_id).is_some() {
         return Err(ChainError::DuplicateIdentity);
+    }
+
+    // R8: Reject ZERO_HASH as identity_hash. A zero identity hash is an
+    // uninitialized/empty sentinel value. Registering with it would create a
+    // trivially guessable identity that collides with the system's default
+    // "not set" value, potentially letting attackers claim another user's identity.
+    if tx.identity_hash == ZERO_HASH {
+        return Err(ChainError::InvalidEncoding(
+            "identity_hash must not be zero".into(),
+        ));
     }
 
     // PublicOfficial tier requires is_public_official flag
@@ -797,6 +816,15 @@ fn validate_stp_action(
             if contract.staked_amount == 0 {
                 return Err(ChainError::STPError(
                     "contract must have non-zero staked amount".into(),
+                ));
+            }
+
+            // R8: Contract must be registered with Active status. Allowing Suspended or
+            // Terminated status creates a sham contract that satisfies the "has contract"
+            // check in TriggerInvestigation but provides no actual accountability.
+            if contract.status != crate::stp::ContractStatus::Active {
+                return Err(ChainError::STPError(
+                    "contract must be registered with Active status".into(),
                 ));
             }
 

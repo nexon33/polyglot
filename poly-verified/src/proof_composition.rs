@@ -21,9 +21,25 @@ pub struct CompositeProof {
     pub privacy_mode: PrivacyMode,
 }
 
+/// Maximum number of inner proofs allowed in a composite.
+/// A realistic verified computation graph should not exceed 1024 nested calls.
+/// This prevents DoS via allocation of millions of serialized proof hashes.
+pub const MAX_INNER_PROOFS: usize = 1024;
+
 impl CompositeProof {
     /// Create a composite proof from an outer proof and a list of inner proofs.
+    ///
+    /// # Panics
+    /// Panics if `inner_proofs.len()` exceeds [`MAX_INNER_PROOFS`] (1024).
     pub fn compose(outer_proof: VerifiedProof, inner_proofs: Vec<VerifiedProof>) -> Self {
+        // [V8-03 FIX] Cap the number of inner proofs to prevent DoS via
+        // unbounded serialization and hashing in compute_composition_hash.
+        assert!(
+            inner_proofs.len() <= MAX_INNER_PROOFS,
+            "CompositeProof: inner_proofs count {} exceeds maximum {}",
+            inner_proofs.len(),
+            MAX_INNER_PROOFS,
+        );
         let composition_hash = Self::compute_composition_hash(&outer_proof, &inner_proofs);
         let privacy_mode = Self::most_restrictive_privacy(&outer_proof, &inner_proofs);
         Self {
@@ -82,6 +98,13 @@ impl CompositeProof {
     /// structurally valid (step_count > 0 for HashIvc), and all inner
     /// proofs must also be structurally valid.
     pub fn verify_composition(&self) -> bool {
+        // [V8-03 FIX] Reject composites with too many inner proofs.
+        // A deserialized CompositeProof bypasses the compose() constructor,
+        // so we must also check the cap during verification.
+        if self.inner_proofs.len() > MAX_INNER_PROOFS {
+            return false;
+        }
+
         // [V7-05 FIX] Structural validation of all contained proofs.
         // Without this, an attacker could wrap invalid proofs inside a
         // CompositeProof and the composition hash would still verify,

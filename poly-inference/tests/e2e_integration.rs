@@ -642,8 +642,9 @@ fn http_encrypted_bad_ciphertext() {
         "max_tokens": 10,
     });
 
+    // R8: Use application/x-pfhe content type (encrypted endpoint now validates Content-Type)
     let resp = ureq::post(&url)
-        .content_type("application/json")
+        .content_type("application/x-pfhe")
         .send(&serde_json::to_string(&req_body).unwrap());
 
     match resp {
