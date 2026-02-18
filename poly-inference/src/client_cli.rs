@@ -27,12 +27,17 @@ fn main() {
     let mut temperature: u32 = 700;
     let mut seed: u64 = 42;
     let mut mode = "encrypted".to_string();
+    let mut model_name = "0.6b".to_string();
     let mut prompt = String::new();
 
     // Simple arg parsing
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--model" => {
+                i += 1;
+                model_name = args.get(i).cloned().unwrap_or(model_name);
+            }
             "--server" | "-s" => {
                 i += 1;
                 server = args.get(i).cloned().unwrap_or(server);
@@ -76,7 +81,7 @@ fn main() {
     }
 
     match mode.as_str() {
-        "encrypted" => run_encrypted(&server, &prompt, max_tokens, temperature, seed),
+        "encrypted" => run_encrypted(&server, &prompt, max_tokens, temperature, seed, &model_name),
         "transparent" | "private" | "private_inputs" => {
             run_plaintext(&server, &prompt, max_tokens, temperature, seed, &mode)
         }
@@ -115,7 +120,7 @@ fn print_usage() {
 // Encrypted mode: CKKS end-to-end
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, seed: u64) {
+fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, seed: u64, model_name: &str) {
     let total_start = Instant::now();
 
     eprintln!();
@@ -132,7 +137,7 @@ fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, 
     // [1] Load tokenizer
     eprint!("[1/7] Loading tokenizer...");
     let t = Instant::now();
-    model::load_tokenizer_only().expect("failed to load tokenizer");
+    model::load_tokenizer_for(&model_name).expect("failed to load tokenizer");
     eprintln!(" done ({:.1}s)", t.elapsed().as_secs_f64());
 
     // [2] Tokenize prompt locally

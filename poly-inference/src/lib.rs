@@ -5,7 +5,7 @@
 //!
 //! ## Components
 //!
-//! - **`model`** — Qwen3-0.6B model loading, tokenization, detokenization
+//! - **`model`** — Model loading (Qwen3, LLaMA/Nanbeige), tokenization, detokenization
 //! - **`inference`** — Verified generation with `#[verified]` macro (transparent, private, private_inputs)
 //! - **`server`** — `InferenceBackend` trait + `MockInferenceBackend` + `RealInferenceBackend`
 //! - **`http`** — HTTP transport via `tiny_http`

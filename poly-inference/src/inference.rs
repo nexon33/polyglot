@@ -6,14 +6,18 @@ use crate::compliance::{ContentPolicy, PolicyChecker, TokenVerdict};
 use crate::compliance_proof::{ComplianceAccumulator, ComplianceProof};
 use crate::model::{DEVICE, MODEL};
 
-/// Qwen3 EOS token IDs.
-const EOS_TOKENS: &[u32] = &[
+/// Qwen3 EOS token IDs (fallback if model not yet loaded).
+const QWEN3_EOS_TOKENS: &[u32] = &[
     151643, // <|endoftext|>
     151645, // <|im_end|>
 ];
 
 fn is_eos(token_id: u32) -> bool {
-    EOS_TOKENS.contains(&token_id)
+    if let Some(eos) = crate::model::EOS_TOKENS.get() {
+        eos.contains(&token_id)
+    } else {
+        QWEN3_EOS_TOKENS.contains(&token_id)
+    }
 }
 
 /// Extract last-position logits as a 1D [vocab_size] tensor.

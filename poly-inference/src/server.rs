@@ -4,7 +4,7 @@
 //! client's `EncryptionBackend`. Two implementations:
 //!
 //! - `MockInferenceBackend` — predictable output, real HashIvc proofs, no model weights.
-//! - `RealInferenceBackend` — actual Qwen3-0.6B inference via Candle.
+//! - `RealInferenceBackend` — actual model inference via Candle (Qwen3, LLaMA/Nanbeige).
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
