@@ -563,6 +563,17 @@ fn validate_identity_register(
         ));
     }
 
+    // R13: Non-PublicOfficial tier must NOT have is_public_official flag.
+    // Without this check, an Identified or Pseudonymous account could set
+    // the flag to true, creating an inconsistent identity record that claims
+    // public official status without the corresponding tier restrictions
+    // (lower reporting threshold, STP accountability).
+    if tx.tier != Tier::PublicOfficial && tx.is_public_official {
+        return Err(ChainError::TierViolation(
+            "is_public_official flag requires PublicOfficial tier".into(),
+        ));
+    }
+
     // R9: Limit office string length to prevent memory exhaustion.
     // An unbounded string could be multi-megabyte, causing excessive memory
     // use during serialization (to_bytes, serde_json, signing messages).
@@ -636,6 +647,15 @@ fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp)
         });
     }
 
+    // R13: Reject empty backup payloads. An empty encrypted_state stores
+    // nothing useful but consumes a nonce and chain storage. It also
+    // creates a backup that cannot be meaningfully restored.
+    if tx.encrypted_state.is_empty() {
+        return Err(ChainError::InvalidEncoding(
+            "backup encrypted_state must not be empty".into(),
+        ));
+    }
+
     // 0. Verify signature — only the account owner can store backups
     let signing_msg = backup_store_signing_message(tx);
     verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
@@ -689,6 +709,15 @@ fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timest
     // 0b. Nonce validation
     let next_nonce = validate_nonce(state, &tx.account_id, tx.nonce)?;
     new_state.set_nonce(tx.account_id, next_nonce);
+
+    // R13: Wallet must exist before restoring. Previously, backup restore
+    // would create a wallet for any account that had a backup entry but no
+    // wallet (e.g., if the wallet was burned by a fraud proof). This bypasses
+    // the normal wallet creation path (IdentityRegister) and lets fraud-burned
+    // accounts regain wallets without re-registering.
+    if state.get_wallet(&tx.account_id).is_none() {
+        return Err(ChainError::AccountNotFound(hex_encode(&tx.account_id[..4])));
+    }
 
     // 1. Verify backup exists
     let backup_hash = state
@@ -875,6 +904,29 @@ fn validate_stp_action(
             // (higher threshold, lower stake) to reduce their accountability.
             if state.get_stp_record(&contract.official).is_some() {
                 return Err(ChainError::DuplicateSTPContract);
+            }
+
+            // R13: Official must have a registered identity. Without this check,
+            // an unidentified account can register an STP contract, creating a
+            // "phantom official" with no KYC accountability.
+            if state.get_identity(&contract.official).is_none() {
+                return Err(ChainError::IdentityNotFound(hex_encode(&contract.official[..4])));
+            }
+
+            // R13: Official must have a wallet. Without this check, an account
+            // with no wallet can register a contract claiming staked_amount,
+            // but there is no wallet to debit the stake from.
+            if state.get_wallet(&contract.official).is_none() {
+                return Err(ChainError::AccountNotFound(hex_encode(&contract.official[..4])));
+            }
+
+            // R13: Contract identity_hash must not be ZERO_HASH. A zero hash
+            // is an uninitialized sentinel value and would create a contract
+            // with a trivially guessable/colliding identity reference.
+            if contract.identity_hash == ZERO_HASH {
+                return Err(ChainError::STPError(
+                    "contract identity_hash must not be zero".into(),
+                ));
             }
 
             // R9: Limit office string length to prevent memory exhaustion.
@@ -1133,6 +1185,14 @@ fn validate_atomic_swap_init(
         .get_wallet(&tx.responder)
         .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.responder[..4])))?;
 
+    // R13: Initiator wallet must also exist. Previously only the responder
+    // wallet was checked. Without this, the initiator (who will claim the
+    // funds) may not have an identity or wallet, allowing swap claims to
+    // create wallets for unregistered accounts.
+    let _ = state
+        .get_wallet(&tx.initiator)
+        .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.initiator[..4])))?;
+
     // 2. Verify swap_id is canonically derived: H(initiator || responder || nonce)
     let expected_swap_id = hash_with_domain(
         DOMAIN_SWAP,
@@ -1276,8 +1336,15 @@ fn validate_atomic_swap_claim(
     // 5. Remove swap (claimed — no longer active)
     new_state.remove_swap(&tx.swap_id);
 
+    // R13: Claimer wallet must exist. Previously used unwrap_or(ZERO_HASH),
+    // which silently created a wallet for non-existent accounts, bypassing
+    // identity registration and KYC requirements. A fraud-burned account
+    // could also regain a wallet through this path.
+    let claimer_current = state
+        .get_wallet(&tx.claimer)
+        .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.claimer[..4])))?;
+
     // 6. Credit claimer (initiator receives the locked funds)
-    let claimer_current = state.get_wallet(&tx.claimer).unwrap_or(ZERO_HASH);
     let new_claimer_hash = hash_with_domain(
         DOMAIN_WALLET_STATE,
         &[
@@ -1353,8 +1420,15 @@ fn validate_atomic_swap_refund(
     // 5. Remove swap (refunded — no longer active)
     new_state.remove_swap(&tx.swap_id);
 
+    // R13: Refundee wallet must exist. Previously used unwrap_or(ZERO_HASH),
+    // which silently created a wallet for non-existent accounts. A fraud-burned
+    // account could regain a wallet through the refund path, bypassing the
+    // burn enforcement.
+    let refundee_current = state
+        .get_wallet(&tx.refundee)
+        .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.refundee[..4])))?;
+
     // 6. Credit refundee (responder gets their locked funds back)
-    let refundee_current = state.get_wallet(&tx.refundee).unwrap_or(ZERO_HASH);
     let new_refundee_hash = hash_with_domain(
         DOMAIN_WALLET_STATE,
         &[
@@ -1416,6 +1490,24 @@ mod tests {
             office: None,
         };
         state.set_identity(recipient, recipient_record.record_hash());
+
+        // R13: Set up a third account for swap initiator tests ([3u8; 32]).
+        // Previously swap init only checked the responder's wallet, but now
+        // also checks the initiator's wallet. Swap tests use [3u8; 32] as
+        // initiator, so it needs a wallet and identity.
+        let swap_initiator = [3u8; 32];
+        let swap_wallet = WalletState::new([0xCC; 32], Tier::Identified, 0);
+        state.set_wallet(swap_initiator, swap_wallet.state_hash());
+        let swap_record = IdentityRecord {
+            account_id: swap_initiator,
+            tier: Tier::Identified,
+            identity_hash: [0xCC; 32],
+            jurisdiction: 840,
+            registered_at: 0,
+            is_public_official: false,
+            office: None,
+        };
+        state.set_identity(swap_initiator, swap_record.record_hash());
 
         (state, sender, recipient)
     }
@@ -1619,8 +1711,21 @@ mod tests {
 
     #[test]
     fn validate_stp_register_contract() {
-        let state = GlobalState::genesis();
+        // R13: Official must have identity and wallet before registering a contract.
+        let mut state = GlobalState::genesis();
         let official = [0x10; 32];
+        let wallet = WalletState::new([0xAA; 32], Tier::PublicOfficial, 0);
+        state.set_wallet(official, wallet.state_hash());
+        let identity = IdentityRecord {
+            account_id: official,
+            tier: Tier::PublicOfficial,
+            identity_hash: [0xAA; 32],
+            jurisdiction: 840,
+            registered_at: 0,
+            is_public_official: true,
+            office: Some("Mayor".into()),
+        };
+        state.set_identity(official, identity.record_hash());
 
         let contract = crate::stp::ServiceContract {
             official,

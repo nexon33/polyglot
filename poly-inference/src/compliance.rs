@@ -457,7 +457,14 @@ fn is_invisible_char(ch: char) -> bool {
         '\u{20D0}'..='\u{20FF}' | // R7: combining diacritical marks for symbols
         '\u{FE20}'..='\u{FE2F}' | // R7: combining half marks
         '\u{E0001}'..='\u{E007F}' | // R7: tag characters (invisible metadata)
-        '\u{E0100}'..='\u{E01EF}'   // R7: variation selectors supplement
+        '\u{E0100}'..='\u{E01EF}' | // R7: variation selectors supplement
+        // R13: Bidirectional override/embedding/isolate characters.
+        // These are invisible formatting characters that reorder displayed text.
+        // Attackers use them to craft prompts that visually appear benign but contain
+        // harmful text when processed by the model. They also break substring matching
+        // by inserting zero-width directionality changes between pattern characters.
+        '\u{202A}'..='\u{202E}' | // LRE, RLE, PDF, LRO, RLO
+        '\u{2066}'..='\u{2069}'   // LRI, RLI, FSI, PDI
     )
 }
 
@@ -608,6 +615,40 @@ fn confusable_to_ascii(ch: char) -> Option<char> {
         '\u{1D20}' => Some('V'), // Latin letter small capital V
         '\u{1D21}' => Some('W'), // Latin letter small capital W
         '\u{1D22}' => Some('Z'), // Latin letter small capital Z
+        // R13: Superscript Latin letters (in the Superscript/Subscript block alongside digits)
+        // U+2071 and U+207F are letter forms that were missed when digits were added.
+        '\u{2071}' => Some('i'), // superscript latin small letter i
+        '\u{207F}' => Some('n'), // superscript latin small letter n
+        // R13: Subscript modifier Latin letters (Phonetic Extensions block)
+        // These are small subscript forms that visually resemble their base letters.
+        '\u{1D62}' => Some('i'), // Latin subscript small letter i
+        '\u{1D63}' => Some('r'), // Latin subscript small letter r
+        '\u{1D64}' => Some('u'), // Latin subscript small letter u
+        '\u{1D65}' => Some('v'), // Latin subscript small letter v
+        '\u{1D66}' => Some('b'), // Latin subscript small letter beta -> b
+        '\u{1D67}' => Some('x'), // Latin subscript small letter chi -> x
+        '\u{1D68}' => Some('r'), // Latin subscript small letter rho -> r
+        '\u{1D69}' => Some('o'), // Latin subscript small letter phi -> o
+        '\u{1D6A}' => Some('x'), // Latin subscript small letter chi -> x
+        // R13: Latin subscript small letters in the Phonetic Extensions Supplement block
+        '\u{2090}' => Some('a'), // Latin subscript small letter a
+        '\u{2091}' => Some('e'), // Latin subscript small letter e
+        '\u{2092}' => Some('o'), // Latin subscript small letter o
+        '\u{2093}' => Some('x'), // Latin subscript small letter x
+        '\u{2094}' => Some('e'), // Latin subscript small letter schwa -> e
+        '\u{2095}' => Some('h'), // Latin subscript small letter h
+        '\u{2096}' => Some('k'), // Latin subscript small letter k
+        '\u{2097}' => Some('l'), // Latin subscript small letter l
+        '\u{2098}' => Some('m'), // Latin subscript small letter m
+        '\u{2099}' => Some('n'), // Latin subscript small letter n
+        '\u{209A}' => Some('p'), // Latin subscript small letter p
+        '\u{209B}' => Some('s'), // Latin subscript small letter s
+        '\u{209C}' => Some('t'), // Latin subscript small letter t
+        // R13: Modifier Tone Letters that visually resemble punctuation
+        // U+A789 (modifier letter colon) looks like ':' but is classified as a letter,
+        // so it survives the interleave punctuation stripping. Must be explicitly stripped.
+        '\u{A789}' => Some(':'), // modifier letter colon -> ':'
+        '\u{A78A}' => Some('='), // modifier letter short equals sign -> '='
         _ => None,
     }
 }
@@ -828,8 +869,9 @@ fn strip_interleaved_punctuation(input: &str) -> String {
 /// in evasion attacks. Only includes characters that would never appear between
 /// letters in normal text patterns we're matching against.
 /// R12: Added '#', '@', '+', '^', '=' which are also used in leet-speak evasion.
+/// R13: Added ':' to catch modifier letter colon (U+A789 -> ':') used as spacer.
 fn is_interleave_punctuation(ch: char) -> bool {
-    matches!(ch, '.' | '-' | '_' | '*' | '~' | '`' | '|' | '/' | '#' | '@' | '+' | '^' | '=')
+    matches!(ch, '.' | '-' | '_' | '*' | '~' | '`' | '|' | '/' | '#' | '@' | '+' | '^' | '=' | ':')
 }
 
 #[cfg(test)]

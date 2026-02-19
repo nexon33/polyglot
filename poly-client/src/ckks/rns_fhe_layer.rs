@@ -181,8 +181,20 @@ pub fn rns_linear_layer(
     rot_keys: &RnsRotationKeySet,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
-    assert_eq!(weights.len(), dim * dim);
-    assert_eq!(biases.len(), dim);
+    // R13: Include descriptive messages — the bare assert_eq! macros produce
+    // unhelpful "assertion failed: left == right" messages without context.
+    // A caller passing the wrong-shaped arrays gets no indication of which
+    // parameter is wrong or what the expected shape should be.
+    assert_eq!(
+        weights.len(), dim * dim,
+        "rns_linear_layer: weights.len() ({}) must equal dim*dim ({}*{}={})",
+        weights.len(), dim, dim, dim * dim
+    );
+    assert_eq!(
+        biases.len(), dim,
+        "rns_linear_layer: biases.len() ({}) must equal dim ({})",
+        biases.len(), dim
+    );
 
     // Matrix-vector multiply: scale becomes ct.scale * ctx.delta
     let ct_wx = rns_matvec(ct_x, weights, dim, rot_keys, ctx);

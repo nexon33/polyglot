@@ -58,6 +58,13 @@
 //! - R12: Frame::new_checked() validates payload at construction (fail-fast before encode)
 //! - R12: Client-side trailing frame data rejected for HelloAck and InferResponse
 //! - R12: Client-side HelloAck frame type validated before deserialization (not after)
+//! - R13: bootstrap_addrs validated (max 64, no self-connection)
+//! - R13: max_sessions capped at MAX_SESSIONS_LIMIT (1024)
+//! - R13: InferRequest.temperature capped at MAX_TEMPERATURE (10_000)
+//! - R13: InferRequest.encrypted_input must be non-empty (prevents backend deserialization failure)
+//! - R13: Zero public key ([0u8; 32]) explicitly rejected in Hello validation
+//! - R13: Duplicate addresses in NodeInfo rejected (prevents gossip amplification)
+//! - R13: Client-side HelloAck version validation (must match PROTOCOL_VERSION)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,6 +156,21 @@ const MAX_CLIENT_RESPONSE_OUTPUT_SIZE: usize = 4 * 1024 * 1024;
 /// streams per connection). Now Ping payloads > 128 bytes are rejected.
 pub const MAX_PING_PAYLOAD: usize = 128;
 
+/// R13: Maximum allowed number of bootstrap addresses in NodeConfig.
+/// Prevents resource exhaustion from excessive connection attempts at startup.
+const MAX_BOOTSTRAP_ADDRS: usize = 64;
+
+/// R13: Maximum allowed max_sessions in NodeConfig.
+/// Without an upper bound, max_sessions=u32::MAX creates semaphores with
+/// billions of permits, effectively disabling all rate limiting defenses.
+const MAX_SESSIONS_LIMIT: u32 = 1024;
+
+/// R13: Maximum allowed temperature in InferRequest (temperature x 1000).
+/// 10_000 represents T=10.0, far above any practical temperature setting.
+/// Values above this cause numerical instability in softmax and produce
+/// degenerate output. Without this cap, u32::MAX (T=~4.3M) passes through.
+pub const MAX_TEMPERATURE: u32 = 10_000;
+
 /// A running Poly Network compute node.
 pub struct PolyNode {
     pub config: NodeConfig,
@@ -168,6 +190,17 @@ impl PolyNode {
         if config.max_sessions == 0 {
             anyhow::bail!("max_sessions must be >= 1 (got 0)");
         }
+        // R13: Validate max_sessions <= MAX_SESSIONS_LIMIT. Without an upper
+        // bound, max_sessions=u32::MAX creates semaphores with billions of
+        // permits, effectively disabling all connection and inference rate
+        // limiting defenses.
+        if config.max_sessions > MAX_SESSIONS_LIMIT {
+            anyhow::bail!(
+                "max_sessions too large: {} (max {})",
+                config.max_sessions,
+                MAX_SESSIONS_LIMIT
+            );
+        }
         // R12: Validate model_name length. The model_name is embedded in every
         // NodeInfo (own_node_info) and broadcast in HelloAck to every connecting
         // peer. Without this check, a multi-MB model_name in the config would be
@@ -177,6 +210,22 @@ impl PolyNode {
                 "model_name too long: {} bytes (max {})",
                 config.model_name.len(),
                 MAX_MODEL_NAME_LEN
+            );
+        }
+        // R13: Validate bootstrap_addrs length and content.
+        // Too many bootstrap addresses waste resources on connection attempts.
+        // Self-connection (listen_addr in bootstrap) creates a loop.
+        if config.bootstrap_addrs.len() > MAX_BOOTSTRAP_ADDRS {
+            anyhow::bail!(
+                "too many bootstrap addresses: {} (max {})",
+                config.bootstrap_addrs.len(),
+                MAX_BOOTSTRAP_ADDRS
+            );
+        }
+        if config.bootstrap_addrs.contains(&config.listen_addr) {
+            anyhow::bail!(
+                "bootstrap_addrs must not contain self (listen_addr={})",
+                config.listen_addr
             );
         }
         let identity = NodeIdentity::generate();
@@ -512,7 +561,15 @@ async fn handle_stream(
             // Verify the client's Ed25519 signature on their NodeInfo
             if accepted {
                 let pk_bytes = hello.node_info.public_key;
-                if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes) {
+                // R13: Reject all-zeros public key (Ed25519 identity point).
+                // The all-zeros key passes VerifyingKey::from_bytes() but is a
+                // well-known weak key. Multiple peers claiming this key would
+                // share the same NodeId, and signatures against it have special
+                // properties that undermine security assumptions.
+                if pk_bytes == [0u8; 32] {
+                    warn!("Rejecting Hello: zero public key (identity point)");
+                    accepted = false;
+                } else if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes) {
                     // Verify NodeId = SHA-256(public_key)
                     let expected_id = crate::identity::compute_node_id(&vk);
                     // Verify signature over the serialized NodeInfo (excluding signature field)
@@ -604,6 +661,22 @@ async fn handle_stream(
                         MAX_SIGNATURE_LEN
                     );
                     accepted = false;
+                }
+                // R13: Reject duplicate addresses — an attacker could include
+                // the same address 16 times to amplify their gossip routing
+                // weight without providing distinct endpoints.
+                if accepted {
+                    let mut unique_addrs = std::collections::HashSet::new();
+                    for a in &hello.node_info.addresses {
+                        if !unique_addrs.insert(a) {
+                            warn!(
+                                "Rejecting Hello: duplicate address {}",
+                                a
+                            );
+                            accepted = false;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -741,6 +814,29 @@ async fn handle_stream(
                     "Rejected InferRequest: encrypted_input too large ({} bytes, max {})",
                     request.encrypted_input.len(),
                     MAX_ENCRYPTED_INPUT_SIZE
+                );
+                return Ok(());
+            }
+
+            // R13: Reject empty encrypted_input. An empty Vec<u8> will fail
+            // deserialization in the backend (serde_json::from_slice(&[])),
+            // producing an error that propagates as a stream failure with no
+            // response. This burns inference semaphore permit time and causes
+            // the client to hang waiting for a response that never comes.
+            // Reject early before acquiring the inference semaphore.
+            if request.encrypted_input.is_empty() {
+                warn!("Rejected InferRequest: encrypted_input is empty");
+                return Ok(());
+            }
+
+            // R13: Cap temperature to prevent numerical instability in softmax.
+            // temperature is defined as "temperature x 1000" (u32), so u32::MAX
+            // represents T=~4.3 million. Anything above MAX_TEMPERATURE (10_000,
+            // i.e., T=10.0) is nonsensical and could cause NaN/Inf in real backends.
+            if request.temperature > MAX_TEMPERATURE {
+                warn!(
+                    "Rejected InferRequest: temperature {} exceeds cap {}",
+                    request.temperature, MAX_TEMPERATURE
                 );
                 return Ok(());
             }
@@ -945,6 +1041,17 @@ pub async fn connect_and_infer(
             .deserialize(&ack_frame.payload)?;
         if !ack.accepted {
             anyhow::bail!("handshake rejected by server");
+        }
+        // R13: Validate server HelloAck version matches client's PROTOCOL_VERSION.
+        // Before R13, the client only checked ack.accepted but not the version.
+        // A malicious server could return version=999 in the HelloAck. The client
+        // would proceed with inference using potentially incompatible wire formats.
+        if ack.version != PROTOCOL_VERSION {
+            anyhow::bail!(
+                "server HelloAck version mismatch: expected {}, got {}",
+                PROTOCOL_VERSION,
+                ack.version
+            );
         }
         // Verify server's Ed25519 signature on its NodeInfo
         // R10: Now verifies signature over ALL NodeInfo fields

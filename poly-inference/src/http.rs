@@ -1004,6 +1004,10 @@ fn check_json_depth(body: &[u8]) -> bool {
 /// - X-Permitted-Cross-Domain-Policies: none — prevents Flash/PDF cross-domain access
 /// - Cross-Origin-Opener-Policy: same-origin — prevents cross-origin window references
 /// - Cross-Origin-Resource-Policy: same-origin — blocks cross-origin resource reads
+/// R13: Added Strict-Transport-Security header.
+/// - Strict-Transport-Security: max-age=63072000; includeSubDomains — instructs browsers
+///   to only access the server over HTTPS for 2 years, preventing MITM downgrade attacks
+///   that intercept inference requests/responses containing sensitive data.
 fn security_headers() -> Vec<Header> {
     vec![
         Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap(),
@@ -1014,6 +1018,7 @@ fn security_headers() -> Vec<Header> {
         Header::from_bytes(&b"X-Permitted-Cross-Domain-Policies"[..], &b"none"[..]).unwrap(),
         Header::from_bytes(&b"Cross-Origin-Opener-Policy"[..], &b"same-origin"[..]).unwrap(),
         Header::from_bytes(&b"Cross-Origin-Resource-Policy"[..], &b"same-origin"[..]).unwrap(),
+        Header::from_bytes(&b"Strict-Transport-Security"[..], &b"max-age=63072000; includeSubDomains"[..]).unwrap(),
     ]
 }
 

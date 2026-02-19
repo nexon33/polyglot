@@ -50,7 +50,14 @@ impl CompositeProof {
         }
     }
 
-    /// Compute the binding hash over all proofs.
+    /// Compute the binding hash over all proofs and the effective privacy mode.
+    ///
+    /// [V13-11 FIX] The privacy_mode is now bound into the composition hash.
+    /// Previously, an attacker could deserialize a CompositeProof, tamper with
+    /// the privacy_mode field (e.g., downgrade Private to Transparent), and
+    /// verify_composition would still pass because privacy_mode was not part
+    /// of the hash. Now the effective (most restrictive) privacy mode is
+    /// included as the final hash_combine step.
     ///
     /// Panics if a proof cannot be serialized (this is a programming error,
     /// not an adversarial condition). Previous code used `unwrap_or_default()`
@@ -67,6 +74,11 @@ impl CompositeProof {
             let inner_hash = hash_data(&inner_bytes);
             combined = hash_combine(&combined, &inner_hash);
         }
+
+        // [V13-11 FIX] Bind the effective privacy mode into the composition hash.
+        let effective_privacy = Self::most_restrictive_privacy(outer, inners);
+        let privacy_binding = hash_data(&[effective_privacy as u8]);
+        combined = hash_combine(&combined, &privacy_binding);
 
         combined
     }
@@ -116,6 +128,15 @@ impl CompositeProof {
             if !Self::is_structurally_valid(inner) {
                 return false;
             }
+        }
+
+        // [V13-11 FIX] Verify that the stored privacy_mode matches the
+        // most restrictive mode computed from the contained proofs. Without
+        // this, an attacker could tamper with the privacy_mode field after
+        // serialization (e.g., downgrade Private to Transparent).
+        let expected_privacy = Self::most_restrictive_privacy(&self.outer_proof, &self.inner_proofs);
+        if self.privacy_mode as u8 != expected_privacy as u8 {
+            return false;
         }
 
         let expected = Self::compute_composition_hash(&self.outer_proof, &self.inner_proofs);

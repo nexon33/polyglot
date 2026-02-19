@@ -1448,7 +1448,13 @@ pub fn replicate_vector(values: &[f64], d: usize) -> Vec<f64> {
     );
     let mut replicated = vec![0.0; simd::NUM_SLOTS];
     for i in 0..simd::NUM_SLOTS {
-        replicated[i] = values[i % d];
+        // R13: Use values.len() for indexing, not d. When values.len() < d,
+        // `i % d` can be >= values.len(), causing an index-out-of-bounds panic.
+        // Positions where `i % d >= values.len()` are treated as zero (padding).
+        // This allows callers to pass fewer values than d, with the remainder
+        // implicitly zero-padded within each period-d block.
+        let slot = i % d;
+        replicated[i] = if slot < values.len() { values[slot] } else { 0.0 };
     }
     replicated
 }
