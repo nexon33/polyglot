@@ -87,24 +87,22 @@ async fn do_handshake(conn: &quinn::Connection) {
 }
 
 /// Helper: create a validly-signed NodeInfo with custom fields
+/// R10: Updated to use compute_nodeinfo_signing_message for full-field signature
 fn make_signed_node_info(
     identity: &NodeIdentity,
     addresses: Vec<SocketAddr>,
     models: Vec<ModelCapability>,
     signature_override: Option<Vec<u8>>,
 ) -> NodeInfo {
+    use poly_node::protocol::wire::compute_nodeinfo_signing_message;
+
     let public_key = identity.public_key_bytes();
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&public_key);
-    msg.extend_from_slice(&timestamp.to_le_bytes());
-    let sig = identity.sign(&msg);
-
-    NodeInfo {
+    let mut info = NodeInfo {
         public_key,
         addresses,
         models,
@@ -115,8 +113,17 @@ fn make_signed_node_info(
             max_sessions: 1,
         },
         timestamp,
-        signature: signature_override.unwrap_or_else(|| sig.to_vec()),
+        signature: vec![],
+    };
+
+    if let Some(sig_override) = signature_override {
+        info.signature = sig_override;
+    } else {
+        let msg = compute_nodeinfo_signing_message(&info);
+        let sig = identity.sign(&msg);
+        info.signature = sig.to_vec();
     }
+    info
 }
 
 // =============================================================================
@@ -839,12 +846,7 @@ async fn r7_audit_node_capacity_not_validated() {
         .unwrap()
         .as_secs();
 
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&public_key);
-    msg.extend_from_slice(&timestamp.to_le_bytes());
-    let sig = identity.sign(&msg);
-
-    let node_info = NodeInfo {
+    let mut node_info = NodeInfo {
         public_key,
         addresses: vec![],
         models: vec![],
@@ -855,8 +857,10 @@ async fn r7_audit_node_capacity_not_validated() {
             max_sessions: u32::MAX,    // Unrealistic
         },
         timestamp,
-        signature: sig.to_vec(),
+        signature: vec![],
     };
+    let signing_msg = poly_node::protocol::wire::compute_nodeinfo_signing_message(&node_info);
+    node_info.signature = identity.sign(&signing_msg).to_vec();
 
     let hello = Hello {
         version: PROTOCOL_VERSION,

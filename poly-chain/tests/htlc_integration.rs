@@ -333,11 +333,19 @@ fn init_with_large_amount() {
 #[test]
 fn init_with_large_timeout() {
     let (state, alice, bob) = setup_wallets();
+    // R10: u64::MAX timeout is now rejected (permanent fund lock attack).
+    // A timeout within MAX_SWAP_TIMEOUT_DELTA (1,000,000) blocks is accepted.
     let swap = make_swap(alice, bob, 5000, u64::MAX, 0);
 
     let tx = Transaction::AtomicSwapInit(swap.clone());
     let result = validate_transaction(&tx, &state, 1000, 50);
-    assert!(result.is_ok());
+    assert!(result.is_err(), "R10: u64::MAX timeout should be rejected");
+
+    // But a large-but-reasonable timeout works
+    let swap_reasonable = make_swap(alice, bob, 5000, 50 + 999_999, 0);
+    let tx_ok = Transaction::AtomicSwapInit(swap_reasonable);
+    let result_ok = validate_transaction(&tx_ok, &state, 1000, 50);
+    assert!(result_ok.is_ok(), "reasonable large timeout should be accepted");
 }
 
 // ---------------------------------------------------------------------------

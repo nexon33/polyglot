@@ -513,6 +513,21 @@ fn confusable_to_ascii(ch: char) -> Option<char> {
         '\u{217D}' => Some('c'),  // ⅽ
         '\u{217E}' => Some('d'),  // ⅾ
         '\u{217F}' => Some('m'),  // ⅿ
+        // R10: Enclosed Alphanumerics (Circled Latin letters)
+        // U+24B6-U+24CF = circled A-Z, U+24D0-U+24E9 = circled a-z
+        // These are visually similar to regular letters and have been used
+        // in filter evasion attacks (documented as gap in R9-18).
+        '\u{24B6}'..='\u{24CF}' => {
+            Some((ch as u32 - 0x24B6 + b'A' as u32) as u8 as char)
+        }
+        '\u{24D0}'..='\u{24E9}' => {
+            Some((ch as u32 - 0x24D0 + b'a' as u32) as u8 as char)
+        }
+        // R10: Parenthesized Latin small letters (U+249C-U+24B5)
+        // e.g., ⒜ ⒝ ⒞ etc.
+        '\u{249C}'..='\u{24B5}' => {
+            Some((ch as u32 - 0x249C + b'a' as u32) as u8 as char)
+        }
         _ => None,
     }
 }
@@ -562,6 +577,57 @@ fn math_alpha_to_ascii(ch: char) -> Option<char> {
     }
     if (0x1D5EE..=0x1D607).contains(&cp) {
         return Some((cp - 0x1D5EE + b'a' as u32) as u8 as char);
+    }
+    // R10: Mathematical Script (A-Z: 1D49C-1D4B5, a-z: 1D4B6-1D4CF)
+    // Note: several codepoints are reserved/replaced (e.g., U+1D49D → ℬ U+212C)
+    // We handle the range and let missing codepoints pass through.
+    if (0x1D49C..=0x1D4B5).contains(&cp) {
+        return Some((cp - 0x1D49C + b'A' as u32) as u8 as char);
+    }
+    if (0x1D4B6..=0x1D4CF).contains(&cp) {
+        return Some((cp - 0x1D4B6 + b'a' as u32) as u8 as char);
+    }
+    // R10: Mathematical Bold Script (A-Z: 1D4D0-1D4E9, a-z: 1D4EA-1D503)
+    if (0x1D4D0..=0x1D4E9).contains(&cp) {
+        return Some((cp - 0x1D4D0 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D4EA..=0x1D503).contains(&cp) {
+        return Some((cp - 0x1D4EA + b'a' as u32) as u8 as char);
+    }
+    // R10: Mathematical Fraktur (A-Z: 1D504-1D51D, a-z: 1D51E-1D537)
+    if (0x1D504..=0x1D51D).contains(&cp) {
+        return Some((cp - 0x1D504 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D51E..=0x1D537).contains(&cp) {
+        return Some((cp - 0x1D51E + b'a' as u32) as u8 as char);
+    }
+    // R10: Mathematical Double-Struck (A-Z: 1D538-1D551, a-z: 1D552-1D56B)
+    if (0x1D538..=0x1D551).contains(&cp) {
+        return Some((cp - 0x1D538 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D552..=0x1D56B).contains(&cp) {
+        return Some((cp - 0x1D552 + b'a' as u32) as u8 as char);
+    }
+    // R10: Mathematical Bold Fraktur (A-Z: 1D56C-1D585, a-z: 1D586-1D59F)
+    if (0x1D56C..=0x1D585).contains(&cp) {
+        return Some((cp - 0x1D56C + b'A' as u32) as u8 as char);
+    }
+    if (0x1D586..=0x1D59F).contains(&cp) {
+        return Some((cp - 0x1D586 + b'a' as u32) as u8 as char);
+    }
+    // R10: Mathematical Sans-Serif Italic (A-Z: 1D608-1D621, a-z: 1D622-1D63B)
+    if (0x1D608..=0x1D621).contains(&cp) {
+        return Some((cp - 0x1D608 + b'A' as u32) as u8 as char);
+    }
+    if (0x1D622..=0x1D63B).contains(&cp) {
+        return Some((cp - 0x1D622 + b'a' as u32) as u8 as char);
+    }
+    // R10: Mathematical Sans-Serif Bold Italic (A-Z: 1D63C-1D655, a-z: 1D656-1D66F)
+    if (0x1D63C..=0x1D655).contains(&cp) {
+        return Some((cp - 0x1D63C + b'A' as u32) as u8 as char);
+    }
+    if (0x1D656..=0x1D66F).contains(&cp) {
+        return Some((cp - 0x1D656 + b'a' as u32) as u8 as char);
     }
     // Mathematical Monospace (A-Z: 1D670-1D689, a-z: 1D68A-1D6A3)
     if (0x1D670..=0x1D689).contains(&cp) {

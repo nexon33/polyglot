@@ -62,9 +62,12 @@ impl Commitment {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        // [V10-01 FIX] Reject trailing bytes. Lax parsing (< instead of !=)
+        // allowed appending arbitrary data after the fixed-size structure,
+        // which could cause signature confusion or parser differential attacks.
+        if data.len() != Self::SIZE {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "commitment: expected {} bytes, got {}",
+                "commitment: expected exactly {} bytes, got {}",
                 Self::SIZE,
                 data.len()
             )));
@@ -124,9 +127,10 @@ impl SignedCommitment {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        // [V10-01 FIX] Reject trailing bytes for strict parsing.
+        if data.len() != Self::SIZE {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "signed commitment: expected {} bytes, got {}",
+                "signed commitment: expected exactly {} bytes, got {}",
                 Self::SIZE,
                 data.len()
             )));
@@ -166,9 +170,10 @@ impl ProofNode {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        // [V10-01 FIX] Reject trailing bytes for strict parsing.
+        if data.len() != Self::SIZE {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "proof node: expected {} bytes, got {}",
+                "proof node: expected exactly {} bytes, got {}",
                 Self::SIZE,
                 data.len()
             )));
@@ -246,9 +251,10 @@ impl MerkleProof {
         }
 
         let expected_size = 108 + 33 * sibling_count;
-        if data.len() < expected_size {
+        // [V10-01 FIX] Reject trailing bytes for strict parsing.
+        if data.len() != expected_size {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "merkle proof: expected {} bytes, got {}",
+                "merkle proof: expected exactly {} bytes, got {}",
                 expected_size,
                 data.len()
             )));
@@ -311,9 +317,10 @@ impl CodeAttestation {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        // [V10-01 FIX] Reject trailing bytes for strict parsing.
+        if data.len() != Self::SIZE {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "code attestation: expected {} bytes, got {}",
+                "code attestation: expected exactly {} bytes, got {}",
                 Self::SIZE,
                 data.len()
             )));

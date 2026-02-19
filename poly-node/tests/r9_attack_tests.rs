@@ -85,23 +85,21 @@ async fn do_handshake(conn: &quinn::Connection) {
 }
 
 /// Helper: create a validly-signed NodeInfo with custom fields
+/// R10: Updated to use compute_nodeinfo_signing_message for full-field signature
 fn make_signed_node_info(
     identity: &NodeIdentity,
     addresses: Vec<SocketAddr>,
     models: Vec<ModelCapability>,
 ) -> NodeInfo {
+    use poly_node::protocol::wire::compute_nodeinfo_signing_message;
+
     let public_key = identity.public_key_bytes();
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&public_key);
-    msg.extend_from_slice(&timestamp.to_le_bytes());
-    let sig = identity.sign(&msg);
-
-    NodeInfo {
+    let mut info = NodeInfo {
         public_key,
         addresses,
         models,
@@ -112,8 +110,13 @@ fn make_signed_node_info(
             max_sessions: 1,
         },
         timestamp,
-        signature: sig.to_vec(),
-    }
+        signature: vec![],
+    };
+
+    let msg = compute_nodeinfo_signing_message(&info);
+    let sig = identity.sign(&msg);
+    info.signature = sig.to_vec();
+    info
 }
 
 // =============================================================================
@@ -399,9 +402,8 @@ async fn r9_verify_server_nodeinfo_is_fresh() {
     assert_eq!(sig_bytes.len(), 64);
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(sig_bytes);
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&server_pk);
-    msg.extend_from_slice(&ack.node_info.timestamp.to_le_bytes());
+    // R10: Use full-field signing message (not just pubkey||timestamp)
+    let msg = poly_node::protocol::wire::compute_nodeinfo_signing_message(&ack.node_info);
     assert!(
         poly_node::identity::verify_signature(&vk, &msg, &sig_arr),
         "HARDENED: server NodeInfo signature must still be valid after RwLock change"

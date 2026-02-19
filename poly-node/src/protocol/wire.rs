@@ -198,6 +198,60 @@ pub struct NodeCapacity {
     pub max_sessions: u32,
 }
 
+/// R10: Compute the canonical signing message for a NodeInfo.
+///
+/// Before R10, the signature only covered `public_key || timestamp`,
+/// leaving `addresses`, `models`, `relay_capable`, and `capacity`
+/// unsigned. A network-level attacker intercepting a valid NodeInfo
+/// could modify these fields without invalidating the signature:
+/// - Change addresses to redirect traffic to a MITM
+/// - Inflate throughput_estimate to attract more clients
+/// - Set relay_capable=true to become an unauthorized relay
+/// - Inflate capacity.max_sessions to appear high-capacity
+///
+/// The R10 fix computes:
+///   Sign(public_key || timestamp || SHA-256(addresses || models || relay || capacity))
+///
+/// This is backwards-compatible: the first 40 bytes of the signed message
+/// are identical to the old format (public_key || timestamp), but now
+/// an additional 32-byte content hash is appended. Old verifiers that
+/// only check the first 40 bytes will still reject (different message length
+/// produces different signature). New verifiers check all 72 bytes.
+pub fn compute_nodeinfo_signing_message(info: &NodeInfo) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    // Hash the mutable fields to produce a fixed-size commitment
+    let mut content_hasher = Sha256::new();
+    // Serialize addresses deterministically
+    for addr in &info.addresses {
+        let addr_str = addr.to_string();
+        content_hasher.update((addr_str.len() as u32).to_le_bytes());
+        content_hasher.update(addr_str.as_bytes());
+    }
+    // Serialize models deterministically
+    content_hasher.update((info.models.len() as u32).to_le_bytes());
+    for m in &info.models {
+        content_hasher.update((m.model_name.len() as u32).to_le_bytes());
+        content_hasher.update(m.model_name.as_bytes());
+        content_hasher.update(&[m.gpu as u8]);
+        content_hasher.update(m.throughput_estimate.to_le_bytes());
+    }
+    // relay_capable
+    content_hasher.update(&[info.relay_capable as u8]);
+    // capacity
+    content_hasher.update(info.capacity.queue_depth.to_le_bytes());
+    content_hasher.update(info.capacity.active_sessions.to_le_bytes());
+    content_hasher.update(info.capacity.max_sessions.to_le_bytes());
+    let content_hash: [u8; 32] = content_hasher.finalize().into();
+
+    // Build the full signing message: public_key || timestamp || content_hash
+    let mut msg = Vec::with_capacity(72);
+    msg.extend_from_slice(&info.public_key);
+    msg.extend_from_slice(&info.timestamp.to_le_bytes());
+    msg.extend_from_slice(&content_hash);
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

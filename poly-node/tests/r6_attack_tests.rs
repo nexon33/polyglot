@@ -1035,9 +1035,8 @@ async fn r6_verify_accepted_hello_includes_server_info() {
     assert_eq!(sig_bytes.len(), 64);
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(sig_bytes);
-    let mut sig_msg = Vec::new();
-    sig_msg.extend_from_slice(&server_pk);
-    sig_msg.extend_from_slice(&ack.node_info.timestamp.to_le_bytes());
+    // R10: Use full-field signing message (not just pubkey||timestamp)
+    let sig_msg = poly_node::protocol::wire::compute_nodeinfo_signing_message(&ack.node_info);
     assert!(
         poly_node::identity::verify_signature(&vk, &sig_msg, &sig_arr),
         "accepted HelloAck server signature must be valid"
@@ -1120,12 +1119,7 @@ async fn r6_verify_nodeinfo_within_bounds_accepted() {
         .unwrap()
         .as_secs();
 
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&public_key);
-    msg.extend_from_slice(&timestamp.to_le_bytes());
-    let sig = identity.sign(&msg);
-
-    let node_info = NodeInfo {
+    let mut node_info = NodeInfo {
         public_key,
         addresses: (0..16)
             .map(|i| format!("10.0.0.{}:4001", i).parse().unwrap())
@@ -1144,8 +1138,10 @@ async fn r6_verify_nodeinfo_within_bounds_accepted() {
             max_sessions: 1,
         },
         timestamp,
-        signature: sig.to_vec(),
+        signature: vec![],
     };
+    let signing_msg = poly_node::protocol::wire::compute_nodeinfo_signing_message(&node_info);
+    node_info.signature = identity.sign(&signing_msg).to_vec();
 
     let hello = Hello {
         version: PROTOCOL_VERSION,

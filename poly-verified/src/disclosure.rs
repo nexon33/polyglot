@@ -269,6 +269,34 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
         }
     }
 
+    // [V10-02 FIX] When ALL tokens are revealed (no redacted positions),
+    // recompute tokens_hash from the revealed values and verify it matches
+    // the output_binding. This prevents cross-disclosure splicing where an
+    // attacker pairs execution_proof+output_binding from disclosure A with
+    // tokens+proofs+output_root from disclosure B. Without this check,
+    // both the Merkle reconstruction (against B's root) and the output_binding
+    // check (against A's proof) pass independently, but they are derived from
+    // different token sets.
+    //
+    // For partial disclosures (with redacted tokens), we cannot recompute
+    // tokens_hash because the raw values of redacted tokens are unknown.
+    // In that case the Merkle root binding provides the primary integrity
+    // guarantee: the redacted leaf hashes must be genuine to reconstruct
+    // the committed root.
+    let all_revealed = disclosure.tokens.iter().all(|t| matches!(t, DisclosedToken::Revealed { .. }));
+    if all_revealed {
+        let revealed_tokens: Vec<u32> = disclosure.tokens.iter().map(|t| {
+            match t {
+                DisclosedToken::Revealed { token_id, .. } => *token_id,
+                _ => unreachable!(), // we just checked all_revealed
+            }
+        }).collect();
+        let recomputed_binding = tokens_hash(&revealed_tokens);
+        if !hash_eq(&recomputed_binding, &disclosure.output_binding) {
+            return false;
+        }
+    }
+
     // Verify output binding: disclosure must be tied to the execution proof
     match &disclosure.execution_proof {
         VerifiedProof::HashIvc {

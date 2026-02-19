@@ -73,6 +73,12 @@ impl RnsCiphertext {
         // can mod-switch a ciphertext (dropping primes) without invalidating
         // the authentication tag, since only scale/level/coefficients were hashed.
         mac.update(&(self.c0.num_primes as u64).to_le_bytes());
+        // R10: Include c1.num_primes separately — R7 only included c0.num_primes,
+        // so an attacker could craft a ciphertext where c0.num_primes is correct
+        // but c1.num_primes differs (e.g., truncated or extended). The auth tag
+        // would verify because only c0's prime count was bound, but decryption
+        // (which multiplies c1 * s) would silently use the wrong modulus chain.
+        mac.update(&(self.c1.num_primes as u64).to_le_bytes());
         for ch in &self.c0.residues {
             for &coeff in ch {
                 mac.update(&coeff.to_le_bytes());
@@ -634,6 +640,25 @@ fn rns_decrypt_simd_unchecked(
         "invalid ciphertext scale: {} (must be finite and positive)",
         ct.scale
     );
+    // R10: Validate count <= NUM_SLOTS. Without this, simd::decode_simd reads
+    // from FFT positions beyond the valid slot range, returning garbage values.
+    // An attacker providing count > 2048 causes out-of-bounds access in the
+    // slot_permutation lookup (slot_to_fft has only NUM_SLOTS entries).
+    assert!(
+        count <= simd::NUM_SLOTS,
+        "rns_decrypt_simd: count {} exceeds NUM_SLOTS {} (maximum decodable slots)",
+        count, simd::NUM_SLOTS
+    );
+    // R10: Validate c0 and c1 have matching num_primes. A crafted ciphertext
+    // with c0.num_primes != c1.num_primes would cause the polynomial multiply
+    // (c1 * s) to panic with an unhelpful assertion, or worse, silently produce
+    // wrong results if the smaller poly gets zero-extended.
+    assert_eq!(
+        ct.c0.num_primes, ct.c1.num_primes,
+        "rns_decrypt_simd: c0 has {} primes but c1 has {} primes \
+         (ciphertext components must have matching prime counts)",
+        ct.c0.num_primes, ct.c1.num_primes
+    );
     let s_at_level = if s.num_primes > ct.c0.num_primes {
         rns_truncate(s, ct.c0.num_primes)
     } else {
@@ -951,6 +976,17 @@ pub fn rns_ct_mul(
     );
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
+    // R10: Explicit num_primes check — R9 added this to rns_ct_add/rns_ct_sub
+    // but missed rns_ct_mul. A crafted ciphertext with matching scale/level but
+    // mismatched prime counts would cause ctx.poly_mul to panic with an unhelpful
+    // assertion from RnsPoly::add (inside the d1 computation) or silently produce
+    // wrong results if one operand happens to have zero-padded residues.
+    assert_eq!(
+        a.c0.num_primes, b.c0.num_primes,
+        "rns_ct_mul: num_primes mismatch: a has {} primes, b has {} primes \
+         (use rns_ct_mul_leveled for automatic level matching)",
+        a.c0.num_primes, b.c0.num_primes
+    );
 
     let d0 = ctx.poly_mul(&a.c0, &b.c0);
     let d1 = ctx.poly_mul(&a.c0, &b.c1).add(&ctx.poly_mul(&a.c1, &b.c0));
@@ -975,6 +1011,16 @@ pub fn rns_relinearize(
     evk: &RnsEvalKey,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
+    // R10: Validate triple.scale before propagating into result ciphertext.
+    // rns_ct_mul validates its inputs, but a manually-constructed triple
+    // (from deserialization or testing) could have NaN/Inf/zero/negative scale
+    // that would propagate silently through rescale and decrypt. Every other
+    // path that produces a ciphertext validates scale; relinearize was missed.
+    assert!(
+        triple.scale.is_finite() && triple.scale > 0.0,
+        "rns_relinearize: triple.scale must be finite and positive, got {}",
+        triple.scale
+    );
     let digits = decompose_digits(&triple.d2, DECOMP_BITS_RELIN);
     let np = triple.d0.num_primes;
 
@@ -1246,6 +1292,16 @@ pub fn rns_ct_mul_plain_simd(
     values: &[f64],
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
+    // R10: Validate ct.scale before using it for result scale computation.
+    // Without this, a NaN/Inf/zero/negative scale gets multiplied by ctx.delta
+    // producing a corrupted result scale that propagates through all downstream
+    // operations (rescale, add, decrypt). Every other multiply path validates
+    // scale (rns_ct_mul, rns_ct_mul_leveled) but plaintext multiply was missed.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_mul_plain_simd: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
     // R7: Reject NaN/Inf in plaintext values — these silently corrupt
     // the encoded polynomial and propagate through all downstream ops.
     assert!(
@@ -1311,6 +1367,10 @@ pub fn rns_matvec(
     rot_keys: &RnsRotationKeySet,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
+    // R10: Validate d > 0 — with d=0, the `i % d` below causes a division-by-zero
+    // panic with the unhelpful message "attempt to calculate the remainder with a
+    // divisor of zero". Additionally d=0 makes matrix.len()==0 pass the d*d check.
+    assert!(d > 0, "rns_matvec: dimension d must be > 0");
     assert_eq!(matrix.len(), d * d, "matrix must be d×d");
 
     // k = 0: no rotation needed

@@ -698,12 +698,8 @@ async fn r5_attack_near_future_timestamp_accepted() {
         .as_secs()
         + 60; // 1 minute in the future (well within 5-min window)
 
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&public_key);
-    msg.extend_from_slice(&near_future_ts.to_le_bytes());
-    let sig = identity.sign(&msg);
-
-    let node_info = NodeInfo {
+    // R10: Use compute_nodeinfo_signing_message for full-field signature
+    let mut node_info = NodeInfo {
         public_key,
         addresses: vec![],
         models: vec![],
@@ -714,8 +710,11 @@ async fn r5_attack_near_future_timestamp_accepted() {
             max_sessions: 1,
         },
         timestamp: near_future_ts,
-        signature: sig.to_vec(),
+        signature: vec![],
     };
+    let msg = poly_node::protocol::wire::compute_nodeinfo_signing_message(&node_info);
+    let sig = identity.sign(&msg);
+    node_info.signature = sig.to_vec();
 
     let hello = Hello {
         version: PROTOCOL_VERSION,
@@ -797,9 +796,8 @@ async fn r5_verify_server_nodeinfo_has_valid_signature() {
     assert_eq!(sig_bytes.len(), 64);
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(sig_bytes);
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&server_pk);
-    msg.extend_from_slice(&ack.node_info.timestamp.to_le_bytes());
+    // R10: Use full-field signing message (not just pubkey||timestamp)
+    let msg = poly_node::protocol::wire::compute_nodeinfo_signing_message(&ack.node_info);
     assert!(
         poly_node::identity::verify_signature(&vk, &msg, &sig_arr),
         "server's HelloAck NodeInfo must have valid Ed25519 signature"
@@ -877,8 +875,9 @@ async fn r5_verify_transport_has_idle_timeout() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn r5_audit_signature_does_not_cover_all_fields() {
-    // Demonstrate that modifying unsigned fields preserves signature validity.
+fn r5_audit_signature_now_covers_all_fields() {
+    // R10 FIXED: Demonstrate that modifying signed fields NOW BREAKS verification.
+    // Before R10, signature only covered pubkey||timestamp. Now it covers ALL fields.
     let identity = NodeIdentity::generate();
     let public_key = identity.public_key_bytes();
     let timestamp = std::time::SystemTime::now()
@@ -886,13 +885,8 @@ fn r5_audit_signature_does_not_cover_all_fields() {
         .unwrap()
         .as_secs();
 
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&public_key);
-    msg.extend_from_slice(&timestamp.to_le_bytes());
-    let sig = identity.sign(&msg);
-
-    // Create original NodeInfo
-    let original = NodeInfo {
+    // Create original NodeInfo with R10 full-field signature
+    let mut original = NodeInfo {
         public_key,
         addresses: vec!["127.0.0.1:4001".parse().unwrap()],
         models: vec![ModelCapability {
@@ -907,32 +901,36 @@ fn r5_audit_signature_does_not_cover_all_fields() {
             max_sessions: 8,
         },
         timestamp,
-        signature: sig.to_vec(),
+        signature: vec![],
     };
+    let msg = poly_node::protocol::wire::compute_nodeinfo_signing_message(&original);
+    let sig = identity.sign(&msg);
+    original.signature = sig.to_vec();
 
-    // Tamper with unsigned fields
+    // Original verifies correctly
+    let vk = identity.verifying_key();
+    let verify_msg = poly_node::protocol::wire::compute_nodeinfo_signing_message(&original);
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&original.signature);
+    assert!(
+        poly_node::identity::verify_signature(vk, &verify_msg, &sig_arr),
+        "original NodeInfo signature must verify"
+    );
+
+    // Tamper with fields that are NOW signed
     let mut tampered = original.clone();
     tampered.addresses = vec!["10.0.0.1:6666".parse().unwrap()]; // MITM address
     tampered.models[0].throughput_estimate = 99999.0; // Inflated
     tampered.relay_capable = true; // Unauthorized relay
     tampered.capacity.max_sessions = 99999; // Inflated capacity
 
-    // Signature still verifies on tampered data (because it only covers pubkey||ts)
-    let vk = identity.verifying_key();
-    let mut verify_msg = Vec::new();
-    verify_msg.extend_from_slice(&tampered.public_key);
-    verify_msg.extend_from_slice(&tampered.timestamp.to_le_bytes());
-    let mut sig_arr = [0u8; 64];
-    sig_arr.copy_from_slice(&tampered.signature);
-    let still_valid =
-        poly_node::identity::verify_signature(vk, &verify_msg, &sig_arr);
-
-    // This SHOULD be a problem (signature covers too little data).
-    // For now, document this as a known limitation.
+    // R10 FIXED: Signature FAILS on tampered data
+    let tampered_msg = poly_node::protocol::wire::compute_nodeinfo_signing_message(&tampered);
+    let tampered_valid =
+        poly_node::identity::verify_signature(vk, &tampered_msg, &sig_arr);
     assert!(
-        still_valid,
-        "AUDIT: signature only covers pubkey||timestamp — tampered fields not detected. \
-         This is a known limitation; fix planned for Phase 2 gossip."
+        !tampered_valid,
+        "HARDENED R10: tampered NodeInfo fields must BREAK signature verification"
     );
 }
 

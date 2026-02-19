@@ -135,6 +135,10 @@ pub fn rns_ct_add_plain_simd(
     values: &[f64],
     dim: usize,
 ) -> RnsCiphertext {
+    // R10: Validate dim > 0 — with dim=0, the `i % dim` below causes a
+    // division-by-zero panic ("attempt to calculate the remainder with a
+    // divisor of zero"). This mirrors the R10 fix for rns_matvec.
+    assert!(dim > 0, "rns_ct_add_plain_simd: dim must be > 0");
     // R7: Reject NaN/Inf in bias values — these silently corrupt the encoded
     // plaintext and propagate through all downstream neural network layers.
     assert!(

@@ -96,14 +96,18 @@ pub struct InvestigationRecord {
 
 impl InvestigationRecord {
     /// Create a new investigation record.
+    ///
+    /// R10: Uses saturating arithmetic to prevent overflow when `now` is near u64::MAX.
+    /// Without this, `now + SECONDS_72H + SECONDS_30D` could wrap around to a small
+    /// value, causing the final deadline to be in the past — allowing immediate slashing.
     pub fn new(id: Hash, target: AccountId, now: Timestamp) -> Self {
         Self {
             id,
             target,
             pool_threshold_reached: now,
             data_request_sent: now,
-            compliance_deadline: now + SECONDS_72H,
-            final_deadline: now + SECONDS_72H + SECONDS_30D,
+            compliance_deadline: now.saturating_add(SECONDS_72H),
+            final_deadline: now.saturating_add(SECONDS_72H).saturating_add(SECONDS_30D),
             status: InvestigationStatus::AwaitingData,
         }
     }

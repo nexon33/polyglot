@@ -241,12 +241,17 @@ fn handle_request<B: InferenceBackend>(
         return json_error(400, "invalid request path", json_header);
     }
     // R9: Reject percent-encoded path traversal (e.g., `%2e%2e` = `..`)
-    // Attackers can double-encode or use mixed encoding to bypass literal `..` check.
+    // R10: Also reject double-encoded variants (e.g., `%252e%252e` decodes to `%2e%2e`
+    // at one proxy layer, then to `..` at the next). This prevents multi-layer
+    // proxy bypass where each layer decodes one level of percent-encoding.
     {
         let decoded_lower = url_path.to_lowercase();
         if decoded_lower.contains("%2e%2e")
             || decoded_lower.contains("%2e.")
             || decoded_lower.contains(".%2e")
+            // R10: Double-encoded variants
+            || decoded_lower.contains("%252e")
+            || decoded_lower.contains("%2525")
         {
             return json_error(400, "invalid request path", json_header);
         }
@@ -470,11 +475,16 @@ fn handle_generate(
     }
 
     // Validate mode
+    // R10: Don't echo the attacker-controlled mode value or list valid modes in the error.
+    // Previously: format!("invalid mode {:?}: expected transparent, private, or private_inputs", mode)
+    // This leaked: (1) the exact user input (potential XSS in downstream consumers),
+    // (2) the full enumeration of valid mode values (aids enumeration attacks).
     let mode = req.mode.as_str();
     if !matches!(mode, "transparent" | "private" | "private_inputs") {
+        eprintln!("invalid mode requested: {:?}", mode);
         return json_error(
             400,
-            &format!("invalid mode {:?}: expected transparent, private, or private_inputs", mode),
+            "invalid mode",
             json_header,
         );
     }
@@ -575,12 +585,18 @@ fn handle_generate(
         _ => (String::new(), String::new(), 0),
     };
 
+    // R10: Don't echo back the raw user-supplied `req.mode` string.
+    // Even though it's validated above, echoing user input into JSON responses
+    // risks injection if downstream consumers don't escape properly.
+    // Use the validated canonical value instead.
+    let canonical_mode = mode.to_string();
+
     let resp = GenerateResponse {
         text,
         completion,
         tokens: output_tokens,
         generated_tokens,
-        mode: req.mode,
+        mode: canonical_mode,
         proof: proof_summary,
         compliance: ComplianceSummary {
             verified: comp_verified,

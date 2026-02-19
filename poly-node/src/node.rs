@@ -44,6 +44,12 @@
 //! - R9: Pre-handshake stream cap (MAX_PRE_HANDSHAKE_STREAMS=8, separate from post-auth cap)
 //! - R9: Client-side InferResponse encrypted_output + model_id size validation
 //! - R9: Frame::try_encode() safe variant that returns Result instead of panicking
+//! - R10: NodeInfo signature covers ALL fields (addresses, models, relay, capacity) not just pubkey||ts
+//! - R10: RwLock poisoning handled gracefully (no server panic on poisoned lock)
+//! - R10: Client-side model_id binding (response model_id must match request model_id)
+//! - R10: Server HelloAck uses encode_hello_ack() (consistent encode/decode path)
+//! - R10: handle_infer() deprecated (dead code that bypasses all validation)
+//! - R10: build_signed_node_info_with() helper for tests with custom signed NodeInfo
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -160,8 +166,11 @@ impl PolyNode {
 
     /// Build a `NodeInfo` advertising this node's identity and capabilities.
     ///
-    /// The NodeInfo is signed with this node's Ed25519 key:
-    /// signature = Sign(public_key || timestamp).
+    /// R10: The NodeInfo is signed with this node's Ed25519 key over ALL fields:
+    /// signature = Sign(public_key || timestamp || SHA-256(addresses || models || relay || capacity)).
+    ///
+    /// Before R10, only `public_key || timestamp` was signed, leaving
+    /// addresses, models, relay_capable, and capacity unprotected.
     fn own_node_info(&self) -> NodeInfo {
         let public_key = self.identity.public_key_bytes();
         let timestamp = std::time::SystemTime::now()
@@ -169,13 +178,8 @@ impl PolyNode {
             .unwrap_or_default()
             .as_secs();
 
-        // Sign: public_key || timestamp
-        let mut msg = Vec::new();
-        msg.extend_from_slice(&public_key);
-        msg.extend_from_slice(&timestamp.to_le_bytes());
-        let sig = self.identity.sign(&msg);
-
-        NodeInfo {
+        // Build the NodeInfo first (without signature)
+        let mut info = NodeInfo {
             public_key,
             addresses: vec![self.config.listen_addr],
             models: vec![ModelCapability {
@@ -190,8 +194,14 @@ impl PolyNode {
                 max_sessions: self.config.max_sessions,
             },
             timestamp,
-            signature: sig.to_vec(),
-        }
+            signature: vec![],
+        };
+
+        // R10: Sign ALL fields via canonical signing message
+        let msg = crate::protocol::wire::compute_nodeinfo_signing_message(&info);
+        let sig = self.identity.sign(&msg);
+        info.signature = sig.to_vec();
+        info
     }
 
     /// Run the node: listen for QUIC connections and handle them.
@@ -250,8 +260,13 @@ impl PolyNode {
                 let generated_at = server_info_generated_at.load(std::sync::atomic::Ordering::SeqCst);
                 if now > generated_at && (now - generated_at) > (MAX_HELLO_TIMESTAMP_DRIFT_SECS - 60) {
                     let new_info = self.own_node_info();
-                    if let Ok(mut guard) = server_info.write() {
-                        *guard = new_info;
+                    // R10: Handle poisoned write lock -- recover and replace data
+                    match server_info.write() {
+                        Ok(mut guard) => { *guard = new_info; }
+                        Err(poisoned) => {
+                            warn!("server_info RwLock poisoned during regeneration, recovering");
+                            *poisoned.into_inner() = new_info;
+                        }
                     }
                     server_info_generated_at.store(now, std::sync::atomic::Ordering::SeqCst);
                     info!("Regenerated server NodeInfo (was {}s stale)", now - generated_at);
@@ -451,10 +466,9 @@ async fn handle_stream(
                     if sig_bytes.len() == 64 {
                         let mut sig_arr = [0u8; 64];
                         sig_arr.copy_from_slice(sig_bytes);
-                        // Verify signature over public_key || timestamp
-                        let mut msg = Vec::new();
-                        msg.extend_from_slice(&pk_bytes);
-                        msg.extend_from_slice(&hello.node_info.timestamp.to_le_bytes());
+                        // R10: Verify signature over ALL NodeInfo fields
+                        // (public_key || timestamp || SHA-256(addresses || models || relay || capacity))
+                        let msg = crate::protocol::wire::compute_nodeinfo_signing_message(&hello.node_info);
                         if !crate::identity::verify_signature(&vk, &msg, &sig_arr) {
                             warn!("Rejecting Hello: invalid Ed25519 signature");
                             accepted = false;
@@ -572,8 +586,21 @@ async fn handle_stream(
             // leaking server identity, capabilities, and addresses to unauthenticated
             // peers. An attacker could enumerate server capabilities by sending
             // deliberately invalid Hellos and inspecting the rejected HelloAck.
+            // R10: Use unwrap_or_else to handle RwLock poisoning gracefully.
+            // Before R10, .unwrap() would panic if any previous writer panicked
+            // while holding the write lock (e.g., during NodeInfo regeneration).
+            // A poisoned lock should not crash the server -- fall back to
+            // a minimal NodeInfo so the handshake can still complete.
             let ack_node_info = if accepted {
-                server_info.read().unwrap().clone()
+                match server_info.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => {
+                        // Lock is poisoned but data may still be valid.
+                        // Read through the poison to recover the last good value.
+                        warn!("server_info RwLock poisoned, recovering data");
+                        poisoned.into_inner().clone()
+                    }
+                }
             } else {
                 NodeInfo {
                     public_key: [0u8; 32],
@@ -594,7 +621,13 @@ async fn handle_stream(
                 node_info: ack_node_info,
                 accepted,
             };
-            Frame::new(MessageType::HelloAck, bincode::serialize(&ack)?)
+            // R10: Use encode_hello_ack() instead of raw bincode::serialize().
+            // Before R10, the server used bincode::serialize() (legacy config)
+            // while the client deserialized with DefaultOptions (new config).
+            // While these happen to be compatible for fixint encoding, using
+            // the same encode/decode path ensures consistency and applies the
+            // output size validation added in R9.
+            Frame::new(MessageType::HelloAck, handshake::encode_hello_ack(&ack)?)
         }
 
         MessageType::InferRequest => {
@@ -745,17 +778,17 @@ async fn handle_stream(
 }
 
 /// Build a properly signed NodeInfo for use in Hello handshake.
+///
+/// R10: Now signs ALL fields via compute_nodeinfo_signing_message(),
+/// not just public_key || timestamp.
 pub fn build_signed_node_info(identity: &NodeIdentity) -> NodeInfo {
     let public_key = identity.public_key_bytes();
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&public_key);
-    msg.extend_from_slice(&timestamp.to_le_bytes());
-    let sig = identity.sign(&msg);
-    NodeInfo {
+
+    let mut info = NodeInfo {
         public_key,
         addresses: vec![],
         models: vec![],
@@ -766,8 +799,47 @@ pub fn build_signed_node_info(identity: &NodeIdentity) -> NodeInfo {
             max_sessions: 1,
         },
         timestamp,
-        signature: sig.to_vec(),
-    }
+        signature: vec![],
+    };
+
+    // R10: Sign ALL fields
+    let msg = crate::protocol::wire::compute_nodeinfo_signing_message(&info);
+    let sig = identity.sign(&msg);
+    info.signature = sig.to_vec();
+    info
+}
+
+/// Build a signed NodeInfo with custom addresses, models, and other fields.
+///
+/// R10: Useful for tests that need to create NodeInfo with specific content
+/// while still having a valid signature covering all fields.
+pub fn build_signed_node_info_with(
+    identity: &NodeIdentity,
+    addresses: Vec<std::net::SocketAddr>,
+    models: Vec<ModelCapability>,
+    relay_capable: bool,
+    capacity: NodeCapacity,
+) -> NodeInfo {
+    let public_key = identity.public_key_bytes();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut info = NodeInfo {
+        public_key,
+        addresses,
+        models,
+        relay_capable,
+        capacity,
+        timestamp,
+        signature: vec![],
+    };
+
+    let msg = crate::protocol::wire::compute_nodeinfo_signing_message(&info);
+    let sig = identity.sign(&msg);
+    info.signature = sig.to_vec();
+    info
 }
 
 /// Connect to a remote node and send an inference request.
@@ -810,15 +882,14 @@ pub async fn connect_and_infer(
             anyhow::bail!("handshake rejected by server");
         }
         // Verify server's Ed25519 signature on its NodeInfo
+        // R10: Now verifies signature over ALL NodeInfo fields
         let server_pk = ack.node_info.public_key;
         if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&server_pk) {
             let sig_bytes = &ack.node_info.signature;
             if sig_bytes.len() == 64 {
                 let mut sig_arr = [0u8; 64];
                 sig_arr.copy_from_slice(sig_bytes);
-                let mut msg = Vec::new();
-                msg.extend_from_slice(&server_pk);
-                msg.extend_from_slice(&ack.node_info.timestamp.to_le_bytes());
+                let msg = crate::protocol::wire::compute_nodeinfo_signing_message(&ack.node_info);
                 if !crate::identity::verify_signature(&vk, &msg, &sig_arr) {
                     anyhow::bail!("server HelloAck has invalid Ed25519 signature");
                 }
@@ -929,6 +1000,18 @@ pub async fn connect_and_infer(
             "server InferResponse model_id too long ({} bytes, max {})",
             response.model_id.len(),
             MAX_MODEL_ID_LEN
+        );
+    }
+    // R10: Verify response model_id matches the request model_id.
+    // Before R10, a malicious server could return a response with a
+    // different model_id (e.g., claiming a more expensive model was used
+    // for billing purposes, or returning cached results from a different
+    // model). The client now rejects mismatched model_ids.
+    if response.model_id != request.model_id {
+        anyhow::bail!(
+            "server InferResponse model_id mismatch: expected '{}', got '{}'",
+            request.model_id,
+            response.model_id
         );
     }
 

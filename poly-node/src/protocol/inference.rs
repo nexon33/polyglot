@@ -71,8 +71,21 @@ pub fn decode_infer_response(data: &[u8]) -> Result<InferResponse> {
 
 /// Handle an inference request: deserialize, run backend, serialize response.
 ///
-/// Called from `spawn_blocking` — this is the sync bridge between the
-/// async QUIC stream handler and the sync `InferenceBackend::infer()`.
+/// # R10 Security Warning
+///
+/// This function performs NO validation on the deserialized request:
+/// - No model_id length/content check
+/// - No max_tokens cap
+/// - No encrypted_input size limit
+///
+/// Since R9, the server's InferRequest handler passes the already-validated
+/// request object directly to `backend.infer()`, making this function dead
+/// code in the server path. It is preserved for backward compatibility but
+/// callers MUST perform their own validation before using it.
+///
+/// Prefer using `decode_infer_request()` + manual validation + `backend.infer()`
+/// + `encode_infer_response()` instead.
+#[deprecated(since = "0.1.0", note = "R10: Use decode_infer_request + manual validation instead. This function bypasses all server-side validation (model_id, max_tokens, encrypted_input size).")]
 pub fn handle_infer(data: &[u8], backend: &dyn InferenceBackend) -> Result<Vec<u8>> {
     let request = decode_infer_request(data)?;
     let response = backend.infer(&request)?;

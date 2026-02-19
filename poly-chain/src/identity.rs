@@ -113,11 +113,26 @@ impl IdentityRecord {
                     "identity record office field truncated".into(),
                 ));
             }
+            // R10: Reject trailing garbage bytes for canonical deserialization.
+            if data.len() > 80 + office_len {
+                return Err(ChainError::InvalidEncoding(format!(
+                    "identity record too long: {} bytes (expected {})",
+                    data.len(),
+                    80 + office_len,
+                )));
+            }
             Some(
                 String::from_utf8(data[80..80 + office_len].to_vec())
                     .map_err(|e| ChainError::InvalidEncoding(e.to_string()))?,
             )
         } else {
+            // R10: Reject trailing garbage bytes for canonical deserialization.
+            if data.len() > 80 {
+                return Err(ChainError::InvalidEncoding(format!(
+                    "identity record too long: {} bytes (expected 80)",
+                    data.len(),
+                )));
+            }
             None
         };
         Ok(Self {

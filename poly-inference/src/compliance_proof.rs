@@ -223,10 +223,26 @@ impl ComplianceProof {
 
     /// True if every token passed the policy.
     ///
-    /// This is a convenience check on the metadata fields. For full verification,
-    /// call `verify()` first to ensure the metadata hasn't been tampered with.
+    /// **WARNING**: This is a convenience check on the metadata fields ONLY.
+    /// It does NOT verify the cryptographic proof. An attacker can forge a
+    /// `ComplianceProof` with `total_tokens == compliant_tokens` that would
+    /// pass this check but fail `verify()`.
+    ///
+    /// **Always call `verify()` before trusting `all_compliant()`.**
     pub fn all_compliant(&self) -> bool {
         self.total_tokens == self.compliant_tokens
+    }
+
+    /// R10: Safe version of `all_compliant()` that also verifies the proof.
+    ///
+    /// Returns `true` only if:
+    /// 1. The IVC proof cryptographically verifies
+    /// 2. Every token passed the policy (total == compliant)
+    ///
+    /// This prevents forgery attacks where an attacker constructs a proof
+    /// with `total_tokens == compliant_tokens` but invalid cryptographic chain.
+    pub fn verified_all_compliant(&self) -> bool {
+        self.verify().unwrap_or(false) && self.all_compliant()
     }
 }
 

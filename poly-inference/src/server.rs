@@ -58,10 +58,14 @@ impl InferenceBackend for MockInferenceBackend {
         let input_tokens = &input_ct.tokens;
 
         // 2. Generate predictable output: input tokens + sequential new tokens
+        // R10: Use saturating arithmetic to prevent overflow panic when
+        // input_tokens.len() * 100 or seed exceeds u32::MAX.
         let mut output_tokens = input_tokens.clone();
-        let base = (input_tokens.len() as u32) * 100 + request.seed as u32;
+        let base = (input_tokens.len() as u32)
+            .saturating_mul(100)
+            .saturating_add(request.seed as u32);
         for i in 0..self.new_tokens {
-            output_tokens.push(base + i as u32);
+            output_tokens.push(base.saturating_add(i as u32));
         }
 
         // 3. Create a real HashIvc proof with correct I/O binding

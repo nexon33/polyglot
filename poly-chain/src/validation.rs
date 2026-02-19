@@ -775,6 +775,16 @@ fn validate_fraud_proof(tx: &FraudProofTx, state: &GlobalState) -> Result<Global
     );
     verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
+    // R10: The fraudulent account must actually have a wallet to burn.
+    // Without this check, an attacker can submit fraud evidence against non-existent
+    // accounts, polluting the fraud evidence tree with records for phantom accounts
+    // and potentially griefing the evidence storage with unlimited fake entries.
+    if state.get_wallet(&tx.evidence.fraudulent_key).is_none() {
+        return Err(ChainError::AccountNotFound(
+            hex_encode(&tx.evidence.fraudulent_key[..4]),
+        ));
+    }
+
     // R7: Check for duplicate fraud evidence before recording.
     // Without this, the same evidence can be submitted repeatedly, and if the
     // wallet was already burned, the fraud evidence tree grows unbounded.
@@ -865,6 +875,15 @@ fn validate_stp_action(
                 ));
             }
 
+            // R10: Reject reporting_threshold of 0. A zero threshold means EVERY
+            // transaction triggers an investigation, spamming the STP system and
+            // making enforcement meaningless through volume overload.
+            if contract.reporting_threshold == 0 {
+                return Err(ChainError::STPError(
+                    "contract must have non-zero reporting threshold".into(),
+                ));
+            }
+
             // R8: Contract must be registered with Active status. Allowing Suspended or
             // Terminated status creates a sham contract that satisfies the "has contract"
             // check in TriggerInvestigation but provides no actual accountability.
@@ -886,6 +905,19 @@ fn validate_stp_action(
             if state.get_stp_record(target).is_none() {
                 return Err(ChainError::UnauthorizedSTPAction(
                     "investigation target has no STP service contract".into(),
+                ));
+            }
+
+            // R10: Reject if an investigation already exists for this pool_id.
+            // Without this check, an attacker can re-trigger the same investigation
+            // to reset the compliance deadline (now + 72h), effectively granting
+            // the official unlimited deadline extensions. The inv_target_key binding
+            // also serves as a sentinel: if it exists, an investigation was already
+            // created for this pool_id.
+            let target_key = inv_target_key(pool_id);
+            if state.get_stp_record(&target_key).is_some() {
+                return Err(ChainError::STPError(
+                    "investigation already exists for this pool_id".into(),
                 ));
             }
 
@@ -1074,6 +1106,15 @@ fn validate_atomic_swap_init(
     // 4. Timeout must be in the future
     if tx.timeout <= block_height {
         return Err(ChainError::SwapExpired);
+    }
+
+    // R10: Timeout must not be unreasonably far in the future.
+    // Without this check, an attacker can set timeout = u64::MAX to permanently
+    // lock the responder's funds (refund requires block_height >= timeout, which
+    // will never be reached). Cap at 1,000,000 blocks above current height.
+    const MAX_SWAP_TIMEOUT_DELTA: u64 = 1_000_000;
+    if tx.timeout > block_height.saturating_add(MAX_SWAP_TIMEOUT_DELTA) {
+        return Err(ChainError::InvalidTimestamp);
     }
 
     // 5. Verify proof
