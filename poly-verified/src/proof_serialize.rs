@@ -156,6 +156,13 @@ impl VerifiedResponse {
         let computed = hash_data(&self.value_bytes);
         hash_eq(&computed, &self.value_hash)
     }
+
+    /// [V9-02 FIX] Validate that proof_bytes deserializes to a valid VerifiedProof.
+    /// Without this, a receiver trusting verify_value_integrity() may accept a
+    /// response with corrupt/malformed proof_bytes that can never be verified.
+    pub fn validate_proof_bytes(&self) -> bool {
+        serde_json::from_slice::<VerifiedProof>(&self.proof_bytes).is_ok()
+    }
 }
 
 #[cfg(test)]

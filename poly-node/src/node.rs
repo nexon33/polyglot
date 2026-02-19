@@ -38,6 +38,12 @@
 //! - R8: Error message type requires handshake (was falling through to unguarded catch-all)
 //! - R8: decode_hello/decode_hello_ack use size-limited bincode (public API hardening)
 //! - R8: Client-side HelloAck NodeInfo field validation (addresses, models, model_name, throughput)
+//! - R9: Double deserialization TOCTOU eliminated (validated request passed to backend directly)
+//! - R9: encode_hello/encode_hello_ack validate output size (symmetric with decode limits)
+//! - R9: Server NodeInfo regenerated every 4 minutes (prevents stale timestamp rejection)
+//! - R9: Pre-handshake stream cap (MAX_PRE_HANDSHAKE_STREAMS=8, separate from post-auth cap)
+//! - R9: Client-side InferResponse encrypted_output + model_id size validation
+//! - R9: Frame::try_encode() safe variant that returns Result instead of panicking
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,6 +83,12 @@ const MAX_STREAMS_PER_CONN: u64 = 256;
 /// the connection is closed. Prevents zombie connections holding semaphore permits.
 const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Maximum streams allowed before handshake completion.
+/// This is much lower than MAX_STREAMS_PER_CONN to limit the damage
+/// an unauthenticated peer can do. A legitimate client only needs 1 stream
+/// for the Hello handshake, so 8 is generous.
+const MAX_PRE_HANDSHAKE_STREAMS: u64 = 8;
+
 /// Maximum number of addresses in a NodeInfo (prevents gossip amplification).
 const MAX_NODEINFO_ADDRESSES: usize = 16;
 
@@ -109,6 +121,11 @@ pub const MAX_MODEL_ID_LEN: usize = 256;
 /// Client-side timeout for reading inference response.
 /// Prevents a malicious/slow server from tying up the client indefinitely.
 const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum allowed size for InferResponse.encrypted_output on client side (4 MB).
+/// Prevents a malicious server from sending an oversized encrypted output that
+/// wastes client memory. Real PFHE ciphertext outputs should be much smaller.
+const MAX_CLIENT_RESPONSE_OUTPUT_SIZE: usize = 4 * 1024 * 1024;
 
 /// A running Poly Network compute node.
 pub struct PolyNode {
@@ -191,19 +208,56 @@ impl PolyNode {
         // Limit concurrent inference tasks (compute-heavy)
         let infer_semaphore = Arc::new(Semaphore::new(self.config.max_sessions as usize));
 
-        // R5: Generate server_info fresh (will be shared across connections
-        // but regenerated on server restart). The timestamp in this NodeInfo
-        // is from startup, which is fine since it's the server's own identity.
-        let server_info = Arc::new(self.own_node_info());
+        // R9: Generate server_info fresh and track its creation time.
+        // Before R9, the NodeInfo was generated once and shared for the
+        // entire lifetime of the server. After 5 minutes, any client with
+        // timestamp freshness checking (R7 connect_and_infer) would reject
+        // the stale HelloAck. Now we regenerate it periodically.
+        let server_info = Arc::new(std::sync::RwLock::new(self.own_node_info()));
+        let server_info_generated_at = Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ));
 
         let model_name = Arc::new(self.config.model_name.clone());
+
+        // R9: Closure to regenerate server_info when needed.
+        // We share the identity reference for regeneration.
+        let identity_for_regen = Arc::new((
+            self.identity.public_key_bytes(),
+            // We need a way to sign -- store the full identity.
+            // Since NodeIdentity doesn't implement Clone, we'll just
+            // regenerate from our own_node_info method via a closure.
+        ));
+        let _ = identity_for_regen; // Used conceptually; actual regen below.
 
         while let Some(incoming) = endpoint.accept().await {
             let backend = self.backend.clone();
             let conn_sem = conn_semaphore.clone();
             let infer_sem = infer_semaphore.clone();
-            let info = server_info.clone();
             let model = model_name.clone();
+
+            // R9: Regenerate server_info if stale (older than 4 minutes).
+            // The MAX_HELLO_TIMESTAMP_DRIFT_SECS is 5 minutes, so we
+            // regenerate at 4 minutes to give a 1-minute safety margin.
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let generated_at = server_info_generated_at.load(std::sync::atomic::Ordering::SeqCst);
+                if now > generated_at && (now - generated_at) > (MAX_HELLO_TIMESTAMP_DRIFT_SECS - 60) {
+                    let new_info = self.own_node_info();
+                    if let Ok(mut guard) = server_info.write() {
+                        *guard = new_info;
+                    }
+                    server_info_generated_at.store(now, std::sync::atomic::Ordering::SeqCst);
+                    info!("Regenerated server NodeInfo (was {}s stale)", now - generated_at);
+                }
+            }
+            let info = server_info.clone();
 
             tokio::spawn(async move {
                 // Acquire connection permit (drop releases it)
@@ -239,7 +293,7 @@ async fn handle_connection(
     incoming: quinn::Incoming,
     backend: Arc<dyn InferenceBackend + Send + Sync>,
     infer_semaphore: Arc<Semaphore>,
-    server_info: Arc<NodeInfo>,
+    server_info: Arc<std::sync::RwLock<NodeInfo>>,
     model_name: Arc<String>,
 ) -> Result<()> {
     let conn = incoming.await?;
@@ -252,6 +306,14 @@ async fn handle_connection(
 
     // Count streams opened on this connection to cap stream-flooding.
     let stream_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // R9: Count pre-handshake streams separately. Before R9, all streams
+    // (pre- and post-handshake) shared the same counter, meaning an
+    // unauthenticated attacker could exhaust all 256 stream slots by
+    // sending pre-handshake probes (Error, wrong-direction, Phase 2/3).
+    // Cap pre-handshake streams at a much lower limit (16) to limit
+    // the damage an unauthenticated peer can do before handshake.
+    let pre_handshake_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     loop {
         // Accept next stream with idle timeout — prevents zombie connections
@@ -290,6 +352,22 @@ async fn handle_connection(
             break;
         }
 
+        // R9: Enforce pre-handshake stream limit. An unauthenticated peer
+        // can only open MAX_PRE_HANDSHAKE_STREAMS before the connection is
+        // closed, limiting the damage from pre-handshake probing attacks.
+        if !handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
+            let pre_count = pre_handshake_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if pre_count >= MAX_PRE_HANDSHAKE_STREAMS {
+                warn!(
+                    "Connection from {} exceeded pre-handshake stream limit ({}), closing",
+                    conn.remote_address(),
+                    MAX_PRE_HANDSHAKE_STREAMS
+                );
+                conn.close(4u32.into(), b"too many unauthenticated streams");
+                break;
+            }
+        }
+
         let backend = backend.clone();
         let infer_sem = infer_semaphore.clone();
         let info = server_info.clone();
@@ -313,7 +391,7 @@ async fn handle_stream(
     mut recv: quinn::RecvStream,
     backend: Arc<dyn InferenceBackend + Send + Sync>,
     infer_semaphore: Arc<Semaphore>,
-    server_info: Arc<NodeInfo>,
+    server_info: Arc<std::sync::RwLock<NodeInfo>>,
     handshake_done: Arc<std::sync::atomic::AtomicBool>,
     model_name: Arc<String>,
 ) -> Result<()> {
@@ -495,7 +573,7 @@ async fn handle_stream(
             // peers. An attacker could enumerate server capabilities by sending
             // deliberately invalid Hellos and inspecting the rejected HelloAck.
             let ack_node_info = if accepted {
-                (*server_info).clone()
+                server_info.read().unwrap().clone()
             } else {
                 NodeInfo {
                     public_key: [0u8; 32],
@@ -586,9 +664,15 @@ async fn handle_stream(
                 .await
                 .map_err(|_| anyhow::anyhow!("inference semaphore closed"))?;
 
-            let payload = frame.payload;
+            // R9: Pass the already-validated request object to the backend
+            // instead of re-deserializing from raw bytes. Before this fix,
+            // the validated `request` was discarded and `handle_infer` would
+            // re-deserialize from `frame.payload`, creating a TOCTOU gap
+            // where the validated object and the actually-processed object
+            // could theoretically differ (defense-in-depth violation).
             let result = tokio::task::spawn_blocking(move || {
-                inference::handle_infer(&payload, &*backend)
+                let response = backend.infer(&request)?;
+                inference::encode_infer_response(&response)
             })
             .await??;
             Frame::new(MessageType::InferResponse, result)
@@ -825,6 +909,28 @@ pub async fn connect_and_infer(
     }
 
     let response = inference::decode_infer_response(&resp_frame.payload)?;
+
+    // R9: Validate InferResponse content from server. Before this fix,
+    // the client accepted arbitrarily large encrypted_output from a
+    // malicious server. While the 16MB read limit caps the total data,
+    // the encrypted_output field could consume most of that 16MB.
+    // Cap at MAX_CLIENT_RESPONSE_OUTPUT_SIZE (4 MB) to prevent memory waste.
+    if response.encrypted_output.len() > MAX_CLIENT_RESPONSE_OUTPUT_SIZE {
+        anyhow::bail!(
+            "server InferResponse encrypted_output too large ({} bytes, max {})",
+            response.encrypted_output.len(),
+            MAX_CLIENT_RESPONSE_OUTPUT_SIZE
+        );
+    }
+    // R9: Validate response model_id length (prevent echo amplification from
+    // a malicious server that sends back a bloated model_id).
+    if response.model_id.len() > MAX_MODEL_ID_LEN {
+        anyhow::bail!(
+            "server InferResponse model_id too long ({} bytes, max {})",
+            response.model_id.len(),
+            MAX_MODEL_ID_LEN
+        );
+    }
 
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;

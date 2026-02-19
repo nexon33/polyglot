@@ -101,6 +101,16 @@ impl Frame {
         buf
     }
 
+    /// R9: Safe encode that returns an error instead of panicking.
+    /// Use this in production code paths where a panic would be undesirable
+    /// (e.g., when encoding a response with potentially large payload).
+    pub fn try_encode(&self) -> Result<Vec<u8>, FrameError> {
+        if self.payload.len() > MAX_FRAME_PAYLOAD {
+            return Err(FrameError::PayloadTooLarge(self.payload.len()));
+        }
+        Ok(self.encode())
+    }
+
     /// Decode a frame from bytes. Returns (frame, bytes_consumed).
     ///
     /// Rejects payloads larger than `MAX_FRAME_PAYLOAD` to prevent

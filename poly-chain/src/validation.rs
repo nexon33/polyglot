@@ -182,8 +182,12 @@ fn stp_action_signing_message(tx: &STPActionTx) -> Vec<u8> {
     msg.extend_from_slice(b"STPAction_v1");
     msg.extend_from_slice(&tx.submitter);
     msg.extend_from_slice(&tx.timestamp.to_le_bytes());
-    // Include the serialized action to bind the signature to the specific action
-    msg.extend_from_slice(&serde_json::to_vec(&tx.action).unwrap_or_default());
+    // R9: Use expect instead of unwrap_or_default. The action is a known enum that
+    // must always be serializable. unwrap_or_default would silently produce empty
+    // bytes, creating a signing message collision between any two unserializable actions.
+    msg.extend_from_slice(
+        &serde_json::to_vec(&tx.action).expect("STP action serialization must not fail"),
+    );
     msg
 }
 
@@ -551,6 +555,20 @@ fn validate_identity_register(
         ));
     }
 
+    // R9: Limit office string length to prevent memory exhaustion.
+    // An unbounded string could be multi-megabyte, causing excessive memory
+    // use during serialization (to_bytes, serde_json, signing messages).
+    const MAX_OFFICE_LEN: usize = 1024;
+    if let Some(ref office) = tx.office {
+        if office.len() > MAX_OFFICE_LEN {
+            return Err(ChainError::InvalidEncoding(format!(
+                "office field too long: {} bytes (max {})",
+                office.len(),
+                MAX_OFFICE_LEN,
+            )));
+        }
+    }
+
     // Verify proof
     let input_hash = hash_with_domain(
         DOMAIN_IDENTITY,
@@ -592,6 +610,15 @@ const MAX_BACKUP_SIZE: usize = 1_048_576;
 
 fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp) -> Result<GlobalState> {
     let mut new_state = state.clone();
+
+    // R9: Reject ZERO_HASH as state_hash. The SMT treats ZERO_HASH as a delete
+    // sentinel — storing a backup with ZERO_HASH would delete the backup entry,
+    // so a subsequent BackupRestore would fail with AccountNotFound.
+    if tx.state_hash == ZERO_HASH {
+        return Err(ChainError::InvalidEncoding(
+            "backup state_hash must not be zero (would delete backup)".into(),
+        ));
+    }
 
     // R5: Reject oversized backups to prevent resource exhaustion
     if tx.encrypted_state.len() > MAX_BACKUP_SIZE {
@@ -637,6 +664,15 @@ fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp)
 
 fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timestamp) -> Result<GlobalState> {
     let mut new_state = state.clone();
+
+    // R9: Reject ZERO_HASH as backup_hash. The wallet gets set to this value,
+    // and ZERO_HASH is the SMT delete sentinel — this would delete the wallet,
+    // allowing fraud evasion and balance forgery.
+    if tx.backup_hash == ZERO_HASH {
+        return Err(ChainError::InvalidEncoding(
+            "backup_hash must not be zero (would delete wallet)".into(),
+        ));
+    }
 
     // 0. Verify signature — only the account owner can restore backups
     let signing_msg = backup_restore_signing_message(tx);
@@ -805,6 +841,16 @@ fn validate_stp_action(
                 return Err(ChainError::DuplicateSTPContract);
             }
 
+            // R9: Limit office string length to prevent memory exhaustion.
+            const MAX_STP_OFFICE_LEN: usize = 1024;
+            if contract.office.len() > MAX_STP_OFFICE_LEN {
+                return Err(ChainError::STPError(format!(
+                    "office field too long: {} bytes (max {})",
+                    contract.office.len(),
+                    MAX_STP_OFFICE_LEN,
+                )));
+            }
+
             // R6: Validate contract parameters to prevent degenerate contracts.
             // term_start must be before term_end (non-zero-duration contract).
             if contract.term_start >= contract.term_end {
@@ -862,6 +908,16 @@ fn validate_stp_action(
             investigation_id,
             data_hash,
         } => {
+            // R9: Reject ZERO_HASH data_hash. The SMT treats ZERO_HASH as a delete
+            // sentinel. If the official provides data_hash = ZERO_HASH, it would delete
+            // the investigation record from the STP SMT, effectively killing the
+            // investigation and making CheckDeadline fail with "investigation not found".
+            if *data_hash == ZERO_HASH {
+                return Err(ChainError::STPError(
+                    "data_hash must not be zero (would delete investigation record)".into(),
+                ));
+            }
+
             // Only the investigation target can provide data.
             // Load investigation record to verify submitter is the target.
             let _stored_hash = state.get_stp_record(investigation_id).ok_or_else(|| {
@@ -911,6 +967,15 @@ fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState, now: Time
 
     // 0. Validate timestamp
     validate_timestamp(tx.timestamp, now)?;
+
+    // R9: Reject ZERO_HASH as new_state_hash. The SMT treats ZERO_HASH as a
+    // delete sentinel — setting an app state to ZERO_HASH effectively removes it,
+    // allowing an attacker to delete arbitrary app state entries.
+    if tx.new_state_hash == ZERO_HASH {
+        return Err(ChainError::InvalidEncoding(
+            "new_state_hash must not be zero (would delete app state)".into(),
+        ));
+    }
 
     // 0b. Verify signature — only the account owner can update app state
     let signing_msg = app_state_update_signing_message(tx);
@@ -993,11 +1058,10 @@ fn validate_atomic_swap_init(
     }
 
     // 3. Amount must be positive
+    // R9: Use ZeroAmount error for consistency with CashTransfer validation.
+    // Previously returned InsufficientBalance which masked the real issue.
     if tx.amount == 0 {
-        return Err(ChainError::InsufficientBalance {
-            needed: 1,
-            available: 0,
-        });
+        return Err(ChainError::ZeroAmount);
     }
 
     // R6: Reject ZERO_HASH as hash_lock — a zero hash_lock is meaningless
@@ -1624,10 +1688,8 @@ mod tests {
 
         let tx = Transaction::AtomicSwapInit(swap);
         let result = validate_transaction(&tx, &state, 1000, 50);
-        assert!(matches!(
-            result,
-            Err(ChainError::InsufficientBalance { .. })
-        ));
+        // R9: Now returns ZeroAmount for consistency with CashTransfer
+        assert!(matches!(result, Err(ChainError::ZeroAmount)));
     }
 
     #[test]

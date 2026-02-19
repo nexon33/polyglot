@@ -139,6 +139,16 @@ impl IvcBackend for HashIvc {
                     return Ok(false);
                 }
 
+                // [V9-03 FIX] Cap checkpoint count to prevent DoS. Rebuilding
+                // a hash chain + Merkle tree is O(N), so an attacker crafting a
+                // proof with millions of checkpoints forces expensive verification.
+                // 1,000,000 checkpoints is the absolute maximum for any realistic
+                // computation; beyond this, reject as adversarial.
+                const MAX_CHECKPOINTS: usize = 1_000_000;
+                if checkpoints.len() > MAX_CHECKPOINTS {
+                    return Ok(false);
+                }
+
                 // 3. Rebuild hash chain from checkpoints, bind code_hash + privacy_mode → verify chain_tip.
                 let mut chain = HashChain::new();
                 for cp in checkpoints {

@@ -240,6 +240,21 @@ fn handle_request<B: InferenceBackend>(
     if url_path.contains("..") {
         return json_error(400, "invalid request path", json_header);
     }
+    // R9: Reject percent-encoded path traversal (e.g., `%2e%2e` = `..`)
+    // Attackers can double-encode or use mixed encoding to bypass literal `..` check.
+    {
+        let decoded_lower = url_path.to_lowercase();
+        if decoded_lower.contains("%2e%2e")
+            || decoded_lower.contains("%2e.")
+            || decoded_lower.contains(".%2e")
+        {
+            return json_error(400, "invalid request path", json_header);
+        }
+    }
+    // R9: Reject null bytes in URL path (can truncate paths in some parsers)
+    if url_path.contains('\0') || url_path.contains("%00") {
+        return json_error(400, "invalid request path", json_header);
+    }
 
     // GET /pubkey returns the server's CKKS public key as JSON with hex-encoded bytes
     if url_path == "/pubkey" {
@@ -249,9 +264,11 @@ fn handle_request<B: InferenceBackend>(
         let pk_bytes = serde_json::to_vec(server_pk).unwrap_or_default();
         let pk_hex = hex::encode(&pk_bytes);
         let body = serde_json::json!({ "public_key": pk_hex }).to_string();
+        let mut headers = vec![json_header];
+        headers.extend(security_headers());
         return Response::new(
             StatusCode(200),
-            vec![json_header],
+            headers,
             std::io::Cursor::new(body.into_bytes()),
             None,
             None,
@@ -319,6 +336,11 @@ fn handle_infer<B: InferenceBackend>(
         }
     };
 
+    // R9: Check JSON nesting depth to prevent stack overflow
+    if !check_json_depth(&body) {
+        return json_error(400, "invalid request body", json_header);
+    }
+
     let infer_request: InferRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(e) => {
@@ -335,12 +357,24 @@ fn handle_infer<B: InferenceBackend>(
 
     // Validate max_tokens upper bound
     if infer_request.max_tokens > MAX_ALLOWED_TOKENS {
-        return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
+        return json_error(400, "max_tokens exceeds server limit", json_header);
     }
 
     // Validate temperature
     if let Err(msg) = crate::inference::validate_temperature(infer_request.temperature) {
         return json_error(400, msg, json_header);
+    }
+
+    // R9: Validate encrypted_input size BEFORE attempting to deserialize/decode.
+    // Previously this check was after the safety check, meaning an attacker
+    // could trigger expensive deserialization and decode on a huge payload
+    // before the size check rejected it (TOCTOU ordering bug).
+    if infer_request.encrypted_input.len() > MAX_ENCRYPTED_INPUT_SIZE {
+        return json_error(
+            400,
+            "encrypted_input too large",
+            json_header,
+        );
     }
 
     // R6: Prompt safety check on /infer (previously missing — allowed bypass)
@@ -358,26 +392,19 @@ fn handle_infer<B: InferenceBackend>(
             }
             // R6: Validate token count on /infer
             if ct.tokens.len() > MAX_PROMPT_TOKENS {
-                return json_error(400, &format!("input exceeds token limit (max {})", MAX_PROMPT_TOKENS), json_header);
+                return json_error(400, "input exceeds token limit", json_header);
             }
         }
-    }
-
-    // Validate encrypted_input size (max 1 MB / ~8192 encrypted tokens)
-    if infer_request.encrypted_input.len() > MAX_ENCRYPTED_INPUT_SIZE {
-        return json_error(
-            400,
-            "encrypted_input too large",
-            json_header,
-        );
     }
 
     match backend.infer(&infer_request) {
         Ok(response) => {
             let response_body = serde_json::to_vec(&response).unwrap();
+            let mut headers = vec![json_header];
+            headers.extend(security_headers());
             Response::new(
                 StatusCode(200),
-                vec![json_header],
+                headers,
                 std::io::Cursor::new(response_body),
                 None,
                 None,
@@ -406,6 +433,11 @@ fn handle_generate(
         }
     };
 
+    // R9: Check JSON nesting depth to prevent stack overflow
+    if !check_json_depth(&body) {
+        return json_error(400, "invalid request body", json_header);
+    }
+
     let req: GenerateRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -420,8 +452,9 @@ fn handle_generate(
     }
 
     // Validate max_tokens upper bound
+    // R9: Don't reveal exact limit in error — aids attacker tuning
     if req.max_tokens > MAX_ALLOWED_TOKENS {
-        return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
+        return json_error(400, "max_tokens exceeds server limit", json_header);
     }
 
     // Validate temperature (must be in 1..=2000; 0 causes divide-by-zero, high values
@@ -431,8 +464,9 @@ fn handle_generate(
     }
 
     // R6: Validate prompt length in characters (DoS prevention)
+    // R9: Don't reveal exact character count or limit in error — aids DoS tuning
     if req.prompt.len() > MAX_PROMPT_LENGTH {
-        return json_error(400, &format!("prompt too long: {} chars (max {})", req.prompt.len(), MAX_PROMPT_LENGTH), json_header);
+        return json_error(400, "prompt too long", json_header);
     }
 
     // Validate mode
@@ -474,8 +508,9 @@ fn handle_generate(
     }
 
     // R6: Validate prompt token count (DoS prevention for token-dense inputs)
+    // R9: Don't reveal exact token count or limit in error — aids DoS tuning
     if token_ids.len() > MAX_PROMPT_TOKENS {
-        return json_error(400, &format!("prompt too many tokens: {} (max {})", token_ids.len(), MAX_PROMPT_TOKENS), json_header);
+        return json_error(400, "prompt too many tokens", json_header);
     }
 
     let prompt_len = token_ids.len();
@@ -561,9 +596,11 @@ fn handle_generate(
     };
 
     let response_body = serde_json::to_vec(&resp).unwrap();
+    let mut headers = vec![json_header];
+    headers.extend(security_headers());
     Response::new(
         StatusCode(200),
-        vec![json_header],
+        headers,
         std::io::Cursor::new(response_body),
         None,
         None,
@@ -605,8 +642,9 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     }
 
     // Validate max_tokens upper bound
+    // R9: Don't reveal exact limit in error — aids attacker tuning
     if req.max_tokens > MAX_ALLOWED_TOKENS {
-        return json_error(400, &format!("max_tokens exceeds limit of {}", MAX_ALLOWED_TOKENS), json_header);
+        return json_error(400, "max_tokens exceeds server limit", json_header);
     }
 
     // Validate temperature
@@ -615,14 +653,11 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     }
 
     // Validate encrypted_input size
+    // R9: Don't reveal exact size or limit in error
     if req.encrypted_input.len() > MAX_ENCRYPTED_INPUT_SIZE {
         return json_error(
             400,
-            &format!(
-                "encrypted_input too large: {} bytes (max {})",
-                req.encrypted_input.len(),
-                MAX_ENCRYPTED_INPUT_SIZE
-            ),
+            "encrypted_input too large",
             json_header,
         );
     }
@@ -630,14 +665,11 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     // R7: Validate client_public_key size (same limit as encrypted_input).
     // Without this, an attacker can send a multi-MB client_public_key that
     // decompresses to an enormous CKKS key, exhausting memory.
+    // R9: Don't reveal exact size or limit in error
     if req.client_public_key.len() > MAX_ENCRYPTED_INPUT_SIZE {
         return json_error(
             400,
-            &format!(
-                "client_public_key too large: {} bytes (max {})",
-                req.client_public_key.len(),
-                MAX_ENCRYPTED_INPUT_SIZE
-            ),
+            "client_public_key too large",
             json_header,
         );
     }
@@ -671,8 +703,9 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     }
 
     // R6: Validate decrypted token count (DoS prevention)
+    // R9: Don't reveal exact count or limit in error
     if token_ids.len() > MAX_PROMPT_TOKENS {
-        return json_error(400, &format!("decrypted input too many tokens: {} (max {})", token_ids.len(), MAX_PROMPT_TOKENS), json_header);
+        return json_error(400, "decrypted input too many tokens", json_header);
     }
 
     // Decode tokens to text for compliance check
@@ -797,9 +830,11 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     let binary_header =
         Header::from_bytes(&b"Content-Type"[..], &b"application/x-pfhe"[..]).unwrap();
     let response_body = compress::compress(&resp).expect("compress response");
+    let mut headers = vec![binary_header];
+    headers.extend(security_headers());
     Response::new(
         StatusCode(200),
-        vec![binary_header],
+        headers,
         std::io::Cursor::new(response_body),
         None,
         None,
@@ -877,12 +912,18 @@ fn proof_to_summary(
 /// Maximum request body size: 1 MB.
 const MAX_BODY_SIZE: usize = 1_048_576;
 
+/// R9: Maximum JSON nesting depth. Deeply nested JSON (e.g., `{"a":{"a":...}}`)
+/// can cause stack overflow during parsing. serde_json doesn't have a built-in
+/// depth limit, so we scan the raw bytes to reject excessively nested payloads
+/// before attempting deserialization.
+const MAX_JSON_DEPTH: usize = 32;
+
 fn read_body(request: &mut tiny_http::Request) -> std::io::Result<Vec<u8>> {
     let content_length = request.body_length().unwrap_or(0);
     if content_length > MAX_BODY_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("body too large: {} bytes (max {})", content_length, MAX_BODY_SIZE),
+            "request body too large",
         ));
     }
     let mut body = Vec::new();
@@ -890,10 +931,61 @@ fn read_body(request: &mut tiny_http::Request) -> std::io::Result<Vec<u8>> {
     if body.len() > MAX_BODY_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("body too large: {} bytes (max {})", body.len(), MAX_BODY_SIZE),
+            "request body too large",
         ));
     }
     Ok(body)
+}
+
+/// R9: Check that JSON nesting depth doesn't exceed MAX_JSON_DEPTH.
+/// This prevents stack overflow from deeply nested payloads like
+/// `{"a":{"a":{"a":...}}}` repeated thousands of times.
+fn check_json_depth(body: &[u8]) -> bool {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut prev_escape = false;
+
+    for &b in body {
+        if in_string {
+            if prev_escape {
+                prev_escape = false;
+                continue;
+            }
+            if b == b'\\' {
+                prev_escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > MAX_JSON_DEPTH {
+                    return false;
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// R9: Build standard security headers for all HTTP responses.
+/// - X-Content-Type-Options: nosniff — prevents MIME-sniffing attacks
+/// - Cache-Control: no-store — prevents caching of sensitive inference responses
+/// - X-Frame-Options: DENY — prevents clickjacking
+fn security_headers() -> Vec<Header> {
+    vec![
+        Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap(),
+        Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
+        Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap(),
+    ]
 }
 
 fn json_error(
@@ -901,9 +993,11 @@ fn json_error(
     message: &str,
     json_header: Header,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut headers = vec![json_header];
+    headers.extend(security_headers());
     Response::new(
         StatusCode(status),
-        vec![json_header],
+        headers,
         std::io::Cursor::new(
             serde_json::to_vec(&serde_json::json!({"error": message})).unwrap(),
         ),

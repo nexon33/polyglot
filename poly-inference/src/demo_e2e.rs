@@ -111,18 +111,18 @@ fn main() {
     eprintln!();
 }
 
+/// R9: Use atomic counter instead of `static mut` which is undefined behavior
+/// in Rust. The previous code used `unsafe { static mut STEP }` which can cause
+/// data races if `run_client_server_flow` is ever called concurrently.
+static STEP_COUNTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(3);
+
 fn run_client_server_flow(
     label: &str,
     mode: Mode,
     input_ids: &[u32],
     max_tokens: u32,
 ) {
-    static mut STEP: u8 = 3;
-    let step = unsafe {
-        let s = STEP;
-        STEP += 1;
-        s
-    };
+    let step = STEP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     eprintln!("[{}/8] {} mode — full client-server flow", step, label);
     eprintln!();

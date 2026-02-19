@@ -294,8 +294,11 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
             }
         }
         VerifiedProof::Mock { output_hash, .. } => {
-            // For Mock proofs, still check binding if output_hash is non-zero (constant-time)
-            if !hash_eq(output_hash, &ZERO_HASH) && !hash_eq(&disclosure.output_binding, output_hash) {
+            // [V9-01 FIX] Always enforce output binding for Mock proofs.
+            // Previously, if output_hash == ZERO_HASH the binding check was skipped,
+            // allowing an attacker to pair a zero-hash Mock proof with ANY token set.
+            // Now we require the output_binding to match output_hash unconditionally.
+            if !hash_eq(&disclosure.output_binding, output_hash) {
                 return false;
             }
             true

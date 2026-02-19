@@ -41,6 +41,15 @@ impl BlockHeader {
                 "block header too short".into(),
             ));
         }
+        // R9: Reject trailing garbage bytes. A header must be exactly 116 bytes.
+        // Without this check, an attacker could append arbitrary data to a valid
+        // header, creating non-canonical serializations that hash differently but
+        // decode to the same logical header.
+        if data.len() > 116 {
+            return Err(ChainError::InvalidEncoding(
+                format!("block header too long: {} bytes (expected 116)", data.len()),
+            ));
+        }
         let height = u64::from_le_bytes(data[0..8].try_into().unwrap());
         let timestamp = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let mut prev_block_hash = [0u8; 32];

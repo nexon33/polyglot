@@ -665,6 +665,16 @@ pub fn rns_ct_add(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
         "rns_ct_add: b.scale must be finite and positive, got {}",
         b.scale
     );
+    // R9: Explicit num_primes check with descriptive message — the underlying
+    // RnsPoly::add has assert_eq!(self.num_primes, other.num_primes) but produces
+    // an unhelpful "assertion failed" message. A deserialized ciphertext could have
+    // matching scale/level but mismatched prime counts.
+    assert_eq!(
+        a.c0.num_primes, b.c0.num_primes,
+        "rns_ct_add: num_primes mismatch: a has {} primes, b has {} primes \
+         (use rns_ct_add_leveled for automatic level matching)",
+        a.c0.num_primes, b.c0.num_primes
+    );
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
     RnsCiphertext {
@@ -689,6 +699,13 @@ pub fn rns_ct_sub(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
         "rns_ct_sub: b.scale must be finite and positive, got {}",
         b.scale
     );
+    // R9: Explicit num_primes check (mirrors rns_ct_add fix).
+    assert_eq!(
+        a.c0.num_primes, b.c0.num_primes,
+        "rns_ct_sub: num_primes mismatch: a has {} primes, b has {} primes \
+         (use rns_ct_add_leveled for automatic level matching)",
+        a.c0.num_primes, b.c0.num_primes
+    );
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
     RnsCiphertext {
@@ -706,6 +723,15 @@ pub fn rns_ct_sub(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
 /// destroying the encrypted message) and extreme scalars that could
 /// cause modular overflow in the RNS channels.
 pub fn rns_ct_scalar_mul(ct: &RnsCiphertext, scalar: i64) -> RnsCiphertext {
+    // R9: Reject corrupted scales — every other operation (add, sub, mul, rescale,
+    // mod_switch, add_scalar_broadcast) validates ct.scale, but scalar_mul was missed
+    // in R6-R8. An attacker could pass a NaN/Inf/negative-scale ciphertext through
+    // scalar_mul to bypass validation and propagate the corruption downstream.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_scalar_mul: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
     assert!(
         scalar != 0,
         "rns_ct_scalar_mul: scalar must be non-zero (would destroy ciphertext)"
@@ -736,8 +762,17 @@ pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: f64) -> RnsCi
         "rns_ct_add_plain: delta must be finite and positive, got {}",
         delta
     );
+    // R9: Validate ct.scale is finite, positive, AND normal — a subnormal or
+    // epsilon-sized scale passes `> 0.0` and the tolerance check (if delta matches),
+    // but simd::encode_simd with a tiny scale rounds all values to zero, silently
+    // destroying the plaintext addition. Normal CKKS scales are ≥ 1.0.
     assert!(
-        ct.scale > 0.0 && (delta - ct.scale).abs() / ct.scale < 0.01,
+        ct.scale.is_finite() && ct.scale > 0.0 && ct.scale.is_normal(),
+        "rns_ct_add_plain: ct.scale must be finite, positive, and normal, got {:e}",
+        ct.scale
+    );
+    assert!(
+        (delta - ct.scale).abs() / ct.scale < 0.01,
         "scale mismatch in rns_ct_add_plain: plaintext delta={:.2} but ct.scale={:.2}",
         delta, ct.scale
     );
@@ -788,6 +823,14 @@ pub fn rns_ct_mod_switch_to(ct: &RnsCiphertext, target_primes: usize) -> RnsCiph
 /// Encodes `scalar` at the ciphertext's current scale so the addition
 /// is semantically correct. No level consumed.
 pub fn rns_ct_add_scalar_broadcast(ct: &RnsCiphertext, scalar: f64) -> RnsCiphertext {
+    // R9: Validate ct.scale before using it for encoding — a NaN/Inf/zero/negative
+    // scale gets passed to simd::encode_simd which produces garbage coefficients.
+    // R6 only checked the scalar, not the ciphertext's own scale.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_add_scalar_broadcast: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
     // R6: Reject NaN/Inf — would silently corrupt the encoded plaintext polynomial.
     assert!(
         scalar.is_finite(),
@@ -1005,6 +1048,17 @@ pub fn rns_rescale(ct: &RnsCiphertext) -> RnsCiphertext {
         "rns_rescale: resulting scale must be finite and positive, got {} (from {}/{})",
         new_scale, ct.scale, q_last
     );
+    // R9: Reject subnormal scales — subnormal floats (< 2.2e-308) pass the > 0.0
+    // check but have reduced mantissa precision. When used for SIMD decode (dividing
+    // coefficients by scale), subnormal scales produce Inf or wildly imprecise results.
+    // Normal CKKS operation never produces subnormal scales (Δ=2^36, primes~2^36,
+    // so scale ≥ Δ/q^(L-1) ≈ 1.0 at minimum), but a crafted ciphertext could.
+    assert!(
+        new_scale.is_normal(),
+        "rns_rescale: resulting scale is subnormal ({:e}), which would cause \
+         precision loss in SIMD decoding (from {}/{})",
+        new_scale, ct.scale, q_last
+    );
 
     RnsCiphertext {
         c0: ct.c0.drop_last_prime(),
@@ -1111,6 +1165,14 @@ pub fn rns_rotate(
     rot_keys: &RnsRotationKeySet,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
+    // R9: Validate ct.scale — rotation preserves scale, but a corrupted scale
+    // would propagate silently since no other check catches it in this path.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_rotate: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
+
     let slots = N / 2;
     let r = ((rotation % slots as i32) + slots as i32) as usize % slots;
     if r == 0 {
@@ -1132,6 +1194,18 @@ pub fn rns_rotate(
     // (identical to relinearization but on c1_auto instead of d2)
     let digits = decompose_digits(&c1_auto, DECOMP_BITS_ROT);
     let np = c0_auto.num_primes;
+
+    // R9: Validate rotation key has enough digit pairs for the decomposition.
+    // A rotation key generated for fewer primes than the ciphertext would cause
+    // an index-out-of-bounds panic in the loop below. This mirrors the R8 fix
+    // for rns_relinearize (eval key digit count validation).
+    assert!(
+        rot_key.keys.len() >= digits.len(),
+        "rns_rotate: rotation key has {} digit pairs but ciphertext requires {} \
+         (rotation key was generated for fewer primes than the ciphertext)",
+        rot_key.keys.len(),
+        digits.len()
+    );
 
     let mut c0_new = c0_auto;
     let mut c1_new = RnsPoly::zero(np);

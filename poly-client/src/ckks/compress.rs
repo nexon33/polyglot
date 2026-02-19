@@ -463,10 +463,32 @@ fn decompress_with_limit(compressed: &[u8], max_bytes: usize) -> Result<Vec<u8>,
     use std::io::Read;
     let mut decoder = zstd::Decoder::new(compressed)
         .map_err(CompressError::Decompress)?;
-    // Allocate up to max_bytes + 1 so we can detect overflow
-    let mut buf = vec![0u8; max_bytes + 1];
+    // R9: Use incremental allocation instead of pre-allocating max_bytes + 1 (33MB).
+    // The old approach allocated 33MB unconditionally for every decompression, even
+    // for tiny payloads. An attacker sending many small compressed payloads could
+    // exhaust memory via the 33MB-per-call overhead. Now we start with a small
+    // buffer and grow as needed, capped at max_bytes + 1.
+    let initial_cap = compressed.len().saturating_mul(4).min(max_bytes + 1).max(4096);
+    let mut buf = vec![0u8; initial_cap];
     let mut total = 0usize;
     loop {
+        if total >= buf.len() {
+            // Grow buffer, but never exceed max_bytes + 1
+            let new_len = buf.len().saturating_mul(2).min(max_bytes + 1);
+            if new_len <= buf.len() {
+                // Can't grow anymore — one more read to detect overflow
+                let mut one = [0u8; 1];
+                let n = decoder.read(&mut one).map_err(CompressError::Decompress)?;
+                if n > 0 {
+                    return Err(CompressError::DecompressedSizeExceeded {
+                        claimed: total + n,
+                        limit: max_bytes,
+                    });
+                }
+                break;
+            }
+            buf.resize(new_len, 0);
+        }
         let n = decoder.read(&mut buf[total..])
             .map_err(CompressError::Decompress)?;
         if n == 0 {

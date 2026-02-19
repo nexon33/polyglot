@@ -34,8 +34,22 @@ pub struct HelloAck {
 /// Protocol version for this implementation.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// R9: Validate serialized size does not exceed the wire limit.
+/// Before this fix, encode_hello used raw bincode::serialize() with no
+/// output size validation. A bloated Hello (e.g., with long model names
+/// within field-level limits) could serialize to >64KB and would be
+/// silently rejected by the receiving side's size-limited deserialization,
+/// producing a confusing error. Now the sender fails fast.
 pub fn encode_hello(hello: &Hello) -> anyhow::Result<Vec<u8>> {
-    Ok(bincode::serialize(hello)?)
+    let bytes = bincode::serialize(hello)?;
+    if bytes.len() as u64 > MAX_HANDSHAKE_MSG_SIZE {
+        anyhow::bail!(
+            "serialized Hello too large: {} bytes (max {})",
+            bytes.len(),
+            MAX_HANDSHAKE_MSG_SIZE
+        );
+    }
+    Ok(bytes)
 }
 
 /// R8: Use size-limited bincode for Hello deserialization.
@@ -50,8 +64,18 @@ pub fn decode_hello(data: &[u8]) -> anyhow::Result<Hello> {
         .deserialize(data)?)
 }
 
+/// R9: Validate serialized size does not exceed the wire limit.
+/// Same issue as encode_hello -- asymmetric encode/decode limits.
 pub fn encode_hello_ack(ack: &HelloAck) -> anyhow::Result<Vec<u8>> {
-    Ok(bincode::serialize(ack)?)
+    let bytes = bincode::serialize(ack)?;
+    if bytes.len() as u64 > MAX_HANDSHAKE_MSG_SIZE {
+        anyhow::bail!(
+            "serialized HelloAck too large: {} bytes (max {})",
+            bytes.len(),
+            MAX_HANDSHAKE_MSG_SIZE
+        );
+    }
+    Ok(bytes)
 }
 
 /// R8: Use size-limited bincode for HelloAck deserialization.
