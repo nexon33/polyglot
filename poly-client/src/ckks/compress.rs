@@ -430,7 +430,15 @@ fn decompress_v2_raw<T: DeserializeOwned>(data: &[u8]) -> Result<T, CompressErro
     if level_byte != 1 && level_byte != 2 {
         return Err(CompressError::InvalidHeader("invalid v2 compression level byte (expected 1=Compact or 2=Max)"));
     }
-    let _reserved = data[6];
+    // R12: Validate reserved byte — previously read as `_reserved` and silently
+    // ignored, allowing any value. This creates a format ambiguity: the same
+    // logical payload can have 256 different valid wire representations (one per
+    // reserved byte value), which could be exploited for steganographic channels
+    // or to bypass content-based deduplication/caching systems.
+    let reserved = data[6];
+    if reserved != 0 {
+        return Err(CompressError::InvalidHeader("reserved byte must be 0"));
+    }
     let element_size = data[7] as usize;
     // Validate element_size matches the expected shuffle element size to prevent
     // an attacker from manipulating the unshuffle step

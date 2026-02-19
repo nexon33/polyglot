@@ -82,6 +82,18 @@ impl Frame {
         Self { msg_type, payload }
     }
 
+    /// R12: Construct a frame with payload size validation.
+    /// Unlike `new()`, this rejects payloads that exceed MAX_FRAME_PAYLOAD
+    /// at construction time instead of deferring the check to encode/decode.
+    /// This prevents wasting memory building oversized frames that will be
+    /// rejected on the wire.
+    pub fn new_checked(msg_type: MessageType, payload: Vec<u8>) -> Result<Self, FrameError> {
+        if payload.len() > MAX_FRAME_PAYLOAD {
+            return Err(FrameError::PayloadTooLarge(payload.len()));
+        }
+        Ok(Self { msg_type, payload })
+    }
+
     /// Encode frame to bytes: [type][length][payload].
     ///
     /// # Panics

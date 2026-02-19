@@ -1000,6 +1000,10 @@ fn check_json_depth(body: &[u8]) -> bool {
 /// - Content-Security-Policy: default-src 'none' — blocks all resource loading if response
 ///   is accidentally rendered as HTML (defense-in-depth against XSS via JSON injection)
 /// - Referrer-Policy: no-referrer — prevents leaking inference URLs to third parties
+/// R12: Added X-Permitted-Cross-Domain-Policies and cross-origin headers.
+/// - X-Permitted-Cross-Domain-Policies: none — prevents Flash/PDF cross-domain access
+/// - Cross-Origin-Opener-Policy: same-origin — prevents cross-origin window references
+/// - Cross-Origin-Resource-Policy: same-origin — blocks cross-origin resource reads
 fn security_headers() -> Vec<Header> {
     vec![
         Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap(),
@@ -1007,6 +1011,9 @@ fn security_headers() -> Vec<Header> {
         Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap(),
         Header::from_bytes(&b"Content-Security-Policy"[..], &b"default-src 'none'"[..]).unwrap(),
         Header::from_bytes(&b"Referrer-Policy"[..], &b"no-referrer"[..]).unwrap(),
+        Header::from_bytes(&b"X-Permitted-Cross-Domain-Policies"[..], &b"none"[..]).unwrap(),
+        Header::from_bytes(&b"Cross-Origin-Opener-Policy"[..], &b"same-origin"[..]).unwrap(),
+        Header::from_bytes(&b"Cross-Origin-Resource-Policy"[..], &b"same-origin"[..]).unwrap(),
     ]
 }
 

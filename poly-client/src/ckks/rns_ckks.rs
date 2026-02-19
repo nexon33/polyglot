@@ -66,7 +66,7 @@ impl RnsCiphertext {
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(mac_key)
             .expect("HMAC accepts any key length");
-        mac.update(b"rns_ckks_auth_v2");
+        mac.update(b"rns_ckks_auth_v3");
         mac.update(&self.scale.to_le_bytes());
         mac.update(&(self.level as u64).to_le_bytes());
         // R7: Include num_primes in the auth tag — without this, an attacker
@@ -79,12 +79,22 @@ impl RnsCiphertext {
         // would verify because only c0's prime count was bound, but decryption
         // (which multiplies c1 * s) would silently use the wrong modulus chain.
         mac.update(&(self.c1.num_primes as u64).to_le_bytes());
-        for ch in &self.c0.residues {
+        // R12: Include per-channel prime identifiers — without this, an attacker
+        // can permute the RNS residue channels (swapping the order of channels)
+        // which represents a different polynomial under CRT but produces an
+        // identical auth tag since the coefficient bytes are hashed in the same
+        // order. By including each channel's prime q_i, channel permutation
+        // changes the hash input and invalidates the tag.
+        for (ch_idx, ch) in self.c0.residues.iter().enumerate() {
+            mac.update(&(ch_idx as u64).to_le_bytes());
+            mac.update(&(NTT_PRIMES[ch_idx] as u64).to_le_bytes());
             for &coeff in ch {
                 mac.update(&coeff.to_le_bytes());
             }
         }
-        for ch in &self.c1.residues {
+        for (ch_idx, ch) in self.c1.residues.iter().enumerate() {
+            mac.update(&(ch_idx as u64).to_le_bytes());
+            mac.update(&(NTT_PRIMES[ch_idx] as u64).to_le_bytes());
             for &coeff in ch {
                 mac.update(&coeff.to_le_bytes());
             }
@@ -659,6 +669,25 @@ fn rns_decrypt_simd_unchecked(
          (ciphertext components must have matching prime counts)",
         ct.c0.num_primes, ct.c1.num_primes
     );
+    // R12: Validate that residue coefficients are in [0, q_i) for each channel.
+    // An attacker crafting a ciphertext via deserialization can inject negative
+    // values or values >= q_i, which violate the RNS invariant and produce
+    // incorrect CRT reconstruction during decryption. This check runs only at
+    // decryption (not in every operation) to minimize overhead while catching
+    // malicious inputs before they corrupt the output.
+    for (poly_name, poly) in [("c0", &ct.c0), ("c1", &ct.c1)] {
+        for ch in 0..poly.num_primes {
+            let q = NTT_PRIMES[ch];
+            for (j, &coeff) in poly.residues[ch].iter().enumerate() {
+                assert!(
+                    coeff >= 0 && coeff < q,
+                    "rns_decrypt_simd: {}.residues[{}][{}] = {} is out of range [0, {}) \
+                     (possible injection via crafted deserialized ciphertext)",
+                    poly_name, ch, j, coeff, q
+                );
+            }
+        }
+    }
     let s_at_level = if s.num_primes > ct.c0.num_primes {
         rns_truncate(s, ct.c0.num_primes)
     } else {
@@ -907,6 +936,18 @@ pub fn rns_ct_mul_leveled(
         "rns_ct_mul_leveled: b.scale must be finite and positive, got {}",
         b.scale
     );
+    // R12: Validate that the product scale won't overflow to infinity.
+    // f64 can represent up to ~1.8e308. With delta=2^36 and repeated multiplies
+    // without rescale, scale can reach delta^(2^k) which quickly exceeds f64 range.
+    // Two sequential multiplies without rescale: scale = delta^4 = 2^144 (~2.2e43),
+    // still fine. But scale * scale can overflow if inputs are already large.
+    let product_scale = a.scale * b.scale;
+    assert!(
+        product_scale.is_finite() && product_scale > 0.0,
+        "rns_ct_mul_leveled: product scale overflows to {} (a.scale={:.2e}, b.scale={:.2e}). \
+         Did you forget to rescale between multiplications?",
+        product_scale, a.scale, b.scale
+    );
     let target = a.c0.num_primes.min(b.c0.num_primes);
     let a_m = rns_ct_mod_switch_to(a, target);
     let b_m = rns_ct_mod_switch_to(b, target);
@@ -1009,6 +1050,14 @@ pub fn rns_ct_mul(
         "rns_ct_mul: num_primes mismatch: a has {} primes, b has {} primes \
          (use rns_ct_mul_leveled for automatic level matching)",
         a.c0.num_primes, b.c0.num_primes
+    );
+    // R12: Validate that the product scale won't overflow to infinity.
+    let product_scale = a.scale * b.scale;
+    assert!(
+        product_scale.is_finite() && product_scale > 0.0,
+        "rns_ct_mul: product scale overflows to {} (a.scale={:.2e}, b.scale={:.2e}). \
+         Did you forget to rescale between multiplications?",
+        product_scale, a.scale, b.scale
     );
 
     let d0 = ctx.poly_mul(&a.c0, &b.c0);
@@ -1351,13 +1400,22 @@ pub fn rns_ct_mul_plain_simd(
         values.iter().all(|v| v.is_finite()),
         "rns_ct_mul_plain_simd: all values must be finite (no NaN/Inf)"
     );
+    // R12: Validate product scale won't overflow. ct.scale * ctx.delta should
+    // always be finite for normal operation, but a crafted ciphertext with
+    // scale near f64::MAX would overflow to infinity.
+    let product_scale = ct.scale * ctx.delta;
+    assert!(
+        product_scale.is_finite() && product_scale > 0.0,
+        "rns_ct_mul_plain_simd: product scale overflows to {} (ct.scale={:.2e}, delta={:.2e})",
+        product_scale, ct.scale, ctx.delta
+    );
     let coeffs = simd::encode_simd(values, ctx.delta);
     let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
 
     RnsCiphertext {
         c0: ctx.poly_mul(&ct.c0, &p),
         c1: ctx.poly_mul(&ct.c1, &p),
-        scale: ct.scale * ctx.delta,
+        scale: product_scale,
         level: ct.level,
         auth_tag: None,
     }

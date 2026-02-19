@@ -1011,8 +1011,17 @@ fn validate_stp_action(
                 ));
             }
 
-            // Store the data hash
-            new_state.set_stp_record(*investigation_id, *data_hash);
+            // R12: Store the data hash under a separate key (not the investigation_id).
+            // Previously this overwrote the investigation record with data_hash,
+            // destroying the original investigation hash. If CheckDeadline runs after
+            // ProvideData, it sees data_hash instead of the investigation hash, making
+            // it impossible to reconstruct the investigation for deadline enforcement.
+            // We store under H("stp_data_v1" || investigation_id) instead.
+            let data_key = hash_with_domain(
+                DOMAIN_STP,
+                &[b"stp_data_v1".as_slice(), investigation_id.as_slice()].concat(),
+            );
+            new_state.set_stp_record(data_key, *data_hash);
         }
 
         STPAction::CheckDeadline { investigation_id } => {
@@ -1075,7 +1084,15 @@ fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState, now: Time
     verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
     // 3. Update app state
-    new_state.set_app_state(tx.app_id, tx.new_state_hash);
+    // R12: Use account-scoped key: H(account_id || app_id). Previously the
+    // raw app_id was used as the SMT key, so two different accounts using the
+    // same app_id would overwrite each other's state. By scoping to the
+    // account, each user's app state is independent.
+    let app_key = hash_with_domain(
+        DOMAIN_WALLET_STATE,
+        &[tx.account_id.as_slice(), &tx.app_id].concat(),
+    );
+    new_state.set_app_state(app_key, tx.new_state_hash);
 
     Ok(new_state)
 }
@@ -1645,7 +1662,12 @@ mod tests {
         });
 
         let new_state = validate_transaction(&tx, &state, 1000, 0).unwrap();
-        assert_eq!(new_state.get_app_state(&app_id), Some([0xDD; 32]));
+        // R12: app state is now scoped to account — key is H(account_id || app_id)
+        let app_key = hash_with_domain(
+            DOMAIN_WALLET_STATE,
+            &[sender.as_slice(), &app_id].concat(),
+        );
+        assert_eq!(new_state.get_app_state(&app_key), Some([0xDD; 32]));
     }
 
     // -----------------------------------------------------------------------

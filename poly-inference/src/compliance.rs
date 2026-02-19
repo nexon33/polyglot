@@ -551,6 +551,63 @@ fn confusable_to_ascii(ch: char) -> Option<char> {
         '\u{249C}'..='\u{24B5}' => {
             Some((ch as u32 - 0x249C + b'a' as u32) as u8 as char)
         }
+        // R12: Latin Extended-B / IPA Extensions confusables
+        // These are phonetic characters that visually resemble standard Latin letters.
+        // Attackers can substitute them to bypass ASCII-only pattern matching.
+        '\u{0251}' => Some('a'), // Latin small alpha (IPA, looks like 'a')
+        '\u{0252}' => Some('a'), // Latin small turned alpha
+        '\u{0253}' => Some('b'), // Latin small b with hook
+        '\u{0255}' => Some('c'), // Latin small c with curl
+        '\u{0256}' => Some('d'), // Latin small d with tail
+        '\u{0257}' => Some('d'), // Latin small d with hook
+        '\u{025B}' => Some('e'), // Latin small open e (epsilon)
+        '\u{025C}' => Some('e'), // Latin small reversed open e
+        '\u{0261}' => Some('g'), // Latin small script g (IPA)
+        '\u{0262}' => Some('G'), // Latin letter small capital G
+        '\u{0266}' => Some('h'), // Latin small h with hook
+        '\u{0268}' => Some('i'), // Latin small i with stroke
+        '\u{026A}' => Some('I'), // Latin letter small capital I
+        '\u{026B}' => Some('l'), // Latin small l with middle tilde
+        '\u{026C}' => Some('l'), // Latin small l with belt
+        '\u{026D}' => Some('l'), // Latin small l with retroflex hook
+        '\u{026F}' => Some('m'), // Latin small turned m
+        '\u{0270}' => Some('m'), // Latin small turned m with long leg
+        '\u{0271}' => Some('m'), // Latin small m with hook
+        '\u{0272}' => Some('n'), // Latin small n with left hook
+        '\u{0273}' => Some('n'), // Latin small n with retroflex hook
+        '\u{0275}' => Some('o'), // Latin small barred o
+        '\u{0278}' => Some('o'), // Latin small phi (looks like o with stroke)
+        '\u{0279}' => Some('r'), // Latin small turned r
+        '\u{027A}' => Some('r'), // Latin small turned r with long leg
+        '\u{027B}' => Some('r'), // Latin small turned r with hook
+        '\u{027C}' => Some('r'), // Latin small r with long leg
+        '\u{027D}' => Some('r'), // Latin small r with tail
+        '\u{027E}' => Some('r'), // Latin small r with fishhook
+        '\u{0282}' => Some('s'), // Latin small s with hook
+        '\u{0283}' => Some('s'), // Latin small esh (looks like long s)
+        '\u{0287}' => Some('t'), // Latin small turned t
+        '\u{0288}' => Some('t'), // Latin small t with retroflex hook
+        '\u{028B}' => Some('v'), // Latin small v with hook
+        '\u{028C}' => Some('v'), // Latin small turned v
+        '\u{028D}' => Some('w'), // Latin small turned w
+        '\u{0290}' => Some('z'), // Latin small z with retroflex hook
+        '\u{0291}' => Some('z'), // Latin small z with curl
+        '\u{0292}' => Some('z'), // Latin small ezh (looks like z with tail)
+        // R12: Latin Extended Additional / modifier letters
+        '\u{1D00}' => Some('A'), // Latin letter small capital A
+        '\u{1D04}' => Some('C'), // Latin letter small capital C
+        '\u{1D05}' => Some('D'), // Latin letter small capital D
+        '\u{1D07}' => Some('E'), // Latin letter small capital E
+        '\u{1D0A}' => Some('J'), // Latin letter small capital J
+        '\u{1D0B}' => Some('K'), // Latin letter small capital K
+        '\u{1D0D}' => Some('M'), // Latin letter small capital M
+        '\u{1D0F}' => Some('O'), // Latin letter small capital O
+        '\u{1D18}' => Some('P'), // Latin letter small capital P
+        '\u{1D1B}' => Some('T'), // Latin letter small capital T
+        '\u{1D1C}' => Some('U'), // Latin letter small capital U
+        '\u{1D20}' => Some('V'), // Latin letter small capital V
+        '\u{1D21}' => Some('W'), // Latin letter small capital W
+        '\u{1D22}' => Some('Z'), // Latin letter small capital Z
         _ => None,
     }
 }
@@ -770,8 +827,9 @@ fn strip_interleaved_punctuation(input: &str) -> String {
 /// Returns true for punctuation characters commonly used as interleaving separators
 /// in evasion attacks. Only includes characters that would never appear between
 /// letters in normal text patterns we're matching against.
+/// R12: Added '#', '@', '+', '^', '=' which are also used in leet-speak evasion.
 fn is_interleave_punctuation(ch: char) -> bool {
-    matches!(ch, '.' | '-' | '_' | '*' | '~' | '`' | '|' | '/')
+    matches!(ch, '.' | '-' | '_' | '*' | '~' | '`' | '|' | '/' | '#' | '@' | '+' | '^' | '=')
 }
 
 #[cfg(test)]

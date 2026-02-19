@@ -121,6 +121,33 @@ impl RnsPoly {
         coeffs
     }
 
+    /// Validate that all residue coefficients are in [0, q_i) for each channel.
+    ///
+    /// R12: RnsPoly fields are `pub`, so deserialized or manually constructed
+    /// polynomials can have out-of-range coefficients (negative or >= q_i).
+    /// These violate the RNS invariant and produce incorrect CRT results.
+    /// Returns `true` if all coefficients are valid, `false` otherwise.
+    pub fn validate_residue_ranges(&self) -> bool {
+        if self.residues.len() != self.num_primes {
+            return false;
+        }
+        for ch in 0..self.num_primes {
+            if ch >= NTT_PRIMES.len() {
+                return false;
+            }
+            let q = NTT_PRIMES[ch];
+            if self.residues[ch].len() != N {
+                return false;
+            }
+            for &coeff in &self.residues[ch] {
+                if coeff < 0 || coeff >= q {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Coefficient-wise addition mod each prime.
     pub fn add(&self, other: &RnsPoly) -> RnsPoly {
         assert_eq!(self.num_primes, other.num_primes);

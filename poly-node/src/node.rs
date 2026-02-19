@@ -53,6 +53,11 @@
 //! - R11: NodeInfo signing includes domain separation tag (prevents cross-context replay)
 //! - R11: NodeInfo signing includes addresses.len() count (prevents address list ambiguity)
 //! - R11: Ping payload size validated (MAX_PING_PAYLOAD=128, prevents 16MB memory waste)
+//! - R12: Trailing frame data rejected (bytes_consumed must equal data.len())
+//! - R12: model_name length validated in PolyNode::new() (prevents config-driven amplification)
+//! - R12: Frame::new_checked() validates payload at construction (fail-fast before encode)
+//! - R12: Client-side trailing frame data rejected for HelloAck and InferResponse
+//! - R12: Client-side HelloAck frame type validated before deserialization (not after)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -162,6 +167,17 @@ impl PolyNode {
         // forever, effectively a self-DoS configuration footgun.
         if config.max_sessions == 0 {
             anyhow::bail!("max_sessions must be >= 1 (got 0)");
+        }
+        // R12: Validate model_name length. The model_name is embedded in every
+        // NodeInfo (own_node_info) and broadcast in HelloAck to every connecting
+        // peer. Without this check, a multi-MB model_name in the config would be
+        // amplified to every connection, wasting bandwidth and memory.
+        if config.model_name.len() > MAX_MODEL_NAME_LEN {
+            anyhow::bail!(
+                "model_name too long: {} bytes (max {})",
+                config.model_name.len(),
+                MAX_MODEL_NAME_LEN
+            );
         }
         let identity = NodeIdentity::generate();
         info!(
@@ -426,7 +442,22 @@ async fn handle_stream(
         .await
         .map_err(|_| anyhow::anyhow!("stream read timeout"))??;
 
-    let (frame, _) = Frame::decode(&data).map_err(|e| anyhow::anyhow!("{}", e))?;
+    // R12: Reject frames with trailing data. Before R12, the bytes_consumed
+    // value from Frame::decode was silently discarded. An attacker could append
+    // arbitrary data after a valid frame (up to 16 MB). While the extra data
+    // is not processed, it wastes server memory (the full 16 MB is read into
+    // `data` before the frame is decoded) and could be used for protocol
+    // confusion attacks where the trailing data resembles a second frame.
+    let (frame, consumed) = Frame::decode(&data).map_err(|e| anyhow::anyhow!("{}", e))?;
+    if consumed != data.len() {
+        warn!(
+            "Rejected frame with {} trailing bytes (frame consumed {}, total {})",
+            data.len() - consumed,
+            consumed,
+            data.len()
+        );
+        return Ok(());
+    }
 
     let response_frame = match frame.msg_type {
         MessageType::Ping => {
@@ -890,7 +921,18 @@ pub async fn connect_and_infer(
         hs_send.write_all(&hello_frame.encode()).await?;
         hs_send.finish()?;
         let ack_data = hs_recv.read_to_end(64 * 1024).await?;
-        let (ack_frame, _) = Frame::decode(&ack_data).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let (ack_frame, ack_consumed) = Frame::decode(&ack_data).map_err(|e| anyhow::anyhow!("{}", e))?;
+        // R12: Reject HelloAck frames with trailing data. A malicious server
+        // could append extra data after a valid HelloAck frame. While the extra
+        // data is not processed, it could indicate a protocol confusion attack.
+        if ack_consumed != ack_data.len() {
+            anyhow::bail!(
+                "HelloAck frame has {} trailing bytes (consumed {}, total {})",
+                ack_data.len() - ack_consumed,
+                ack_consumed,
+                ack_data.len()
+            );
+        }
         if ack_frame.msg_type != MessageType::HelloAck {
             anyhow::bail!("expected HelloAck, got {:?}", ack_frame.msg_type);
         }
@@ -996,7 +1038,14 @@ pub async fn connect_and_infer(
     )
     .await
     .map_err(|_| anyhow::anyhow!("inference response read timed out after {:?}", CLIENT_RESPONSE_TIMEOUT))??;
-    let (resp_frame, _) = Frame::decode(&data).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let (resp_frame, resp_consumed) = Frame::decode(&data).map_err(|e| anyhow::anyhow!("{}", e))?;
+    // R12: Reject InferResponse frames with trailing data.
+    if resp_consumed != data.len() {
+        anyhow::bail!(
+            "InferResponse frame has {} trailing bytes",
+            data.len() - resp_consumed
+        );
+    }
 
     if resp_frame.msg_type != MessageType::InferResponse {
         anyhow::bail!("expected InferResponse, got {:?}", resp_frame.msg_type);
