@@ -354,15 +354,26 @@ pub fn check_prompt(prompt: &str) -> Result<(), PromptRejection> {
 ///
 /// Applies the following transformations:
 /// 1. Strip zero-width characters (ZWJ, ZWNJ, ZWSP, soft hyphen, etc.)
+/// 1b. R11: Strip ASCII control characters (U+0001-U+001F except whitespace)
 /// 2. Replace common confusable/homoglyph characters with ASCII equivalents
 /// 3. Replace fullwidth ASCII with halfwidth equivalents
+/// 3b. R11: Replace Letterlike Symbols (U+2100-U+214F) with ASCII equivalents
 /// 4. Collapse multiple whitespace into single space
+/// 5. R11: Strip interleaved punctuation used for leet-speak evasion
 fn normalize_prompt(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
 
     for ch in input.chars() {
         // 1. Strip zero-width and invisible characters
         if is_invisible_char(ch) {
+            continue;
+        }
+
+        // R11: Strip ASCII control characters (U+0001-U+001F) except standard whitespace.
+        // Control chars like BEL, ESC, etc. can break pattern matching and are never
+        // legitimate in natural language prompts. Whitespace (tab, newline, CR) is
+        // preserved for the whitespace collapse step.
+        if ch < '\u{0020}' && ch != '\t' && ch != '\n' && ch != '\r' {
             continue;
         }
 
@@ -385,6 +396,12 @@ fn normalize_prompt(input: &str) -> String {
             continue;
         }
 
+        // R11: Replace Letterlike Symbols (U+2100-U+214F) with ASCII equivalents
+        if let Some(replacement) = letterlike_to_ascii(ch) {
+            result.push(replacement);
+            continue;
+        }
+
         result.push(ch);
     }
 
@@ -402,6 +419,12 @@ fn normalize_prompt(input: &str) -> String {
             prev_space = false;
         }
     }
+
+    // R11: Strip interleaved single-punctuation characters used for leet-speak evasion.
+    // Attackers can bypass substring matching by inserting dots, hyphens, or underscores
+    // between letters: "h.o.w t.o m.a.k.e a b.o.m.b" or "j-a-i-l-b-r-e-a-k".
+    // This strips isolated punctuation characters that appear between letters.
+    let collapsed = strip_interleaved_punctuation(&collapsed);
 
     collapsed
 }
@@ -638,6 +661,117 @@ fn math_alpha_to_ascii(ch: char) -> Option<char> {
     }
 
     None
+}
+
+/// R11: Normalize Letterlike Symbols (U+2100-U+214F) to ASCII.
+///
+/// These are standalone symbols that look like Latin letters but are in a
+/// separate Unicode block. Examples: ℋ (script H), ℐ (script I), ℒ (script L),
+/// ℎ (planck constant = italic h), ℕ (double-struck N), ℝ (double-struck R).
+/// Some of these are actually the "canonical" forms that replace reserved
+/// codepoints in the Mathematical Alphanumeric Symbols block (e.g., U+210E
+/// replaces U+1D455 for italic h). Without normalizing these, an attacker
+/// can use them to bypass filters that only handle the math alpha block.
+fn letterlike_to_ascii(ch: char) -> Option<char> {
+    match ch {
+        '\u{2100}' => Some('a'), // ℀ account of (a/c ligature → a)
+        '\u{2101}' => Some('a'), // ℁ addressed to (a/s ligature → a)
+        '\u{2102}' => Some('C'), // ℂ double-struck C
+        '\u{2103}' => Some('C'), // ℃ degree Celsius
+        '\u{2105}' => Some('c'), // ℅ care of (c/o ligature → c)
+        '\u{2107}' => Some('E'), // ℇ Euler constant
+        '\u{210A}' => Some('g'), // ℊ script small g
+        '\u{210B}' => Some('H'), // ℋ script capital H
+        '\u{210C}' => Some('H'), // ℌ Fraktur capital H
+        '\u{210D}' => Some('H'), // ℍ double-struck capital H
+        '\u{210E}' => Some('h'), // ℎ Planck constant (italic h)
+        '\u{210F}' => Some('h'), // ℏ Planck constant / 2pi
+        '\u{2110}' => Some('I'), // ℐ script capital I
+        '\u{2111}' => Some('I'), // ℑ Fraktur capital I
+        '\u{2112}' => Some('L'), // ℒ script capital L
+        '\u{2113}' => Some('l'), // ℓ script small l
+        '\u{2115}' => Some('N'), // ℕ double-struck capital N
+        '\u{2118}' => Some('P'), // ℘ Weierstrass p (script capital P)
+        '\u{2119}' => Some('P'), // ℙ double-struck capital P
+        '\u{211A}' => Some('Q'), // ℚ double-struck capital Q
+        '\u{211B}' => Some('R'), // ℛ script capital R
+        '\u{211C}' => Some('R'), // ℜ Fraktur capital R
+        '\u{211D}' => Some('R'), // ℝ double-struck capital R
+        '\u{2124}' => Some('Z'), // ℤ double-struck capital Z
+        '\u{2126}' => Some('O'), // Ω ohm sign (looks like O, actually omega)
+        '\u{2128}' => Some('Z'), // ℨ Fraktur capital Z
+        '\u{212A}' => Some('K'), // K kelvin sign
+        '\u{212B}' => Some('A'), // Å angstrom sign
+        '\u{212C}' => Some('B'), // ℬ script capital B
+        '\u{212D}' => Some('C'), // ℭ Fraktur capital C
+        '\u{212F}' => Some('e'), // ℯ script small e
+        '\u{2130}' => Some('E'), // ℰ script capital E
+        '\u{2131}' => Some('F'), // ℱ script capital F
+        '\u{2132}' => Some('F'), // Ⅎ turned capital F
+        '\u{2133}' => Some('M'), // ℳ script capital M
+        '\u{2134}' => Some('o'), // ℴ script small o
+        '\u{2139}' => Some('i'), // ℹ information source (small i)
+        '\u{213C}' => Some('p'), // ℼ double-struck small pi → p
+        '\u{213D}' => Some('y'), // ℽ double-struck small gamma → y
+        '\u{213E}' => Some('G'), // ℾ double-struck capital Gamma → G
+        '\u{213F}' => Some('P'), // ℿ double-struck capital Pi → P
+        '\u{2145}' => Some('D'), // ⅅ double-struck italic capital D
+        '\u{2146}' => Some('d'), // ⅆ double-struck italic small d
+        '\u{2147}' => Some('e'), // ⅇ double-struck italic small e
+        '\u{2148}' => Some('i'), // ⅈ double-struck italic small i
+        '\u{2149}' => Some('j'), // ⅉ double-struck italic small j
+        _ => None,
+    }
+}
+
+/// R11: Strip interleaved punctuation characters used for leet-speak evasion.
+///
+/// Attackers bypass substring matching by inserting dots, hyphens, underscores,
+/// or other punctuation between letters: "h.o.w t.o m.a.k.e a b.o.m.b" or
+/// "j-a-i-l-b-r-e-a-k". This function detects single punctuation characters
+/// flanked by alphabetic characters and removes them.
+///
+/// Only strips punctuation that appears as a single character between letters.
+/// Multi-character punctuation sequences ("how to...make") are left intact
+/// since they are less likely to be evasion attempts.
+fn strip_interleaved_punctuation(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    if len < 3 {
+        return input.to_string();
+    }
+
+    let mut result = String::with_capacity(input.len());
+
+    // Check character by character
+    let mut i = 0;
+    while i < len {
+        if i > 0 && i + 1 < len {
+            let prev = chars[i - 1];
+            let curr = chars[i];
+            let next = chars[i + 1];
+
+            // If current char is a single punctuation/separator between two letters, skip it
+            if prev.is_alphabetic()
+                && next.is_alphabetic()
+                && is_interleave_punctuation(curr)
+            {
+                i += 1;
+                continue;
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+/// Returns true for punctuation characters commonly used as interleaving separators
+/// in evasion attacks. Only includes characters that would never appear between
+/// letters in normal text patterns we're matching against.
+fn is_interleave_punctuation(ch: char) -> bool {
+    matches!(ch, '.' | '-' | '_' | '*' | '~' | '`' | '|' | '/')
 }
 
 #[cfg(test)]

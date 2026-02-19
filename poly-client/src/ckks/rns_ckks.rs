@@ -829,6 +829,16 @@ pub fn rns_ct_mod_switch_to(ct: &RnsCiphertext, target_primes: usize) -> RnsCiph
         "rns_ct_mod_switch_to: scale must be finite and positive, got {}",
         ct.scale
     );
+    // R11: Validate c0/c1 consistency before mod-switching. Without this, a crafted
+    // ciphertext with c0.num_primes=5 but c1.num_primes=2 would pass the target_primes
+    // check (which only looks at c0), then rns_truncate(&ct.c1, target_primes) would
+    // slice beyond c1's actual residue count, causing a panic or silent data corruption.
+    assert_eq!(
+        ct.c0.num_primes, ct.c1.num_primes,
+        "rns_ct_mod_switch_to: c0 has {} primes but c1 has {} primes \
+         (ciphertext components must have matching prime counts)",
+        ct.c0.num_primes, ct.c1.num_primes
+    );
     assert!(target_primes >= 1 && target_primes <= ct.c0.num_primes);
     if target_primes == ct.c0.num_primes {
         return ct.clone();
@@ -941,6 +951,19 @@ pub fn rns_ct_add_leveled(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext
         b.scale.is_finite() && b.scale > 0.0,
         "rns_ct_add_leveled: b.scale must be finite and positive, got {}",
         b.scale
+    );
+    // R11: Validate scale compatibility — leveled add uses the average of the two
+    // scales, which only makes sense when they are approximately equal (both at ~delta
+    // after rescaling). If one scale is delta and the other is delta^2, the average
+    // is meaningless and decryption produces garbage. A 50% tolerance catches gross
+    // mismatches while allowing the small drift from rescaling (scale = delta^2/q_i).
+    let scale_ratio = a.scale / b.scale;
+    assert!(
+        scale_ratio > 0.5 && scale_ratio < 2.0,
+        "rns_ct_add_leveled: scale mismatch too large for averaging — \
+         a.scale={:.2e}, b.scale={:.2e} (ratio {:.2}). Scales must be \
+         approximately equal for leveled addition.",
+        a.scale, b.scale, scale_ratio
     );
     let target = a.c0.num_primes.min(b.c0.num_primes);
     let a_m = rns_ct_mod_switch_to(a, target);
@@ -1078,6 +1101,16 @@ pub fn rns_rescale(ct: &RnsCiphertext) -> RnsCiphertext {
     assert!(
         ct.c0.num_primes > 1,
         "cannot rescale: only 1 prime remaining"
+    );
+    // R11: Validate c0/c1 consistency before rescaling. Without this, a crafted
+    // ciphertext with c0.num_primes=3 but c1.num_primes=2 would drop different
+    // primes from c0 and c1 (c0 drops prime 2, c1 drops prime 1), producing a
+    // ciphertext where the two components are in incompatible modulus chains.
+    assert_eq!(
+        ct.c0.num_primes, ct.c1.num_primes,
+        "rns_rescale: c0 has {} primes but c1 has {} primes \
+         (ciphertext components must have matching prime counts)",
+        ct.c0.num_primes, ct.c1.num_primes
     );
     // R7: Reject NaN/Inf/negative scales — division by q_last would propagate
     // the corruption, and the result scale could become 0.0 or subnormal.
@@ -1218,6 +1251,16 @@ pub fn rns_rotate(
         "rns_rotate: ct.scale must be finite and positive, got {}",
         ct.scale
     );
+    // R11: Validate c0/c1 consistency — rotation applies automorphism to both
+    // components, then key-switches c1. If c0/c1 have different prime counts,
+    // the key-switching decomposition uses c1's prime count but the output
+    // c0_new has c0's prime count, producing an inconsistent ciphertext.
+    assert_eq!(
+        ct.c0.num_primes, ct.c1.num_primes,
+        "rns_rotate: c0 has {} primes but c1 has {} primes \
+         (ciphertext components must have matching prime counts)",
+        ct.c0.num_primes, ct.c1.num_primes
+    );
 
     let slots = N / 2;
     let r = ((rotation % slots as i32) + slots as i32) as usize % slots;
@@ -1334,6 +1377,16 @@ pub fn replicate_vector(values: &[f64], d: usize) -> Vec<f64> {
     assert!(
         !values.is_empty(),
         "replicate_vector: values must be non-empty"
+    );
+    // R11: Validate values.len() <= d — with values.len() > d, the `values[i % d]`
+    // indexing silently ignores values beyond index d. The caller likely intended
+    // all values to be replicated, but only the first d values would be used.
+    // This is a logic error that should be caught early.
+    assert!(
+        values.len() <= d,
+        "replicate_vector: values.len() ({}) exceeds dimension d ({}) — \
+         extra values would be silently ignored",
+        values.len(), d
     );
     let mut replicated = vec![0.0; simd::NUM_SLOTS];
     for i in 0..simd::NUM_SLOTS {

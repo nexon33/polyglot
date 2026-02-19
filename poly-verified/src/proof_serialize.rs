@@ -163,6 +163,29 @@ impl VerifiedResponse {
     pub fn validate_proof_bytes(&self) -> bool {
         serde_json::from_slice::<VerifiedProof>(&self.proof_bytes).is_ok()
     }
+
+    /// [V11-04 FIX] Validate that proof_bytes content is consistent with the
+    /// wire format header fields (proof_scheme and privacy_mode).
+    ///
+    /// Without this check, an attacker can tamper with the header's proof_scheme
+    /// or privacy_mode bytes after serialization. For example, flipping
+    /// privacy_mode from Transparent to Private causes `verify_value_integrity()`
+    /// to skip the value hash check, bypassing integrity protection.
+    pub fn validate_header_consistency(&self) -> bool {
+        let proof: VerifiedProof = match serde_json::from_slice(&self.proof_bytes) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        // Check proof_scheme matches actual proof variant
+        if self.proof_scheme as u8 != proof.backend_id() as u8 {
+            return false;
+        }
+        // Check privacy_mode matches actual proof content
+        if self.privacy_mode as u8 != proof.privacy_mode() as u8 {
+            return false;
+        }
+        true
+    }
 }
 
 #[cfg(test)]

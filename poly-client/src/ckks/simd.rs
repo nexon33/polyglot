@@ -197,6 +197,15 @@ pub fn encode_simd(values: &[f64], delta: f64) -> Vec<i64> {
         values.len(),
         NUM_SLOTS
     );
+    // R11: Validate delta — NaN/Inf/zero/negative delta produces garbage coefficients
+    // after scaling (c.re * NaN → NaN → 0 after round-as-i64, or Inf → platform-dependent).
+    // While internal callers always pass ctx.delta (which is valid), encode_simd is a
+    // public function and can be called with arbitrary delta by users or attackers.
+    assert!(
+        delta.is_finite() && delta > 0.0,
+        "encode_simd: delta must be finite and positive, got {}",
+        delta
+    );
 
     let mut padded = vec![0.0f64; NUM_SLOTS];
     padded[..values.len()].copy_from_slice(values);
@@ -235,6 +244,15 @@ pub fn encode_simd(values: &[f64], delta: f64) -> Vec<i64> {
 /// 3. Read real parts from Galois-aligned FFT positions
 pub fn decode_simd(coeffs: &[i64], scale: f64, count: usize) -> Vec<f64> {
     assert!(count <= NUM_SLOTS, "count {} > NUM_SLOTS {}", count, NUM_SLOTS);
+    // R11: Validate scale — dividing coefficients by NaN/Inf/zero/negative scale
+    // produces NaN, zero, or garbage values. While rns_decrypt_simd_unchecked
+    // validates ct.scale before calling this, decode_simd is a public function
+    // and can be called directly with an invalid scale.
+    assert!(
+        scale.is_finite() && scale > 0.0,
+        "decode_simd: scale must be finite and positive, got {}",
+        scale
+    );
 
     // Twist: b_j = (coeff_j / scale) · ψ^j
     let psi_angle = PI / N as f64;

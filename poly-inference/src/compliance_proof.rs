@@ -221,7 +221,7 @@ impl ComplianceProof {
         Ok(true)
     }
 
-    /// True if every token passed the policy.
+    /// True if every token passed the policy and at least one token was checked.
     ///
     /// **WARNING**: This is a convenience check on the metadata fields ONLY.
     /// It does NOT verify the cryptographic proof. An attacker can forge a
@@ -229,8 +229,13 @@ impl ComplianceProof {
     /// pass this check but fail `verify()`.
     ///
     /// **Always call `verify()` before trusting `all_compliant()`.**
+    ///
+    /// R11: Now returns false for zero-token proofs (0 == 0). A proof that
+    /// checked no tokens should not be considered "all compliant" since it
+    /// provides no compliance evidence. This prevents attackers from constructing
+    /// vacuously-true empty proofs.
     pub fn all_compliant(&self) -> bool {
-        self.total_tokens == self.compliant_tokens
+        self.total_tokens > 0 && self.total_tokens == self.compliant_tokens
     }
 
     /// R10: Safe version of `all_compliant()` that also verifies the proof.

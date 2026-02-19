@@ -50,6 +50,9 @@
 //! - R10: Server HelloAck uses encode_hello_ack() (consistent encode/decode path)
 //! - R10: handle_infer() deprecated (dead code that bypasses all validation)
 //! - R10: build_signed_node_info_with() helper for tests with custom signed NodeInfo
+//! - R11: NodeInfo signing includes domain separation tag (prevents cross-context replay)
+//! - R11: NodeInfo signing includes addresses.len() count (prevents address list ambiguity)
+//! - R11: Ping payload size validated (MAX_PING_PAYLOAD=128, prevents 16MB memory waste)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,6 +135,14 @@ const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Prevents a malicious server from sending an oversized encrypted output that
 /// wastes client memory. Real PFHE ciphertext outputs should be much smaller.
 const MAX_CLIENT_RESPONSE_OUTPUT_SIZE: usize = 4 * 1024 * 1024;
+
+/// R11: Maximum allowed payload for Ping messages (128 bytes).
+/// Ping is a health-check with no meaningful payload. Before R11, the server
+/// read up to 16 MB for every message type including Ping, and then discarded
+/// the payload entirely. An authenticated attacker could send 16 MB Ping
+/// frames to waste server memory (16 MB allocation per stream, up to 256
+/// streams per connection). Now Ping payloads > 128 bytes are rejected.
+pub const MAX_PING_PAYLOAD: usize = 128;
 
 /// A running Poly Network compute node.
 pub struct PolyNode {
@@ -422,6 +433,18 @@ async fn handle_stream(
             // Allow Ping only after successful handshake
             if !handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
                 warn!("Rejected Ping: handshake not completed");
+                return Ok(());
+            }
+            // R11: Reject Ping with oversized payload. Ping is a health-check
+            // that requires no payload. Before R11, the payload was silently
+            // discarded regardless of size, allowing an authenticated attacker
+            // to waste 16 MB of server memory per Ping stream.
+            if frame.payload.len() > MAX_PING_PAYLOAD {
+                warn!(
+                    "Rejected Ping: payload too large ({} bytes, max {})",
+                    frame.payload.len(),
+                    MAX_PING_PAYLOAD
+                );
                 return Ok(());
             }
             Frame::new(MessageType::Pong, vec![])

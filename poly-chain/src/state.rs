@@ -138,9 +138,15 @@ impl GlobalState {
         }
     }
 
-    /// Combined state root: H(wallets_root || identities_root || ... || swaps_root).
+    /// Combined state root: H(wallets_root || identities_root || ... || swaps_root || nonces_hash).
+    ///
+    /// R11: The nonces map is now included in the state root commitment.
+    /// Previously, nonces were excluded, meaning two states with different nonces
+    /// would produce the same state_root. This allowed an attacker who obtained a
+    /// state snapshot to forge a state with reset nonces, enabling transaction replays
+    /// that bypass the nonce check (because the replayed nonce would match the forged state).
     pub fn state_root(&self) -> Hash {
-        let mut data = Vec::with_capacity(8 * 32);
+        let mut data = Vec::with_capacity(9 * 32);
         data.extend_from_slice(&self.wallets.root());
         data.extend_from_slice(&self.identities.root());
         data.extend_from_slice(&self.compliance.root());
@@ -149,7 +155,23 @@ impl GlobalState {
         data.extend_from_slice(&self.stp.root());
         data.extend_from_slice(&self.applications.root());
         data.extend_from_slice(&self.swaps.root());
+        data.extend_from_slice(&self.nonces_hash());
         hash_with_domain(DOMAIN_BLOCK, &data)
+    }
+
+    /// R11: Compute a deterministic hash of all account nonces.
+    /// This ensures the nonce map is committed to in the state root,
+    /// preventing state forgery attacks that reset nonces.
+    fn nonces_hash(&self) -> Hash {
+        if self.nonces.is_empty() {
+            return ZERO_HASH;
+        }
+        let mut buf = Vec::new();
+        for (account_id, nonce) in &self.nonces {
+            buf.extend_from_slice(account_id);
+            buf.extend_from_slice(&nonce.to_le_bytes());
+        }
+        hash_with_domain(DOMAIN_BLOCK, &buf)
     }
 
     // -----------------------------------------------------------------------

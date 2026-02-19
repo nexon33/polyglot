@@ -996,11 +996,17 @@ fn check_json_depth(body: &[u8]) -> bool {
 /// - X-Content-Type-Options: nosniff — prevents MIME-sniffing attacks
 /// - Cache-Control: no-store — prevents caching of sensitive inference responses
 /// - X-Frame-Options: DENY — prevents clickjacking
+/// R11: Added Content-Security-Policy and Referrer-Policy headers.
+/// - Content-Security-Policy: default-src 'none' — blocks all resource loading if response
+///   is accidentally rendered as HTML (defense-in-depth against XSS via JSON injection)
+/// - Referrer-Policy: no-referrer — prevents leaking inference URLs to third parties
 fn security_headers() -> Vec<Header> {
     vec![
         Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap(),
         Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap(),
         Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap(),
+        Header::from_bytes(&b"Content-Security-Policy"[..], &b"default-src 'none'"[..]).unwrap(),
+        Header::from_bytes(&b"Referrer-Policy"[..], &b"no-referrer"[..]).unwrap(),
     ]
 }
 

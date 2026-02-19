@@ -71,6 +71,7 @@ impl MessageType {
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// Wire frame: 1B type + 4B big-endian length + payload.
+#[derive(Debug)]
 pub struct Frame {
     pub msg_type: MessageType,
     pub payload: Vec<u8>,
@@ -135,7 +136,8 @@ impl Frame {
 }
 
 /// Frame decoding errors.
-#[derive(Debug)]
+/// R11: Added PartialEq for easier test assertions and pattern matching.
+#[derive(Debug, PartialEq)]
 pub enum FrameError {
     /// Not enough bytes to decode a complete frame.
     Incomplete,
@@ -222,6 +224,19 @@ pub fn compute_nodeinfo_signing_message(info: &NodeInfo) -> Vec<u8> {
 
     // Hash the mutable fields to produce a fixed-size commitment
     let mut content_hasher = Sha256::new();
+    // R11: Domain separation tag prevents cross-context signature replay.
+    // Without this, a signature produced for NodeInfo could theoretically
+    // be valid if the same key is used for a different protocol message
+    // (e.g., Phase 2 gossip announcements). The tag ensures the signed
+    // message is unambiguously a NodeInfo.
+    content_hasher.update(b"poly-node/NodeInfo/v1\0");
+    // R11: Include addresses.len() in the hash. Before R11, only models.len()
+    // was included. The address list was iterated without a count prefix,
+    // making it theoretically possible to craft ambiguous address boundaries.
+    // While exploitation is difficult in practice (addresses are length-prefixed),
+    // including the count is a defense-in-depth measure that makes the hash
+    // unambiguously committed to the exact number of addresses.
+    content_hasher.update((info.addresses.len() as u32).to_le_bytes());
     // Serialize addresses deterministically
     for addr in &info.addresses {
         let addr_str = addr.to_string();

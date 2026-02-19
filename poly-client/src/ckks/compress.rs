@@ -421,7 +421,15 @@ fn decompress_v2_raw<T: DeserializeOwned>(data: &[u8]) -> Result<T, CompressErro
         return Err(CompressError::InvalidHeader("v2 payload too short"));
     }
 
-    let _level_byte = data[5];
+    let level_byte = data[5];
+    // R11: Validate level_byte — previously this was read as `_level_byte` and ignored,
+    // meaning any value (0, 3, 255, etc.) would be silently accepted. This creates an
+    // inconsistency: `detect_level` returns None for invalid level bytes, but `decompress`
+    // succeeds, so a caller checking `detect_level` before `decompress` gets mismatched results.
+    // Valid level bytes: 1 = Compact, 2 = Max.
+    if level_byte != 1 && level_byte != 2 {
+        return Err(CompressError::InvalidHeader("invalid v2 compression level byte (expected 1=Compact or 2=Max)"));
+    }
     let _reserved = data[6];
     let element_size = data[7] as usize;
     // Validate element_size matches the expected shuffle element size to prevent

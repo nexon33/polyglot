@@ -432,6 +432,14 @@ fn validate_cash_transfer(
     );
     new_state.set_wallet(tx.from, new_sender_hash);
 
+    // R11: Recipient wallet must exist. Without this check, a transfer to a
+    // non-existent account silently creates a wallet for them, bypassing the
+    // normal wallet creation path (IdentityRegister). This means the recipient
+    // would have a wallet but no identity, no KYC tier, and no compliance tracking.
+    if state.get_wallet(&tx.to).is_none() {
+        return Err(ChainError::AccountNotFound(hex_encode(&tx.to[..4])));
+    }
+
     // 5. Update recipient wallet
     let new_recipient_hash = hash_with_domain(
         DOMAIN_WALLET_STATE,
@@ -698,8 +706,13 @@ fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timest
     );
     verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
 
-    // R5: Actually restore the wallet state from backup (was missing — the feature was broken)
-    new_state.set_wallet(tx.account_id, tx.backup_hash);
+    // R11: Always restore the wallet to the stored backup hash, NOT to
+    // tx.backup_hash.  Previously the wallet was set to tx.backup_hash,
+    // which in mock/test mode (where proof verification is skipped) allowed
+    // an attacker to supply any arbitrary value and set their wallet hash
+    // to it.  Using the stored backup_hash is authoritative — the proof
+    // binds the restore to the real backup regardless.
+    new_state.set_wallet(tx.account_id, backup_hash);
 
     Ok(new_state)
 }
@@ -724,6 +737,19 @@ fn validate_fraud_proof(tx: &FraudProofTx, state: &GlobalState) -> Result<Global
     if tx.evidence.observation_a.observer == tx.evidence.observation_b.observer {
         return Err(ChainError::FraudDetected(
             "observations must come from different observers".into(),
+        ));
+    }
+
+    // R11: Neither observer may be the fraudulent account itself.
+    // Without this check, the fraudster can act as one of the two "independent"
+    // observers, fabricating one observation while only needing to find/collude with
+    // a single external party for the other. This reduces the attestation requirement
+    // from "two independent third parties" to "one colluding party + self".
+    if tx.evidence.observation_a.observer == tx.evidence.fraudulent_key
+        || tx.evidence.observation_b.observer == tx.evidence.fraudulent_key
+    {
+        return Err(ChainError::FraudDetected(
+            "observer cannot be the fraudulent account itself".into(),
         ));
     }
 
@@ -867,6 +893,21 @@ fn validate_stp_action(
                 return Err(ChainError::STPError(
                     "contract term_start must be before term_end".into(),
                 ));
+            }
+            // R11: Contract must have a minimum term duration of 24 hours.
+            // Without this check, an official can register a contract with a 1-second
+            // term (term_end = term_start + 1). The contract satisfies the "has contract"
+            // check for TriggerInvestigation, but expires almost immediately. If the
+            // investigation is triggered after the contract expires, the official can
+            // claim the contract is no longer valid. A 24h minimum ensures meaningful
+            // accountability.
+            const MIN_CONTRACT_DURATION: u64 = 86_400; // 24 hours
+            if contract.term_end.saturating_sub(contract.term_start) < MIN_CONTRACT_DURATION {
+                return Err(ChainError::STPError(format!(
+                    "contract term too short: {} seconds (minimum {})",
+                    contract.term_end - contract.term_start,
+                    MIN_CONTRACT_DURATION,
+                )));
             }
             // Staked amount must be non-zero — zero-stake contracts have no slashing deterrent.
             if contract.staked_amount == 0 {
