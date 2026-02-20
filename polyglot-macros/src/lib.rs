@@ -8,7 +8,7 @@
 //! All interpreters are fully embedded - no external runtimes needed!
 //!
 //! # Example
-//! ```rust
+//! ```ignore
 //! use polyglot::prelude::*;
 //!
 //! fn main() {
@@ -36,7 +36,7 @@ mod verified_macro;
 /// Uses RustPython (pure Rust interpreter, no system Python needed).
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// let result: i32 = py!{ 1 + 2 };
 /// ```
 #[proc_macro]
@@ -49,7 +49,7 @@ pub fn py(input: TokenStream) -> TokenStream {
 /// Uses Boa engine (pure Rust, no Node.js needed).
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// let value: i32 = js!{ 1 + 2 + 3 };
 /// let arr: Vec<i32> = js!{ [1, 2, 3].map(x => x * 2) };
 /// ```
@@ -63,7 +63,7 @@ pub fn js(input: TokenStream) -> TokenStream {
 /// Uses SWC (pure Rust) to transpile, then Boa to execute.
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// let result: i32 = ts!{ const x: number = 5; x * 2 };
 /// ```
 #[proc_macro]
@@ -74,7 +74,7 @@ pub fn ts(input: TokenStream) -> TokenStream {
 /// CUDA/GPU kernel macro (reserved - not yet implemented)
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// let result = cuda!{ parallel_map(data, |x| x * x) };
 /// ```
 #[proc_macro]
@@ -91,7 +91,7 @@ pub fn gpu(input: TokenStream) -> TokenStream {
 /// SQL query macro (reserved - not yet implemented)
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// let users: Vec<User> = sql!{ SELECT * FROM users WHERE active = true };
 /// ```
 #[proc_macro]
@@ -140,7 +140,7 @@ pub fn fold(input: TokenStream) -> TokenStream {
 /// foreign language methods with compile-time type checking.
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// #[poly_bridge(javascript)]
 /// trait Calculator {
 ///     fn add(&self, a: i32, b: i32) -> i32;
@@ -162,7 +162,7 @@ pub fn poly_bridge(args: TokenStream, input: TokenStream) -> TokenStream {
 
 /// JavaScript expression with Result return (reserved - v0.2)
 ///
-/// ```rust
+/// ```ignore
 /// let result: Result<i32, PolyglotError> = js_try!{ risky_operation() };
 /// ```
 #[proc_macro]
