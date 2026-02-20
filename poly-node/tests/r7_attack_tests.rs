@@ -880,11 +880,13 @@ async fn r7_audit_node_capacity_not_validated() {
     let (ack_frame, _) = Frame::decode(&data).unwrap();
     let ack: HelloAck = bincode::deserialize(&ack_frame.payload).unwrap();
 
-    // AUDIT: Currently accepted (values not used in Phase 1)
-    // This is a known limitation -- will need validation in Phase 2 gossip
+    // R14 FIX: Extreme capacity values are now rejected.
+    // Before R14, this was accepted (documented as Phase 1 limitation).
+    // R14 added validation: max_sessions <= 1024, active_sessions <= max_sessions,
+    // queue_depth <= 1_000_000.
     assert!(
-        ack.accepted,
-        "AUDIT: extreme capacity values currently accepted (Phase 1 limitation)"
+        !ack.accepted,
+        "R14: extreme capacity values must now be rejected"
     );
 
     conn.close(0u32.into(), b"done");

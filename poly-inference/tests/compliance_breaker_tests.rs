@@ -307,6 +307,7 @@ fn attack_06_forge_compliance_proof_from_scratch() {
         total_tokens: 10,
         compliant_tokens: 10,
         final_state_hash: fake_final_state,
+        created_at: 0,
     };
 
     let verified = forged.verify().unwrap();
@@ -366,6 +367,7 @@ fn attack_06b_forge_with_consistent_chain_wrong_code() {
         total_tokens: 1,
         compliant_tokens: 1,
         final_state_hash: state1,
+        created_at: 0,
     };
 
     let verified = forged.verify().unwrap();
@@ -445,6 +447,7 @@ fn attack_07b_forge_zero_step_proof() {
         total_tokens: 0,
         compliant_tokens: 0,
         final_state_hash: ZERO_HASH,
+        created_at: 0,
     };
 
     let verified = forged.verify().unwrap();

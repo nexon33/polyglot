@@ -128,6 +128,13 @@ impl RnsPoly {
     /// These violate the RNS invariant and produce incorrect CRT results.
     /// Returns `true` if all coefficients are valid, `false` otherwise.
     pub fn validate_residue_ranges(&self) -> bool {
+        // R14: Reject zero-prime polynomials — a polynomial with no primes represents
+        // no modulus chain and cannot participate in any RNS operation. Previously,
+        // num_primes=0 passed validation because residues.len()==0==num_primes and
+        // the for loop body never executed, returning true for an empty (invalid) poly.
+        if self.num_primes == 0 {
+            return false;
+        }
         if self.residues.len() != self.num_primes {
             return false;
         }

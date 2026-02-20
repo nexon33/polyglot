@@ -378,11 +378,14 @@ async fn attack_bincode_bomb_hello() {
 
     // If we get here without the server crashing, the test passes.
     // The server should still be responsive.
-    // Handshake was never completed (the bomb was not a valid Hello),
-    // so Ping would be rejected. Instead, do a proper handshake first
-    // to verify the server survived, then Ping.
-    do_handshake(&conn).await;
-    let (mut send2, mut recv2) = conn.open_bi().await.unwrap();
+    // R14: handshake_attempted is now per-connection, so the bomb Hello
+    // consumes the single handshake attempt for this connection.
+    // Use a NEW connection to verify the server survived.
+    conn.close(0u32.into(), b"done");
+
+    let conn2 = endpoint.connect(addr, "poly-node").unwrap().await.unwrap();
+    do_handshake(&conn2).await;
+    let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
     let ping = Frame::new(MessageType::Ping, vec![]);
     send2.write_all(&ping.encode()).await.unwrap();
     send2.finish().unwrap();
@@ -396,7 +399,7 @@ async fn attack_bincode_bomb_hello() {
     let (pong, _) = Frame::decode(&pong_data).unwrap();
     assert_eq!(pong.msg_type, MessageType::Pong);
 
-    conn.close(0u32.into(), b"done");
+    conn2.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     handle.abort();
 }

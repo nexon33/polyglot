@@ -807,11 +807,12 @@ async fn r8_audit_nodeinfo_loopback_addresses_accepted() {
     let (ack_frame, _) = Frame::decode(&data).unwrap();
     let ack: HelloAck = bincode::deserialize(&ack_frame.payload).unwrap();
 
-    // AUDIT: Loopback/unroutable addresses are currently accepted.
-    // Phase 2 gossip should filter these before forwarding.
+    // R14 fix: unspecified IPs (0.0.0.0) and port-0 addresses are now rejected.
+    // Loopback (127.0.0.1) is still accepted (useful for local testing).
+    // This Hello includes 0.0.0.0:4002, so it gets rejected.
     assert!(
-        ack.accepted,
-        "AUDIT: loopback/unroutable addresses currently accepted (Phase 1 limitation)"
+        !ack.accepted,
+        "R14: unspecified-IP addresses (0.0.0.0) must now be rejected"
     );
 
     conn.close(0u32.into(), b"done");

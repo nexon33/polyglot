@@ -43,7 +43,7 @@ fn valid_hash_ivc_proof_with_mode(tokens: &[u32], mode: PrivacyMode) -> Verified
     };
     ivc.fold_step(&mut acc, &witness).unwrap();
     acc.input_hash = ZERO_HASH;
-    acc.output_hash = tokens_hash(tokens);
+    acc.output_hash = disclosure_output_hash(tokens);
     ivc.finalize(acc).unwrap()
 }
 

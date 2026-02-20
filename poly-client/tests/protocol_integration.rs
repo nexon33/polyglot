@@ -10,7 +10,7 @@ use poly_client::encryption::{EncryptionBackend, MockCiphertext, MockEncryption}
 use poly_client::protocol::{InferRequest, InferResponse, Mode};
 use poly_client::PolyClient;
 use poly_verified::crypto::hash::hash_data;
-use poly_verified::disclosure::verify_disclosure;
+use poly_verified::disclosure::{disclosure_output_hash, verify_disclosure};
 use poly_verified::ivc::hash_ivc::HashIvc;
 use poly_verified::ivc::IvcBackend;
 use poly_verified::types::*;
@@ -43,7 +43,7 @@ fn hash_ivc_proof_with_mode_for(tokens: &[u32], mode: PrivacyMode) -> VerifiedPr
     };
     ivc.fold_step(&mut acc, &witness).unwrap();
     acc.input_hash = ZERO_HASH;
-    acc.output_hash = tokens_hash(tokens);
+    acc.output_hash = disclosure_output_hash(tokens);
     ivc.finalize(acc).unwrap()
 }
 

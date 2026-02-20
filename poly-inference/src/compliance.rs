@@ -402,6 +402,18 @@ fn normalize_prompt(input: &str) -> String {
             continue;
         }
 
+        // R14: Replace Latin Extended Additional precomposed accented letters (U+1E00-U+1EFF)
+        if let Some(replacement) = latin_ext_additional_to_ascii(ch) {
+            result.push(replacement);
+            continue;
+        }
+
+        // R14: Replace Enclosed Alphanumeric Supplement (U+1F100-U+1F1FF) letters
+        if let Some(replacement) = enclosed_supplement_to_ascii(ch) {
+            result.push(replacement);
+            continue;
+        }
+
         result.push(ch);
     }
 
@@ -464,7 +476,13 @@ fn is_invisible_char(ch: char) -> bool {
         // harmful text when processed by the model. They also break substring matching
         // by inserting zero-width directionality changes between pattern characters.
         '\u{202A}'..='\u{202E}' | // LRE, RLE, PDF, LRO, RLO
-        '\u{2066}'..='\u{2069}'   // LRI, RLI, FSI, PDI
+        '\u{2066}'..='\u{2069}' | // LRI, RLI, FSI, PDI
+        // R14: Private Use Area characters carry no standard semantic content.
+        // They can be used to insert invisible padding between letters to bypass
+        // pattern matching. Strip all three PUA ranges.
+        '\u{E000}'..='\u{F8FF}' |   // Basic Multilingual Plane PUA
+        '\u{F0000}'..='\u{FFFFD}' | // Supplementary PUA-A
+        '\u{100000}'..='\u{10FFFD}'  // Supplementary PUA-B
     )
 }
 
@@ -649,6 +667,80 @@ fn confusable_to_ascii(ch: char) -> Option<char> {
         // so it survives the interleave punctuation stripping. Must be explicitly stripped.
         '\u{A789}' => Some(':'), // modifier letter colon -> ':'
         '\u{A78A}' => Some('='), // modifier letter short equals sign -> '='
+        // R14: Spacing Modifier Letters (U+02B0-U+02FF)
+        // Superscript-style modifier letters used in phonetic notation that visually
+        // resemble their base Latin letter equivalents.
+        '\u{02B0}' => Some('h'), // modifier letter small h
+        '\u{02B1}' => Some('h'), // modifier letter small h with hook
+        '\u{02B2}' => Some('j'), // modifier letter small j
+        '\u{02B3}' => Some('r'), // modifier letter small r
+        '\u{02B4}' => Some('r'), // modifier letter small turned r
+        '\u{02B5}' => Some('r'), // modifier letter small turned r with hook
+        '\u{02B6}' => Some('r'), // modifier letter small capital inverted R
+        '\u{02B7}' => Some('w'), // modifier letter small w
+        '\u{02B8}' => Some('y'), // modifier letter small y
+        '\u{02E0}' => Some('g'), // modifier letter small gamma -> g
+        '\u{02E1}' => Some('l'), // modifier letter small l
+        '\u{02E2}' => Some('s'), // modifier letter small s
+        '\u{02E3}' => Some('x'), // modifier letter small x
+        '\u{02E4}' => Some('?'), // modifier letter small reversed glottal stop
+        // R14: Modifier letters small a-z (Phonetic Extensions, U+1D43-U+1D5A)
+        // Superscript-style phonetic modifier letters for individual Latin letters.
+        '\u{1D43}' => Some('a'), // modifier letter small a
+        '\u{1D44}' => Some('a'), // modifier letter small turned a
+        '\u{1D47}' => Some('b'), // modifier letter small b
+        '\u{1D48}' => Some('d'), // modifier letter small d
+        '\u{1D49}' => Some('e'), // modifier letter small e
+        '\u{1D4A}' => Some('e'), // modifier letter small schwa -> e
+        '\u{1D4B}' => Some('e'), // modifier letter small open e -> e
+        '\u{1D4C}' => Some('e'), // modifier letter small turned open e -> e
+        '\u{1D4D}' => Some('g'), // modifier letter small g
+        '\u{1D4F}' => Some('k'), // modifier letter small k
+        '\u{1D50}' => Some('m'), // modifier letter small m
+        '\u{1D51}' => Some('n'), // modifier letter small eng -> n
+        '\u{1D52}' => Some('o'), // modifier letter small o
+        '\u{1D53}' => Some('o'), // modifier letter small open o -> o
+        '\u{1D54}' => Some('o'), // modifier letter small top half o -> o
+        '\u{1D55}' => Some('o'), // modifier letter small bottom half o -> o
+        '\u{1D56}' => Some('p'), // modifier letter small p
+        '\u{1D57}' => Some('t'), // modifier letter small t
+        '\u{1D58}' => Some('u'), // modifier letter small u
+        '\u{1D5A}' => Some('v'), // modifier letter small turned m -> v
+        '\u{1D5B}' => Some('v'), // modifier letter small v (if exists)
+        // R14: Negative Circled Latin Capital Letters (U+1F150-U+1F169)
+        '\u{1F150}'..='\u{1F169}' => {
+            Some((ch as u32 - 0x1F150 + b'A' as u32) as u8 as char)
+        }
+        // R14: Negative Squared Latin Capital Letters (U+1F170-U+1F189)
+        '\u{1F170}'..='\u{1F189}' => {
+            Some((ch as u32 - 0x1F170 + b'A' as u32) as u8 as char)
+        }
+        // R14: Cherokee syllabary confusables (visually similar to Latin letters)
+        '\u{13A0}' => Some('D'), // Cherokee letter A -> looks like D
+        '\u{13A1}' => Some('R'), // Cherokee letter E -> looks like R
+        '\u{13A2}' => Some('T'), // Cherokee letter I -> looks like T (inverted)
+        '\u{13A9}' => Some('V'), // Cherokee letter DO -> looks like V
+        '\u{13AA}' => Some('O'), // Cherokee letter DU -> looks like O (inverted)
+        '\u{13AB}' => Some('O'), // Cherokee letter DV -> looks like O
+        '\u{13B3}' => Some('W'), // Cherokee letter LA -> looks like W
+        '\u{13B7}' => Some('M'), // Cherokee letter LU -> looks like M (inverted)
+        '\u{13C0}' => Some('G'), // Cherokee letter NA -> looks like G
+        '\u{13C3}' => Some('Z'), // Cherokee letter NO -> looks like Z
+        '\u{13CF}' => Some('S'), // Cherokee letter SI -> looks like S
+        '\u{13D9}' => Some('b'), // Cherokee letter YI -> looks like b
+        '\u{13DA}' => Some('E'), // Cherokee letter YO -> looks like E (inverted)
+        '\u{13DE}' => Some('P'), // Cherokee letter TLI -> looks like P
+        // R14: Latin letter Wynn (U+01BF) and related medieval confusables
+        '\u{01BF}' => Some('p'), // Latin letter wynn (looks like 'p')
+        '\u{01B6}' => Some('z'), // Latin small letter z with stroke
+        '\u{0185}' => Some('b'), // Latin small letter tone six (looks like 'b')
+        '\u{0188}' => Some('c'), // Latin small letter c with hook
+        '\u{0199}' => Some('k'), // Latin small letter k with hook
+        '\u{019A}' => Some('l'), // Latin small letter l with bar
+        '\u{019E}' => Some('n'), // Latin small letter n with long right leg
+        '\u{01A1}' => Some('o'), // Latin small letter o with horn
+        '\u{01AD}' => Some('t'), // Latin small letter t with hook
+        '\u{01B4}' => Some('y'), // Latin small letter y with hook
         _ => None,
     }
 }
@@ -758,6 +850,86 @@ fn math_alpha_to_ascii(ch: char) -> Option<char> {
         return Some((cp - 0x1D68A + b'a' as u32) as u8 as char);
     }
 
+    // R14: Mathematical Greek letters that are confusable with Latin letters.
+    // Greek alpha->a, beta->b, epsilon->e, eta->h, iota->i, kappa->k,
+    // mu->m, nu->n, omicron->o, rho->p, tau->t, upsilon->y, chi->x.
+    // Covers Bold, Italic, Bold Italic, Sans-Serif Bold, and Sans-Serif Bold Italic ranges.
+    if let Some(latin) = math_greek_to_latin_confusable(cp) {
+        return Some(latin);
+    }
+
+    None
+}
+
+/// R14: Map Mathematical Greek letter codepoints to their Latin confusable equivalents.
+///
+/// Only maps Greek letters that are visually similar to Latin letters:
+/// alpha->a, omicron->o, kappa->k, nu->n, etc.
+/// This prevents attackers from using mathematical Greek letters as Latin substitutes.
+fn math_greek_to_latin_confusable(cp: u32) -> Option<char> {
+    // Greek letter offsets within each math Greek alphabet range:
+    // Alpha=0, Beta=1, Gamma=2, Delta=3, Epsilon=4, Zeta=5, Eta=6,
+    // Theta=7, Iota=8, Kappa=9, Lambda=10, Mu=11, Nu=12, Xi=13,
+    // Omicron=14, Pi=15, Rho=16, (Theta variant=17), Sigma=18,
+    // Tau=19, Upsilon=20, Phi=21, Chi=22, Psi=23, Omega=24
+    // Lowercase: alpha=0..omega=24 (25 letters each for upper and lower)
+
+    // Map Greek letter offset to Latin confusable (or None if not confusable)
+    fn greek_offset_to_latin(offset: u32, uppercase: bool) -> Option<char> {
+        match offset {
+            0 => Some(if uppercase { 'A' } else { 'a' }),   // Alpha -> A/a
+            1 => Some(if uppercase { 'B' } else { 'b' }),   // Beta -> B/b
+            4 => Some(if uppercase { 'E' } else { 'e' }),   // Epsilon -> E/e
+            6 => Some(if uppercase { 'H' } else { 'h' }),   // Eta -> H/h
+            8 => Some(if uppercase { 'I' } else { 'i' }),   // Iota -> I/i
+            9 => Some(if uppercase { 'K' } else { 'k' }),   // Kappa -> K/k
+            11 => Some(if uppercase { 'M' } else { 'm' }),  // Mu -> M/m
+            12 => Some(if uppercase { 'N' } else { 'n' }),  // Nu -> N/n
+            14 => Some(if uppercase { 'O' } else { 'o' }),  // Omicron -> O/o
+            16 => Some(if uppercase { 'P' } else { 'p' }),  // Rho -> P/p
+            19 => Some(if uppercase { 'T' } else { 't' }),  // Tau -> T/t
+            20 => Some(if uppercase { 'Y' } else { 'y' }),  // Upsilon -> Y/y
+            22 => Some(if uppercase { 'X' } else { 'x' }),  // Chi -> X/x
+            _ => None,
+        }
+    }
+
+    // Mathematical Bold Greek: uppercase 1D6A8-1D6C0, lowercase 1D6C2-1D6DA
+    if (0x1D6A8..=0x1D6C0).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D6A8, true);
+    }
+    if (0x1D6C2..=0x1D6DA).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D6C2, false);
+    }
+    // Mathematical Italic Greek: uppercase 1D6E2-1D6FA, lowercase 1D6FC-1D714
+    if (0x1D6E2..=0x1D6FA).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D6E2, true);
+    }
+    if (0x1D6FC..=0x1D714).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D6FC, false);
+    }
+    // Mathematical Bold Italic Greek: uppercase 1D71C-1D734, lowercase 1D736-1D74E
+    if (0x1D71C..=0x1D734).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D71C, true);
+    }
+    if (0x1D736..=0x1D74E).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D736, false);
+    }
+    // Mathematical Sans-Serif Bold Greek: uppercase 1D756-1D76E, lowercase 1D770-1D788
+    if (0x1D756..=0x1D76E).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D756, true);
+    }
+    if (0x1D770..=0x1D788).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D770, false);
+    }
+    // Mathematical Sans-Serif Bold Italic Greek: uppercase 1D790-1D7A8, lowercase 1D7AA-1D7C2
+    if (0x1D790..=0x1D7A8).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D790, true);
+    }
+    if (0x1D7AA..=0x1D7C2).contains(&cp) {
+        return greek_offset_to_latin(cp - 0x1D7AA, false);
+    }
+
     None
 }
 
@@ -820,6 +992,65 @@ fn letterlike_to_ascii(ch: char) -> Option<char> {
         '\u{2149}' => Some('j'), // ⅉ double-struck italic small j
         _ => None,
     }
+}
+
+/// R14: Normalize Latin Extended Additional precomposed accented letters
+/// (U+1E00-U+1EFF) to their ASCII base letter.
+fn latin_ext_additional_to_ascii(ch: char) -> Option<char> {
+    let cp = ch as u32;
+    if !(0x1E00..=0x1EFF).contains(&cp) {
+        return None;
+    }
+    match cp {
+        0x1E00..=0x1E01 => Some(if cp & 1 == 0 { 'A' } else { 'a' }),
+        0x1E02..=0x1E07 => Some(if cp & 1 == 0 { 'B' } else { 'b' }),
+        0x1E08..=0x1E09 => Some(if cp & 1 == 0 { 'C' } else { 'c' }),
+        0x1E0A..=0x1E13 => Some(if cp & 1 == 0 { 'D' } else { 'd' }),
+        0x1E14..=0x1E1D => Some(if cp & 1 == 0 { 'E' } else { 'e' }),
+        0x1E1E..=0x1E1F => Some(if cp & 1 == 0 { 'F' } else { 'f' }),
+        0x1E20..=0x1E21 => Some(if cp & 1 == 0 { 'G' } else { 'g' }),
+        0x1E22..=0x1E2B => Some(if cp & 1 == 0 { 'H' } else { 'h' }),
+        0x1E2C..=0x1E2F => Some(if cp & 1 == 0 { 'I' } else { 'i' }),
+        0x1E30..=0x1E35 => Some(if cp & 1 == 0 { 'K' } else { 'k' }),
+        0x1E36..=0x1E3D => Some(if cp & 1 == 0 { 'L' } else { 'l' }),
+        0x1E3E..=0x1E43 => Some(if cp & 1 == 0 { 'M' } else { 'm' }),
+        0x1E44..=0x1E4B => Some(if cp & 1 == 0 { 'N' } else { 'n' }),
+        0x1E4C..=0x1E53 => Some(if cp & 1 == 0 { 'O' } else { 'o' }),
+        0x1E54..=0x1E57 => Some(if cp & 1 == 0 { 'P' } else { 'p' }),
+        0x1E58..=0x1E5F => Some(if cp & 1 == 0 { 'R' } else { 'r' }),
+        0x1E60..=0x1E6B => Some(if cp & 1 == 0 { 'S' } else { 's' }),
+        0x1E6C..=0x1E71 => Some(if cp & 1 == 0 { 'T' } else { 't' }),
+        0x1E72..=0x1E7B => Some(if cp & 1 == 0 { 'U' } else { 'u' }),
+        0x1E7C..=0x1E7F => Some(if cp & 1 == 0 { 'V' } else { 'v' }),
+        0x1E80..=0x1E89 => Some(if cp & 1 == 0 { 'W' } else { 'w' }),
+        0x1E8A..=0x1E8D => Some(if cp & 1 == 0 { 'X' } else { 'x' }),
+        0x1E8E..=0x1E8F => Some(if cp & 1 == 0 { 'Y' } else { 'y' }),
+        0x1E90..=0x1E95 => Some(if cp & 1 == 0 { 'Z' } else { 'z' }),
+        0x1E96 => Some('h'),
+        0x1E97 => Some('t'),
+        0x1E98 => Some('w'),
+        0x1E99 => Some('y'),
+        0x1E9A => Some('a'),
+        0x1EA0..=0x1EB7 => Some(if cp & 1 == 0 { 'A' } else { 'a' }),
+        0x1EB8..=0x1EC7 => Some(if cp & 1 == 0 { 'E' } else { 'e' }),
+        0x1EC8..=0x1ECB => Some(if cp & 1 == 0 { 'I' } else { 'i' }),
+        0x1ECC..=0x1EE3 => Some(if cp & 1 == 0 { 'O' } else { 'o' }),
+        0x1EE4..=0x1EF1 => Some(if cp & 1 == 0 { 'U' } else { 'u' }),
+        0x1EF2..=0x1EF9 => Some(if cp & 1 == 0 { 'Y' } else { 'y' }),
+        _ => None,
+    }
+}
+
+/// R14: Normalize Enclosed Alphanumeric Supplement characters (U+1F100-U+1F1FF).
+fn enclosed_supplement_to_ascii(ch: char) -> Option<char> {
+    let cp = ch as u32;
+    if (0x1F110..=0x1F129).contains(&cp) {
+        return Some((cp - 0x1F110 + b'A' as u32) as u8 as char);
+    }
+    if (0x1F130..=0x1F149).contains(&cp) {
+        return Some((cp - 0x1F130 + b'A' as u32) as u8 as char);
+    }
+    None
 }
 
 /// R11: Strip interleaved punctuation characters used for leet-speak evasion.

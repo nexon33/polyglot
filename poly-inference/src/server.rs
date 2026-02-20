@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 use poly_client::encryption::MockCiphertext;
 use poly_client::protocol::{InferRequest, InferResponse, Mode};
+use poly_verified::disclosure::disclosure_output_hash;
 use poly_verified::ivc::hash_ivc::HashIvc;
 use poly_verified::ivc::IvcBackend;
 use poly_verified::types::{PrivacyMode, StepWitness, VerifiedProof};
@@ -261,8 +262,10 @@ fn create_proof(input_tokens: &[u32], output_tokens: &[u32], privacy: PrivacyMod
     backend.fold_step(&mut acc, &witness)?;
 
     // Bind I/O hashes to the proof before finalize.
+    // [V14-02] output_hash must use disclosure_output_hash to bind both
+    // token content and Merkle tree structure, preventing cross-disclosure splicing.
     acc.input_hash = input_hash;
-    acc.output_hash = output_hash;
+    acc.output_hash = disclosure_output_hash(output_tokens);
 
     let proof = backend.finalize(acc)?;
     Ok(proof)

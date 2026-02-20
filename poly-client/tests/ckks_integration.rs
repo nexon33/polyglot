@@ -12,7 +12,7 @@ use poly_client::encryption::EncryptionBackend;
 use poly_client::protocol::{InferRequest, InferResponse, Mode};
 use poly_client::PolyClient;
 use poly_verified::crypto::hash::hash_data;
-use poly_verified::disclosure::verify_disclosure;
+use poly_verified::disclosure::{disclosure_output_hash, verify_disclosure};
 use poly_verified::ivc::hash_ivc::HashIvc;
 use poly_verified::ivc::IvcBackend;
 use poly_verified::types::{PrivacyMode, StepWitness, VerifiedProof, ZERO_HASH};
@@ -45,7 +45,7 @@ fn valid_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
     };
     ivc.fold_step(&mut acc, &witness).unwrap();
     acc.input_hash = ZERO_HASH;
-    acc.output_hash = tokens_hash(tokens);
+    acc.output_hash = disclosure_output_hash(tokens);
     ivc.finalize(acc).unwrap()
 }
 

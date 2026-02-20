@@ -145,12 +145,19 @@ impl ComplianceAccumulator {
             .finalize(self.acc)
             .map_err(|e| format!("IVC finalize failed: {e}"))?;
 
+        // R14: Record creation timestamp for replay prevention
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         Ok(ComplianceProof {
             ivc_proof,
             policy_hash,
             total_tokens,
             compliant_tokens,
             final_state_hash,
+            created_at,
         })
     }
 }
@@ -168,7 +175,15 @@ pub struct ComplianceProof {
     pub compliant_tokens: u64,
     /// Final chained state hash.
     pub final_state_hash: Hash,
+    /// R14: Unix timestamp (seconds since epoch) when the proof was created.
+    /// Prevents replay attacks by allowing verifiers to reject stale proofs.
+    /// A proof older than `MAX_PROOF_AGE_SECS` (1 hour) is considered invalid.
+    pub created_at: u64,
 }
+
+/// R14: Maximum age of a compliance proof in seconds (1 hour).
+/// Proofs older than this are considered stale and rejected by `verify()`.
+pub const MAX_PROOF_AGE_SECS: u64 = 3600;
 
 impl ComplianceProof {
     /// Verify the structural and cryptographic validity of this proof.
@@ -216,6 +231,24 @@ impl ComplianceProof {
         // 4. compliant_tokens must not exceed total_tokens.
         if self.compliant_tokens > self.total_tokens {
             return Ok(false);
+        }
+
+        // R14-07: Reject stale proofs (replay prevention).
+        // A proof with created_at=0 is considered legacy/uninitialized and is allowed
+        // for backward compatibility, but any proof with a nonzero timestamp must be
+        // within MAX_PROOF_AGE_SECS of the current time.
+        if self.created_at > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now.saturating_sub(self.created_at) > MAX_PROOF_AGE_SECS {
+                return Ok(false);
+            }
+            // Also reject proofs from the future (clock skew > 60s is suspicious)
+            if self.created_at > now.saturating_add(60) {
+                return Ok(false);
+            }
         }
 
         Ok(true)

@@ -10,7 +10,7 @@ use poly_verified::crypto::hash::{
 };
 use poly_verified::crypto::merkle::{verify_proof, MerkleTree};
 use poly_verified::disclosure::{
-    create_disclosure, verify_disclosure, DisclosedToken,
+    create_disclosure, disclosure_output_hash, verify_disclosure, DisclosedToken,
 };
 use poly_verified::ivc::hash_ivc::HashIvc;
 use poly_verified::ivc::IvcBackend;
@@ -44,7 +44,7 @@ fn valid_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
     };
     ivc.fold_step(&mut acc, &witness).unwrap();
     acc.input_hash = ZERO_HASH;
-    acc.output_hash = tokens_hash(tokens);
+    acc.output_hash = disclosure_output_hash(tokens);
     ivc.finalize(acc).unwrap()
 }
 

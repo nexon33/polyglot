@@ -171,6 +171,11 @@ const MAX_SESSIONS_LIMIT: u32 = 1024;
 /// degenerate output. Without this cap, u32::MAX (T=~4.3M) passes through.
 pub const MAX_TEMPERATURE: u32 = 10_000;
 
+/// R14: Maximum allowed queue_depth in a Hello NodeInfo capacity.
+/// A peer claiming queue_depth > 1M is clearly lying or misconfigured.
+/// This prevents gossip table pollution with unrealistic load data.
+const MAX_QUEUE_DEPTH: u32 = 1_000_000;
+
 /// A running Poly Network compute node.
 pub struct PolyNode {
     pub config: NodeConfig,
@@ -226,6 +231,30 @@ impl PolyNode {
             anyhow::bail!(
                 "bootstrap_addrs must not contain self (listen_addr={})",
                 config.listen_addr
+            );
+        }
+        // R14: Reject duplicate bootstrap addresses. An operator could
+        // accidentally list the same peer twice (e.g., via automation),
+        // causing double connection attempts at startup.
+        {
+            let mut unique_bootstrap = std::collections::HashSet::new();
+            for a in &config.bootstrap_addrs {
+                if !unique_bootstrap.insert(a) {
+                    anyhow::bail!(
+                        "duplicate bootstrap address: {}",
+                        a
+                    );
+                }
+            }
+        }
+        // R14: Reject model_name containing control characters (0x00-0x1F).
+        // Control characters in model_name can:
+        // - Inject newlines into log output (log forging)
+        // - Inject ANSI escape sequences into terminal output
+        // - Contain null bytes that truncate C strings in FFI contexts
+        if config.model_name.bytes().any(|b| b < 0x20) {
+            anyhow::bail!(
+                "model_name contains control characters (bytes < 0x20)"
             );
         }
         let identity = NodeIdentity::generate();
@@ -395,6 +424,15 @@ async fn handle_connection(
     // `true` and InferRequest handler loading the value on concurrent streams.
     let handshake_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // R14: Track whether ANY Hello has been attempted on this connection
+    // (regardless of success or failure). Before R14, only handshake_done
+    // blocked re-auth (after success). A rejected Hello did not set any
+    // flag, allowing the attacker to retry Hello up to MAX_PRE_HANDSHAKE_STREAMS
+    // times, each costing deserialization + Ed25519 verification. Now,
+    // once the first Hello is processed (accepted OR rejected), subsequent
+    // Hellos are silently dropped without cryptographic work.
+    let handshake_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Count streams opened on this connection to cap stream-flooding.
     let stream_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -463,10 +501,11 @@ async fn handle_connection(
         let infer_sem = infer_semaphore.clone();
         let info = server_info.clone();
         let hs = handshake_done.clone();
+        let ha = handshake_attempted.clone();
         let model = model_name.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_stream(send, recv, backend, infer_sem, info, hs, model).await
+                handle_stream(send, recv, backend, infer_sem, info, hs, ha, model).await
             {
                 warn!("Stream error: {}", e);
             }
@@ -484,6 +523,7 @@ async fn handle_stream(
     infer_semaphore: Arc<Semaphore>,
     server_info: Arc<std::sync::RwLock<NodeInfo>>,
     handshake_done: Arc<std::sync::atomic::AtomicBool>,
+    handshake_attempted: Arc<std::sync::atomic::AtomicBool>,
     model_name: Arc<String>,
 ) -> Result<()> {
     // Read entire request with timeout (max 16MB)
@@ -527,7 +567,13 @@ async fn handle_stream(
                 );
                 return Ok(());
             }
-            Frame::new(MessageType::Pong, vec![])
+            // R14: Echo the Ping payload as a nonce in the Pong response.
+            // Before R14, the Pong was always empty, so the client could not
+            // correlate a Pong to a specific Ping (no request-response binding).
+            // This enables unsolicited Pong injection where a MITM replaces
+            // the real Pong with a forged one. Echoing the Ping payload allows
+            // the client to verify the Pong corresponds to its Ping.
+            Frame::new(MessageType::Pong, frame.payload.clone())
         }
 
         MessageType::Hello => {
@@ -535,6 +581,15 @@ async fn handle_stream(
             // Reject repeated Hellos to prevent re-authentication attacks.
             if handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
                 warn!("Rejected Hello: handshake already completed on this connection");
+                return Ok(());
+            }
+            // R14: Block repeated Hello attempts after the first one (even
+            // if the first Hello was rejected). Before R14, only handshake_done
+            // blocked re-auth (after success). A rejected Hello did not set
+            // any flag, allowing retry up to MAX_PRE_HANDSHAKE_STREAMS times,
+            // each costing deserialization + Ed25519 verification.
+            if handshake_attempted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                warn!("Rejected Hello: handshake already attempted on this connection");
                 return Ok(());
             }
 
@@ -635,6 +690,18 @@ async fn handle_stream(
                         accepted = false;
                         break;
                     }
+                    // R14: Reject negative zero throughput_estimate. IEEE 754
+                    // defines -0.0 as equal to 0.0 (so the < 0.0 check above
+                    // does not catch it), but -0.0 has a different bit pattern
+                    // and can cause inconsistent hashing/comparison in gossip
+                    // tables. Detect via is_sign_negative() when value is 0.0.
+                    if m.throughput_estimate == 0.0 && m.throughput_estimate.is_sign_negative() {
+                        warn!(
+                            "Rejecting Hello: negative-zero throughput_estimate"
+                        );
+                        accepted = false;
+                        break;
+                    }
                 }
                 // R7: Reject model names that are too long — each model_name is
                 // an unbounded String. Without this cap, 16 models x 64KB names
@@ -645,6 +712,17 @@ async fn handle_stream(
                             "Rejecting Hello: model_name too long ({} bytes, max {})",
                             m.model_name.len(),
                             MAX_MODEL_NAME_LEN
+                        );
+                        accepted = false;
+                        break;
+                    }
+                    // R14: Reject model names containing control characters
+                    // (bytes < 0x20). Control characters can inject newlines
+                    // into log output, ANSI escape sequences into terminals,
+                    // or null bytes that truncate C strings in FFI contexts.
+                    if m.model_name.bytes().any(|b| b < 0x20) {
+                        warn!(
+                            "Rejecting Hello: model_name contains control characters"
                         );
                         accepted = false;
                         break;
@@ -676,6 +754,55 @@ async fn handle_stream(
                             accepted = false;
                             break;
                         }
+                    }
+                }
+                // R14: Reject addresses with unspecified IP (0.0.0.0 or [::])
+                // or port 0. These are non-routable and waste gossip table entries.
+                if accepted {
+                    for a in &hello.node_info.addresses {
+                        if a.ip().is_unspecified() || a.port() == 0 {
+                            warn!(
+                                "Rejecting Hello: non-routable address {} (unspecified IP or port 0)",
+                                a
+                            );
+                            accepted = false;
+                            break;
+                        }
+                    }
+                }
+                // R14: Validate NodeInfo capacity fields.
+                // - max_sessions must be >= 1 (a node with 0 max_sessions cannot
+                //   serve any requests, wasting gossip table entries)
+                // - max_sessions must be <= MAX_SESSIONS_LIMIT (prevents inflated
+                //   capacity claims that attract all traffic in gossip load balancing)
+                // - active_sessions must be <= max_sessions (logically impossible
+                //   to have more active sessions than the maximum)
+                // - queue_depth must be <= MAX_QUEUE_DEPTH (prevents absurd claims)
+                if accepted {
+                    let cap = &hello.node_info.capacity;
+                    if cap.max_sessions == 0 {
+                        warn!(
+                            "Rejecting Hello: max_sessions=0 in NodeInfo capacity"
+                        );
+                        accepted = false;
+                    } else if cap.max_sessions > MAX_SESSIONS_LIMIT {
+                        warn!(
+                            "Rejecting Hello: max_sessions {} exceeds limit {} in NodeInfo capacity",
+                            cap.max_sessions, MAX_SESSIONS_LIMIT
+                        );
+                        accepted = false;
+                    } else if cap.active_sessions > cap.max_sessions {
+                        warn!(
+                            "Rejecting Hello: active_sessions ({}) > max_sessions ({}) in NodeInfo capacity",
+                            cap.active_sessions, cap.max_sessions
+                        );
+                        accepted = false;
+                    } else if cap.queue_depth > MAX_QUEUE_DEPTH {
+                        warn!(
+                            "Rejecting Hello: queue_depth {} exceeds limit {} in NodeInfo capacity",
+                            cap.queue_depth, MAX_QUEUE_DEPTH
+                        );
+                        accepted = false;
                     }
                 }
             }

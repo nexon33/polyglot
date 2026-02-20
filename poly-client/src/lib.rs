@@ -163,7 +163,7 @@ mod tests {
     use super::*;
     use crate::encryption::{MockCiphertext, MockEncryption};
     use poly_verified::crypto::hash::hash_data;
-    use poly_verified::disclosure::verify_disclosure;
+    use poly_verified::disclosure::{disclosure_output_hash, verify_disclosure};
     use poly_verified::ivc::hash_ivc::HashIvc;
     use poly_verified::ivc::IvcBackend;
     use poly_verified::types::{PrivacyMode, StepWitness, VerifiedProof, ZERO_HASH};
@@ -190,7 +190,7 @@ mod tests {
         };
         ivc.fold_step(&mut acc, &witness).unwrap();
         acc.input_hash = ZERO_HASH;
-        acc.output_hash = tokens_hash(token_ids);
+        acc.output_hash = disclosure_output_hash(token_ids);
         ivc.finalize(acc).unwrap()
     }
 

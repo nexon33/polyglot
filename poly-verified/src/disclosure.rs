@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
-use crate::crypto::hash::hash_leaf;
+use crate::crypto::hash::{hash_combine, hash_leaf};
 use crate::crypto::merkle::{self, MerkleTree};
 use crate::error::{ProofSystemError, Result};
 use crate::ivc::hash_ivc::HashIvc;
@@ -96,6 +96,21 @@ pub fn token_leaf(token_id: u32) -> Hash {
     hash_leaf(&token_id.to_le_bytes())
 }
 
+/// Compute the combined output hash for disclosure proofs.
+///
+/// [V14-02 FIX] The output hash binds both the raw token content (via tokens_hash)
+/// AND the Merkle tree structure of token leaves (via output_root). This prevents
+/// cross-disclosure splicing where an attacker takes redacted leaf hashes from one
+/// disclosure and an execution_proof from a different one.
+///
+/// The combined output hash is: `hash_combine(tokens_hash(tokens), token_merkle_root)`
+pub fn disclosure_output_hash(tokens: &[u32]) -> Hash {
+    let raw_hash = tokens_hash(tokens);
+    let leaves: Vec<Hash> = tokens.iter().map(|&t| token_leaf(t)).collect();
+    let tree = MerkleTree::build(&leaves);
+    hash_combine(&raw_hash, &tree.root)
+}
+
 /// Create a selective disclosure from a verified output.
 ///
 /// # Arguments
@@ -152,7 +167,13 @@ pub fn create_disclosure(
         }
     }
 
-    // Compute binding: SHA-256 of all raw token bytes — matches proof's output_hash
+    // [V14-02 FIX] output_binding stores the raw tokens_hash. The execution
+    // proof's output_hash must be hash_combine(tokens_hash, token_merkle_root).
+    // During verification, we recompute hash_combine(output_binding, reconstructed_root)
+    // and check it matches the execution_proof's output_hash. This prevents
+    // cross-disclosure splicing: an attacker using A's leaf hashes (reconstructing
+    // A's Merkle root) with B's execution_proof (committed to B's Merkle root)
+    // produces hash_combine(B_tokens_hash, A_root) != hash_combine(B_tokens_hash, B_root).
     let output_binding = tokens_hash(tokens);
 
     Ok(Disclosure {
@@ -291,6 +312,8 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
                 _ => unreachable!(), // we just checked all_revealed
             }
         }).collect();
+        // [V14-02 FIX] output_binding is the raw tokens_hash. Recompute it
+        // from the revealed tokens for the all-revealed cross-check.
         let recomputed_binding = tokens_hash(&revealed_tokens);
         if !hash_eq(&recomputed_binding, &disclosure.output_binding) {
             return false;
@@ -308,8 +331,14 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
             if *step_count == 0 {
                 return false;
             }
-            // The output_binding must match the proof's committed output_hash (constant-time)
-            if !hash_eq(&disclosure.output_binding, output_hash) {
+            // [V14-02 FIX] The execution proof's output_hash must equal
+            // hash_combine(output_binding, output_root). This cryptographically
+            // binds the disclosure's Merkle tree (output_root) to the execution
+            // proof. An attacker splicing A's leaf hashes (A's output_root) with
+            // B's execution_proof (B's output_hash committed to B's root) fails
+            // because hash_combine(B_tokens_hash, A_root) != B_output_hash.
+            let bound_output = hash_combine(&disclosure.output_binding, &disclosure.output_root);
+            if !hash_eq(&bound_output, output_hash) {
                 return false;
             }
             // Verify the cryptographic chain integrity (chain_tip, merkle_root,
@@ -322,11 +351,10 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
             }
         }
         VerifiedProof::Mock { output_hash, .. } => {
-            // [V9-01 FIX] Always enforce output binding for Mock proofs.
-            // Previously, if output_hash == ZERO_HASH the binding check was skipped,
-            // allowing an attacker to pair a zero-hash Mock proof with ANY token set.
-            // Now we require the output_binding to match output_hash unconditionally.
-            if !hash_eq(&disclosure.output_binding, output_hash) {
+            // [V14-02 FIX] Same binding check as HashIvc: the combined
+            // hash_combine(output_binding, output_root) must match output_hash.
+            let bound_output = hash_combine(&disclosure.output_binding, &disclosure.output_root);
+            if !hash_eq(&bound_output, output_hash) {
                 return false;
             }
             true
@@ -345,7 +373,7 @@ mod tests {
     fn mock_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
         VerifiedProof::Mock {
             input_hash: ZERO_HASH,
-            output_hash: tokens_hash(tokens),
+            output_hash: disclosure_output_hash(tokens),
             privacy_mode: PrivacyMode::Transparent,
         }
     }
@@ -361,9 +389,9 @@ mod tests {
             step_inputs: hash_data(b"inputs"),
         };
         ivc.fold_step(&mut acc, &witness).unwrap();
-        // Patch I/O hashes to match the disclosure context
+        // [V14-02 FIX] Patch I/O hashes to include token Merkle root binding
         acc.input_hash = ZERO_HASH;
-        acc.output_hash = tokens_hash(tokens);
+        acc.output_hash = disclosure_output_hash(tokens);
         ivc.finalize(acc).unwrap()
     }
 
