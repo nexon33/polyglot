@@ -42,7 +42,11 @@ impl Transaction {
 
     /// Hash of this transaction for Merkle tree inclusion.
     pub fn tx_hash(&self) -> Hash {
-        hash_with_domain(DOMAIN_TRANSFER, &serde_json::to_vec(self).unwrap_or_default())
+        // R5: Fail loudly rather than silently producing colliding hashes
+        hash_with_domain(
+            DOMAIN_TRANSFER,
+            &serde_json::to_vec(self).expect("Transaction serialization must not fail"),
+        )
     }
 
     /// The account that pays the fee for this transaction.
@@ -80,6 +84,21 @@ pub struct CashTransfer {
     pub proof: VerifiedProof,
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
+    // -- Compliance fields (attested by the client's ZK proof) --
+    /// Sender's KYC tier (determines reporting threshold).
+    pub sender_tier: Tier,
+    /// H(sender identity) — included in compliance reports.
+    pub sender_identity_hash: Hash,
+    /// H(recipient identity) — included in compliance reports.
+    pub recipient_identity_hash: Hash,
+    /// Whether the sender account is frozen (proof attests correctness).
+    pub sender_frozen: bool,
+    /// Whether the recipient account is frozen (proof attests correctness).
+    pub recipient_frozen: bool,
+    /// Sender's rolling 24h outgoing total *after* this transfer.
+    pub rolling_24h_total_after: Amount,
+    /// ISO 3166-1 numeric country code of the sender.
+    pub jurisdiction: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -229,14 +248,33 @@ pub enum SwapStatus {
 
 /// Compute the state hash stored in the `swaps` SMT for an active swap.
 pub fn swap_state_hash(swap: &AtomicSwapInit, status: SwapStatus) -> Hash {
+    swap_state_hash_from_parts(
+        &swap.initiator,
+        &swap.responder,
+        swap.amount,
+        &swap.hash_lock,
+        swap.timeout,
+        status,
+    )
+}
+
+/// Compute swap state hash from individual fields (used by claim/refund verification).
+pub fn swap_state_hash_from_parts(
+    initiator: &AccountId,
+    responder: &AccountId,
+    amount: Amount,
+    hash_lock: &Hash,
+    timeout: BlockHeight,
+    status: SwapStatus,
+) -> Hash {
     hash_with_domain(
         DOMAIN_SWAP,
         &[
-            swap.initiator.as_slice(),
-            swap.responder.as_slice(),
-            &swap.amount.to_le_bytes(),
-            swap.hash_lock.as_slice(),
-            &swap.timeout.to_le_bytes(),
+            initiator.as_slice(),
+            responder.as_slice(),
+            &amount.to_le_bytes(),
+            hash_lock.as_slice(),
+            &timeout.to_le_bytes(),
             &[status as u8],
         ]
         .concat(),
@@ -283,6 +321,17 @@ pub struct AtomicSwapClaim {
     pub secret: Hash,
     /// Must be the initiator.
     pub claimer: AccountId,
+    // -- Original swap parameters for on-chain verification --
+    /// The original swap's initiator (must match claimer).
+    pub original_initiator: AccountId,
+    /// The original swap's responder.
+    pub original_responder: AccountId,
+    /// The original locked amount.
+    pub original_amount: Amount,
+    /// The original hash lock: H(secret) must equal this.
+    pub original_hash_lock: Hash,
+    /// The original timeout block height.
+    pub original_timeout: BlockHeight,
     pub proof: VerifiedProof,
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
@@ -297,6 +346,17 @@ pub struct AtomicSwapRefund {
     pub swap_id: Hash,
     /// Must be the responder (who locked the funds).
     pub refundee: AccountId,
+    // -- Original swap parameters for on-chain verification --
+    /// The original swap's initiator.
+    pub original_initiator: AccountId,
+    /// The original swap's responder (must match refundee).
+    pub original_responder: AccountId,
+    /// The original locked amount.
+    pub original_amount: Amount,
+    /// The original hash lock.
+    pub original_hash_lock: Hash,
+    /// The original timeout block height.
+    pub original_timeout: BlockHeight,
     pub proof: VerifiedProof,
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
@@ -328,6 +388,13 @@ mod tests {
                 state_pre: ZERO_HASH,
                 proof: mock_proof(),
                 signature: [0u8; 64],
+                sender_tier: Tier::Identified,
+                sender_identity_hash: [0xAA; 32],
+                recipient_identity_hash: [0xBB; 32],
+                sender_frozen: false,
+                recipient_frozen: false,
+                rolling_24h_total_after: 0,
+                jurisdiction: 840,
             }),
             Transaction::IdentityRegister(IdentityRegister {
                 account_id: [1u8; 32],
@@ -357,6 +424,13 @@ mod tests {
             state_pre: ZERO_HASH,
             proof: mock_proof(),
             signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
         });
         let h1 = tx.tx_hash();
         let h2 = tx.tx_hash();
@@ -376,6 +450,13 @@ mod tests {
             state_pre: ZERO_HASH,
             proof: mock_proof(),
             signature: [0u8; 64],
+            sender_tier: Tier::Identified,
+            sender_identity_hash: [0xAA; 32],
+            recipient_identity_hash: [0xBB; 32],
+            sender_frozen: false,
+            recipient_frozen: false,
+            rolling_24h_total_after: 0,
+            jurisdiction: 840,
         });
         assert_eq!(tx.fee_payer(), Some([0xAA; 32]));
 

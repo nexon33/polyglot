@@ -30,10 +30,13 @@ pub mod rns_fhe_layer;
 pub mod simd;
 pub mod poly;
 pub mod sampling;
+pub mod compress;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 
-pub use ciphertext::CkksCiphertext;
+pub use ciphertext::{compute_key_id, CkksCiphertext};
 pub use eval_key::CkksEvalKey;
-pub use keys::{CkksPublicKey, CkksSecretKey};
+pub use keys::{derive_mac_key, CkksPublicKey, CkksSecretKey};
 
 use crate::encryption::EncryptionBackend;
 
@@ -54,9 +57,9 @@ impl EncryptionBackend for CkksEncryption {
         keys::keygen(&mut rng)
     }
 
-    fn encrypt(&self, token_ids: &[u32], pk: &Self::PublicKey) -> Self::Ciphertext {
+    fn encrypt(&self, token_ids: &[u32], pk: &Self::PublicKey, sk: &Self::SecretKey) -> Self::Ciphertext {
         let mut rng = rand::thread_rng();
-        ciphertext::encrypt(token_ids, pk, &mut rng)
+        ciphertext::encrypt(token_ids, pk, sk, &mut rng)
     }
 
     fn decrypt(&self, ct: &Self::Ciphertext, sk: &Self::SecretKey) -> Vec<u32> {

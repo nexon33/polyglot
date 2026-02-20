@@ -5,7 +5,7 @@
 //! Fully self-contained, no external dependencies!
 
 use crate::{PolyglotError, Result};
-use rhai::{Array, Dynamic, Engine};
+use rhai::{Array, Engine};
 
 /// Scripting runtime wrapper (uses embedded Rhai engine)
 pub struct ScriptRuntime {

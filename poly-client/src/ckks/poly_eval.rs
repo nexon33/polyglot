@@ -216,6 +216,19 @@ fn trivial_ciphertext_broadcast(
     scale: f64,
     num_primes: usize,
 ) -> RnsCiphertext {
+    // R10: Validate scale — this function creates a ciphertext used as an
+    // accumulator in polynomial evaluation. A NaN/Inf/zero scale would silently
+    // propagate through all subsequent leveled add/multiply operations.
+    assert!(
+        scale.is_finite() && scale > 0.0,
+        "trivial_ciphertext_broadcast: scale must be finite and positive, got {}",
+        scale
+    );
+    assert!(
+        scalar.is_finite(),
+        "trivial_ciphertext_broadcast: scalar must be finite, got {}",
+        scalar
+    );
     let values = vec![scalar; simd::NUM_SLOTS];
     let coeffs = simd::encode_simd(&values, scale);
     let c0 = RnsPoly::from_coeffs(&coeffs, num_primes);
@@ -225,6 +238,7 @@ fn trivial_ciphertext_broadcast(
         c1,
         scale,
         level: 0,
+        auth_tag: None,
     }
 }
 

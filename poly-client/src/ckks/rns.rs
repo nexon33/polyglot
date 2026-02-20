@@ -121,6 +121,40 @@ impl RnsPoly {
         coeffs
     }
 
+    /// Validate that all residue coefficients are in [0, q_i) for each channel.
+    ///
+    /// R12: RnsPoly fields are `pub`, so deserialized or manually constructed
+    /// polynomials can have out-of-range coefficients (negative or >= q_i).
+    /// These violate the RNS invariant and produce incorrect CRT results.
+    /// Returns `true` if all coefficients are valid, `false` otherwise.
+    pub fn validate_residue_ranges(&self) -> bool {
+        // R14: Reject zero-prime polynomials — a polynomial with no primes represents
+        // no modulus chain and cannot participate in any RNS operation. Previously,
+        // num_primes=0 passed validation because residues.len()==0==num_primes and
+        // the for loop body never executed, returning true for an empty (invalid) poly.
+        if self.num_primes == 0 {
+            return false;
+        }
+        if self.residues.len() != self.num_primes {
+            return false;
+        }
+        for ch in 0..self.num_primes {
+            if ch >= NTT_PRIMES.len() {
+                return false;
+            }
+            let q = NTT_PRIMES[ch];
+            if self.residues[ch].len() != N {
+                return false;
+            }
+            for &coeff in &self.residues[ch] {
+                if coeff < 0 || coeff >= q {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Coefficient-wise addition mod each prime.
     pub fn add(&self, other: &RnsPoly) -> RnsPoly {
         assert_eq!(self.num_primes, other.num_primes);
@@ -130,7 +164,7 @@ impl RnsPoly {
             let res: Vec<i64> = self.residues[i]
                 .iter()
                 .zip(other.residues[i].iter())
-                .map(|(&a, &b)| (a + b) % q)
+                .map(|(&a, &b)| ((a + b) % q + q) % q)
                 .collect();
             residues.push(res);
         }
@@ -180,11 +214,12 @@ impl RnsPoly {
     pub fn scalar_mul(&self, scalar: i64) -> RnsPoly {
         let mut residues = Vec::with_capacity(self.num_primes);
         for i in 0..self.num_primes {
-            let q = NTT_PRIMES[i];
-            let s = ((scalar as i128 % q as i128) + q as i128) as i64;
+            let q = NTT_PRIMES[i] as i128;
+            // Normalize scalar to [0, q) to avoid intermediate values in [0, 2q)
+            let s = ((scalar as i128 % q) + q) % q;
             let res: Vec<i64> = self.residues[i]
                 .iter()
-                .map(|&a| (a as i128 * s as i128 % q as i128) as i64)
+                .map(|&a| (a as i128 * s % q) as i64)
                 .collect();
             residues.push(res);
         }
@@ -227,8 +262,8 @@ impl RnsPoly {
     /// because gcd(m, 2N) = 1 guarantees j → m*j mod 2N is a bijection.
     pub fn apply_automorphism(&self, m: usize) -> RnsPoly {
         let two_n = 2 * N;
-        debug_assert!(m % 2 == 1, "automorphism index must be odd");
-        debug_assert!(m < two_n, "automorphism index must be < 2N");
+        assert!(m % 2 == 1, "automorphism index must be odd");
+        assert!(m < two_n, "automorphism index must be < 2N");
 
         let mut residues = Vec::with_capacity(self.num_primes);
         for ch in 0..self.num_primes {
@@ -400,11 +435,24 @@ fn garner_reconstruct_wide(residues: &[i64], primes: &[i64]) -> i64 {
     // Step 4: Center — if result > Q/2, return result - Q (negative)
     let half_q = wide_shr(&q_total, 1);
     if wide_gt(&result, &half_q) {
-        // Centered value = result - Q (negative, fits in i64)
         let diff = wide_sub(&q_total, &result);
+        // Verify the centered value fits in i64 (upper limbs must be zero)
+        for i in 1..diff.len() {
+            debug_assert!(
+                diff[i] == 0,
+                "CRT result exceeds i64 range: limb[{}] = {} (need 4+ primes?)",
+                i, diff[i]
+            );
+        }
         -(diff[0] as i64)
     } else {
-        // Positive value, fits in i64
+        for i in 1..result.len() {
+            debug_assert!(
+                result[i] == 0,
+                "CRT result exceeds i64 range: limb[{}] = {} (need 4+ primes?)",
+                i, result[i]
+            );
+        }
         result[0] as i64
     }
 }
@@ -426,29 +474,47 @@ fn wide_mul_u64(a: &[u64], b: u64) -> Vec<u64> {
         result[i] = prod as u64;
         carry = prod >> 64;
     }
-    result
-}
-
-fn wide_add(a: &[u64], b: &[u64]) -> Vec<u64> {
-    let n = a.len();
-    let mut result = vec![0u64; n];
-    let mut carry = 0u128;
-    for i in 0..n {
-        let bv = if i < b.len() { b[i] as u128 } else { 0 };
-        let sum = a[i] as u128 + bv + carry;
-        result[i] = sum as u64;
-        carry = sum >> 64;
+    // R5: Extend result if there's remaining carry — prevents silent truncation
+    // in CRT reconstruction with many primes (4+).
+    if carry != 0 {
+        result.push(carry as u64);
+        if carry >> 64 != 0 {
+            result.push((carry >> 64) as u64);
+        }
     }
     result
 }
 
+fn wide_add(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let n = a.len().max(b.len());
+    let mut result = vec![0u64; n];
+    let mut carry = 0u128;
+    for i in 0..n {
+        let av = if i < a.len() { a[i] as u128 } else { 0 };
+        let bv = if i < b.len() { b[i] as u128 } else { 0 };
+        let sum = av + bv + carry;
+        result[i] = sum as u64;
+        carry = sum >> 64;
+    }
+    // R6: Extend result if there's remaining carry — prevents silent truncation
+    // in CRT reconstruction when wide_mul_u64 has extended one operand.
+    if carry != 0 {
+        result.push(carry as u64);
+    }
+    result
+}
+
+/// R7: Use max(a.len(), b.len()) — if b was extended by wide_mul_u64 carry
+/// propagation, using only a.len() silently drops higher limbs of b,
+/// producing an incorrect subtraction result in CRT reconstruction.
 fn wide_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
-    let n = a.len();
+    let n = a.len().max(b.len());
     let mut result = vec![0u64; n];
     let mut borrow = 0i128;
     for i in 0..n {
+        let av = if i < a.len() { a[i] as i128 } else { 0 };
         let bv = if i < b.len() { b[i] as i128 } else { 0 };
-        let diff = a[i] as i128 - bv - borrow;
+        let diff = av - bv - borrow;
         if diff < 0 {
             result[i] = (diff + (1i128 << 64)) as u64;
             borrow = 1;
@@ -472,12 +538,15 @@ fn wide_shr(a: &[u64], bits: u32) -> Vec<u64> {
     result
 }
 
+/// R7: Use max(a.len(), b.len()) — if b has more limbs than a,
+/// non-zero higher limbs of b mean b > a, which was previously missed.
 fn wide_gt(a: &[u64], b: &[u64]) -> bool {
-    let n = a.len();
+    let n = a.len().max(b.len());
     for i in (0..n).rev() {
+        let av = if i < a.len() { a[i] } else { 0 };
         let bv = if i < b.len() { b[i] } else { 0 };
-        if a[i] > bv { return true; }
-        if a[i] < bv { return false; }
+        if av > bv { return true; }
+        if av < bv { return false; }
     }
     false // equal
 }

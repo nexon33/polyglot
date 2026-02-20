@@ -135,6 +135,21 @@ pub fn rns_ct_add_plain_simd(
     values: &[f64],
     dim: usize,
 ) -> RnsCiphertext {
+    // R10: Validate dim > 0 — with dim=0, the `i % dim` below causes a
+    // division-by-zero panic ("attempt to calculate the remainder with a
+    // divisor of zero"). This mirrors the R10 fix for rns_matvec.
+    assert!(dim > 0, "rns_ct_add_plain_simd: dim must be > 0");
+    // R7: Reject NaN/Inf in bias values — these silently corrupt the encoded
+    // plaintext and propagate through all downstream neural network layers.
+    assert!(
+        values.iter().all(|v| v.is_finite()),
+        "rns_ct_add_plain_simd: all bias values must be finite (no NaN/Inf)"
+    );
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_add_plain_simd: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
     let mut replicated = vec![0.0; simd::NUM_SLOTS];
     for i in 0..simd::NUM_SLOTS {
         if i % dim < values.len() {
@@ -150,6 +165,7 @@ pub fn rns_ct_add_plain_simd(
         c1: ct.c1.clone(),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
@@ -165,8 +181,20 @@ pub fn rns_linear_layer(
     rot_keys: &RnsRotationKeySet,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
-    assert_eq!(weights.len(), dim * dim);
-    assert_eq!(biases.len(), dim);
+    // R13: Include descriptive messages — the bare assert_eq! macros produce
+    // unhelpful "assertion failed: left == right" messages without context.
+    // A caller passing the wrong-shaped arrays gets no indication of which
+    // parameter is wrong or what the expected shape should be.
+    assert_eq!(
+        weights.len(), dim * dim,
+        "rns_linear_layer: weights.len() ({}) must equal dim*dim ({}*{}={})",
+        weights.len(), dim, dim, dim * dim
+    );
+    assert_eq!(
+        biases.len(), dim,
+        "rns_linear_layer: biases.len() ({}) must equal dim ({})",
+        biases.len(), dim
+    );
 
     // Matrix-vector multiply: scale becomes ct.scale * ctx.delta
     let ct_wx = rns_matvec(ct_x, weights, dim, rot_keys, ctx);

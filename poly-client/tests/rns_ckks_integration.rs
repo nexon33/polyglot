@@ -553,7 +553,7 @@ fn phase1_compatibility() {
     let (pk, sk) = backend.keygen();
 
     let tokens = vec![1u32, 42, 1000, 65535];
-    let ct = backend.encrypt(&tokens, &pk);
+    let ct = backend.encrypt(&tokens, &pk, &sk);
     let decrypted = backend.decrypt(&ct, &sk);
 
     assert_eq!(tokens, decrypted, "Phase 1 basic encrypt/decrypt broken");

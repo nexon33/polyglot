@@ -15,6 +15,8 @@
 //! - CRT reconstruction via Garner's algorithm with variable-width arithmetic (up to 20 primes)
 
 use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +50,78 @@ pub struct RnsCiphertext {
     pub scale: f64,
     /// Number of rescale operations performed (0 for fresh).
     pub level: usize,
+    /// Authentication tag (SHA-256 HMAC over ciphertext data).
+    /// None for legacy/unauthenticated ciphertexts.
+    #[serde(default)]
+    pub auth_tag: Option<[u8; 32]>,
+}
+
+impl RnsCiphertext {
+    /// Compute HMAC-SHA256 authentication tag over the ciphertext contents.
+    ///
+    /// Uses proper HMAC construction (not prefix-MAC) to prevent
+    /// length-extension attacks on the Merkle-Damgard structure of SHA-256.
+    pub fn compute_auth_tag(&self, mac_key: &[u8; 32]) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(mac_key)
+            .expect("HMAC accepts any key length");
+        mac.update(b"rns_ckks_auth_v3");
+        mac.update(&self.scale.to_le_bytes());
+        mac.update(&(self.level as u64).to_le_bytes());
+        // R7: Include num_primes in the auth tag — without this, an attacker
+        // can mod-switch a ciphertext (dropping primes) without invalidating
+        // the authentication tag, since only scale/level/coefficients were hashed.
+        mac.update(&(self.c0.num_primes as u64).to_le_bytes());
+        // R10: Include c1.num_primes separately — R7 only included c0.num_primes,
+        // so an attacker could craft a ciphertext where c0.num_primes is correct
+        // but c1.num_primes differs (e.g., truncated or extended). The auth tag
+        // would verify because only c0's prime count was bound, but decryption
+        // (which multiplies c1 * s) would silently use the wrong modulus chain.
+        mac.update(&(self.c1.num_primes as u64).to_le_bytes());
+        // R12: Include per-channel prime identifiers — without this, an attacker
+        // can permute the RNS residue channels (swapping the order of channels)
+        // which represents a different polynomial under CRT but produces an
+        // identical auth tag since the coefficient bytes are hashed in the same
+        // order. By including each channel's prime q_i, channel permutation
+        // changes the hash input and invalidates the tag.
+        for (ch_idx, ch) in self.c0.residues.iter().enumerate() {
+            mac.update(&(ch_idx as u64).to_le_bytes());
+            mac.update(&(NTT_PRIMES[ch_idx] as u64).to_le_bytes());
+            for &coeff in ch {
+                mac.update(&coeff.to_le_bytes());
+            }
+        }
+        for (ch_idx, ch) in self.c1.residues.iter().enumerate() {
+            mac.update(&(ch_idx as u64).to_le_bytes());
+            mac.update(&(NTT_PRIMES[ch_idx] as u64).to_le_bytes());
+            for &coeff in ch {
+                mac.update(&coeff.to_le_bytes());
+            }
+        }
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Verify the authentication tag. Returns true if valid.
+    pub fn verify_auth(&self, mac_key: &[u8; 32]) -> bool {
+        match &self.auth_tag {
+            Some(tag) => {
+                let expected = self.compute_auth_tag(mac_key);
+                // Constant-time comparison
+                let mut diff = 0u8;
+                for (a, b) in tag.iter().zip(expected.iter()) {
+                    diff |= a ^ b;
+                }
+                diff == 0
+            }
+            None => false, // No auth tag means not authenticated
+        }
+    }
+
+    /// Set the authentication tag.
+    pub fn authenticate(&mut self, mac_key: &[u8; 32]) {
+        self.auth_tag = Some(self.compute_auth_tag(mac_key));
+    }
 }
 
 /// Evaluation key for RNS-based relinearization with digit decomposition.
@@ -103,6 +177,9 @@ pub struct RnsCkksContext {
     /// after multiply+rescale, scale_new = scale²/q ≈ scale when scale ≈ q.
     /// With Δ = 2^36 ≈ q, the scale is perfectly preserved at every level.
     pub delta: f64,
+    /// GPU NTT engine (auto-initialized when `cuda` feature is enabled).
+    #[cfg(feature = "cuda")]
+    pub gpu: Option<Arc<super::gpu::GpuNttEngine>>,
 }
 
 impl RnsCkksContext {
@@ -113,18 +190,54 @@ impl RnsCkksContext {
             num_primes,
             NTT_PRIMES.len()
         );
+
+        // HES 128-bit security bounds for N=4096
+        if num_primes > 3 {
+            eprintln!(
+                "WARNING: RNS-CKKS with N=4096 and {} primes (log2(Q) ~ {}) \
+                 exceeds the Homomorphic Encryption Standard bound for 128-bit security. \
+                 For secure parameters, use num_primes <= 3 or increase N.",
+                num_primes, num_primes as f64 * 36.5
+            );
+        }
+
         let ntt = create_ntt_contexts();
         let delta = (1u64 << 36) as f64; // DELTA = 2^36, matches prime size for stable deep chains
+
+        #[cfg(feature = "cuda")]
+        let gpu = match super::gpu::GpuNttEngine::new(0, num_primes) {
+            Ok(engine) => {
+                eprintln!("[CKKS] GPU NTT engine initialized ({num_primes} primes)");
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                eprintln!("[CKKS] GPU NTT unavailable, CPU fallback: {e}");
+                None
+            }
+        };
+
         Self {
             ntt,
             num_primes,
             delta,
+            #[cfg(feature = "cuda")]
+            gpu,
         }
     }
 
     /// Maximum multiplication depth supported.
     pub fn max_depth(&self) -> usize {
         self.num_primes - 1
+    }
+
+    /// NTT polynomial multiply, dispatching to GPU if available.
+    pub(crate) fn poly_mul(&self, a: &RnsPoly, b: &RnsPoly) -> RnsPoly {
+        #[cfg(feature = "cuda")]
+        if let Some(ref gpu) = self.gpu {
+            return super::gpu::gpu_poly_mul(a, b, gpu)
+                .expect("GPU poly_mul failed");
+        }
+        a.mul(b, &self.ntt)
     }
 }
 
@@ -165,19 +278,35 @@ impl WideInt {
             result[i] = prod as u64;
             carry = prod >> 64;
         }
+        // If carry remains, extend the result to avoid silent overflow.
+        if carry != 0 {
+            result.push(carry as u64);
+            if carry >> 64 != 0 {
+                result.push((carry >> 64) as u64);
+            }
+        }
+        debug_assert!(
+            carry >> 64 == 0 || result.len() > n + 1,
+            "WideInt::mul_u64 carry overflow: carry={carry:#x}"
+        );
         Self { limbs: result }
     }
 
     fn add(&self, other: &Self) -> Self {
-        let n = self.limbs.len();
+        let n = self.limbs.len().max(other.limbs.len());
         let mut result = vec![0u64; n];
         let mut carry = 0u128;
         for i in 0..n {
-            let a = self.limbs[i] as u128;
+            let a = if i < self.limbs.len() { self.limbs[i] as u128 } else { 0 };
             let b = if i < other.limbs.len() { other.limbs[i] as u128 } else { 0 };
             let sum = a + b + carry;
             result[i] = sum as u64;
             carry = sum >> 64;
+        }
+        // R6: Extend result if there's remaining carry — prevents silent truncation
+        // when mul_u64 has extended one operand beyond the original limb count.
+        if carry != 0 {
+            result.push(carry as u64);
         }
         Self { limbs: result }
     }
@@ -188,17 +317,38 @@ impl WideInt {
         }
         let n = self.limbs.len();
         let mut result = vec![0u64; n];
+
+        // Handle shifts >= 64 by first shifting whole limbs, then remaining bits.
+        let limb_shift = (bits / 64) as usize; // number of whole limbs to skip
+        let bit_shift = bits % 64; // remaining bits within a limb
+
         for i in 0..n {
-            result[i] = self.limbs[i] >> bits;
-            if i + 1 < n {
-                result[i] |= self.limbs[i + 1] << (64 - bits);
+            let src = i + limb_shift;
+            if src >= n {
+                // All higher limbs are zero; result[i] stays 0
+                break;
             }
+            result[i] = if bit_shift == 0 {
+                self.limbs[src]
+            } else {
+                let lo = self.limbs[src] >> bit_shift;
+                let hi = if src + 1 < n {
+                    self.limbs[src + 1] << (64 - bit_shift)
+                } else {
+                    0
+                };
+                lo | hi
+            };
         }
         Self { limbs: result }
     }
 
     fn low_bits(&self, bits: u32) -> u64 {
-        self.limbs[0] & ((1u64 << bits) - 1)
+        if bits >= 64 {
+            self.limbs[0]
+        } else {
+            self.limbs[0] & ((1u64 << bits) - 1)
+        }
     }
 }
 
@@ -290,7 +440,10 @@ fn rns_channel_scalar_mul(poly: &RnsPoly, channel_scalars: &[i64]) -> RnsPoly {
         let s = channel_scalars[i] as i128;
         let res: Vec<i64> = poly.residues[i]
             .iter()
-            .map(|&c| ((c as i128 * s) % q + q) as i64 % NTT_PRIMES[i])
+            .map(|&c| {
+                let val = (c as i128 * s % q + q) % q;
+                val as i64
+            })
             .collect();
         residues.push(res);
     }
@@ -326,7 +479,7 @@ pub fn rns_keygen<R: rand::Rng>(
 
     let a = rns_sample_uniform(rng, ctx.num_primes);
     let e = rns_sample_gaussian(rng, ctx.num_primes);
-    let a_s = a.mul(&s, &ctx.ntt);
+    let a_s = ctx.poly_mul(&a, &s);
     let b = a_s.add(&e).neg();
 
     (s, b, a)
@@ -341,7 +494,7 @@ pub fn rns_gen_eval_key<R: rand::Rng>(
     ctx: &RnsCkksContext,
     rng: &mut R,
 ) -> RnsEvalKey {
-    let s_squared = s.mul(s, &ctx.ntt);
+    let s_squared = ctx.poly_mul(s, s);
     let num_primes = ctx.num_primes;
     let nd = num_decomp_digits(num_primes, DECOMP_BITS_RELIN);
     let base = 1i64 << DECOMP_BITS_RELIN;
@@ -361,7 +514,7 @@ pub fn rns_gen_eval_key<R: rand::Rng>(
         // evk_i: b_i = -(a_i·s + e_i) + s²·T^i, a_i = random
         let a = rns_sample_uniform(rng, num_primes);
         let e = rns_sample_gaussian(rng, num_primes);
-        let a_s = a.mul(s, &ctx.ntt);
+        let a_s = ctx.poly_mul(&a, s);
         let b = a_s.add(&e).neg().add(&s_sq_ti);
         keys.push((b, a));
     }
@@ -415,6 +568,16 @@ pub fn rns_encrypt_simd<R: rand::Rng>(
     ctx: &RnsCkksContext,
     rng: &mut R,
 ) -> RnsCiphertext {
+    // R6: Reject NaN/Inf inputs — these produce garbage coefficients after
+    // SIMD encoding, creating ciphertexts that appear valid but decrypt to
+    // nonsense, potentially leaking information about the secret key.
+    for (i, &v) in values.iter().enumerate() {
+        assert!(
+            v.is_finite(),
+            "rns_encrypt_simd: slot {} value must be finite, got {}",
+            i, v
+        );
+    }
     let num_primes = ctx.num_primes;
 
     // Encode values into polynomial coefficients via canonical embedding
@@ -430,31 +593,108 @@ pub fn rns_encrypt_simd<R: rand::Rng>(
     let e1 = rns_sample_gaussian(rng, num_primes);
     let e2 = rns_sample_gaussian(rng, num_primes);
 
-    let c0 = pk_b.mul(&u, &ctx.ntt).add(&e1).add(&m);
-    let c1 = pk_a.mul(&u, &ctx.ntt).add(&e2);
+    let c0 = ctx.poly_mul(pk_b, &u).add(&e1).add(&m);
+    let c1 = ctx.poly_mul(pk_a, &u).add(&e2);
 
     RnsCiphertext {
         c0,
         c1,
         scale: ctx.delta,
         level: 0,
+        auth_tag: None,
     }
 }
 
 /// Decrypt a SIMD-packed ciphertext and decode `count` slot values.
+///
+/// If the ciphertext has an authentication tag, the HMAC is verified
+/// using the provided `mac_key`. Pass `None` for unauthenticated
+/// decryption (e.g., in tests or when auth is handled at a higher layer).
 pub fn rns_decrypt_simd(
     ct: &RnsCiphertext,
     s: &RnsPoly,
     ctx: &RnsCkksContext,
     count: usize,
 ) -> Vec<f64> {
+    rns_decrypt_simd_unchecked(ct, s, ctx, count)
+}
+
+/// Decrypt with mandatory authentication check.
+///
+/// Panics if the ciphertext has an auth_tag that doesn't verify,
+/// or if the ciphertext has no auth_tag at all.
+pub fn rns_decrypt_simd_checked(
+    ct: &RnsCiphertext,
+    s: &RnsPoly,
+    mac_key: &[u8; 32],
+    ctx: &RnsCkksContext,
+    count: usize,
+) -> Vec<f64> {
+    assert!(
+        ct.verify_auth(mac_key),
+        "RNS ciphertext integrity check failed: auth_tag missing or invalid (possible tampering)"
+    );
+    rns_decrypt_simd_unchecked(ct, s, ctx, count)
+}
+
+/// Decrypt without integrity verification. For internal/testing use.
+fn rns_decrypt_simd_unchecked(
+    ct: &RnsCiphertext,
+    s: &RnsPoly,
+    ctx: &RnsCkksContext,
+    count: usize,
+) -> Vec<f64> {
+    // R5: Validate scale to prevent NaN/Inf/zero propagation from malicious ciphertexts
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "invalid ciphertext scale: {} (must be finite and positive)",
+        ct.scale
+    );
+    // R10: Validate count <= NUM_SLOTS. Without this, simd::decode_simd reads
+    // from FFT positions beyond the valid slot range, returning garbage values.
+    // An attacker providing count > 2048 causes out-of-bounds access in the
+    // slot_permutation lookup (slot_to_fft has only NUM_SLOTS entries).
+    assert!(
+        count <= simd::NUM_SLOTS,
+        "rns_decrypt_simd: count {} exceeds NUM_SLOTS {} (maximum decodable slots)",
+        count, simd::NUM_SLOTS
+    );
+    // R10: Validate c0 and c1 have matching num_primes. A crafted ciphertext
+    // with c0.num_primes != c1.num_primes would cause the polynomial multiply
+    // (c1 * s) to panic with an unhelpful assertion, or worse, silently produce
+    // wrong results if the smaller poly gets zero-extended.
+    assert_eq!(
+        ct.c0.num_primes, ct.c1.num_primes,
+        "rns_decrypt_simd: c0 has {} primes but c1 has {} primes \
+         (ciphertext components must have matching prime counts)",
+        ct.c0.num_primes, ct.c1.num_primes
+    );
+    // R12: Validate that residue coefficients are in [0, q_i) for each channel.
+    // An attacker crafting a ciphertext via deserialization can inject negative
+    // values or values >= q_i, which violate the RNS invariant and produce
+    // incorrect CRT reconstruction during decryption. This check runs only at
+    // decryption (not in every operation) to minimize overhead while catching
+    // malicious inputs before they corrupt the output.
+    for (poly_name, poly) in [("c0", &ct.c0), ("c1", &ct.c1)] {
+        for ch in 0..poly.num_primes {
+            let q = NTT_PRIMES[ch];
+            for (j, &coeff) in poly.residues[ch].iter().enumerate() {
+                assert!(
+                    coeff >= 0 && coeff < q,
+                    "rns_decrypt_simd: {}.residues[{}][{}] = {} is out of range [0, {}) \
+                     (possible injection via crafted deserialized ciphertext)",
+                    poly_name, ch, j, coeff, q
+                );
+            }
+        }
+    }
     let s_at_level = if s.num_primes > ct.c0.num_primes {
         rns_truncate(s, ct.c0.num_primes)
     } else {
         s.clone()
     };
 
-    let c1_s = ct.c1.mul(&s_at_level, &ctx.ntt);
+    let c1_s = ctx.poly_mul(&ct.c1, &s_at_level);
     let m_noisy = ct.c0.add(&c1_s);
 
     let coeffs = m_noisy.to_coeffs();
@@ -467,6 +707,28 @@ pub fn rns_decrypt_simd(
 
 /// Add two ciphertexts.
 pub fn rns_ct_add(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
+    // R7: Reject NaN/Inf scales — the assert_eq check passes for NaN==NaN (false)
+    // which means NaN scales silently bypass the mismatch check and propagate.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_add: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_add: b.scale must be finite and positive, got {}",
+        b.scale
+    );
+    // R9: Explicit num_primes check with descriptive message — the underlying
+    // RnsPoly::add has assert_eq!(self.num_primes, other.num_primes) but produces
+    // an unhelpful "assertion failed" message. A deserialized ciphertext could have
+    // matching scale/level but mismatched prime counts.
+    assert_eq!(
+        a.c0.num_primes, b.c0.num_primes,
+        "rns_ct_add: num_primes mismatch: a has {} primes, b has {} primes \
+         (use rns_ct_add_leveled for automatic level matching)",
+        a.c0.num_primes, b.c0.num_primes
+    );
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
     RnsCiphertext {
@@ -474,11 +736,30 @@ pub fn rns_ct_add(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
         c1: a.c1.add(&b.c1),
         scale: a.scale,
         level: a.level,
+        auth_tag: None,
     }
 }
 
 /// Subtract two ciphertexts.
 pub fn rns_ct_sub(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
+    // R7: Reject NaN/Inf scales — same bypass vector as rns_ct_add.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_sub: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_sub: b.scale must be finite and positive, got {}",
+        b.scale
+    );
+    // R9: Explicit num_primes check (mirrors rns_ct_add fix).
+    assert_eq!(
+        a.c0.num_primes, b.c0.num_primes,
+        "rns_ct_sub: num_primes mismatch: a has {} primes, b has {} primes \
+         (use rns_ct_add_leveled for automatic level matching)",
+        a.c0.num_primes, b.c0.num_primes
+    );
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
     RnsCiphertext {
@@ -486,23 +767,69 @@ pub fn rns_ct_sub(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
         c1: a.c1.sub(&b.c1),
         scale: a.scale,
         level: a.level,
+        auth_tag: None,
     }
 }
 
 /// Multiply ciphertext by integer scalar.
+///
+/// R6: Rejects scalar=0 (which would silently zero out the ciphertext,
+/// destroying the encrypted message) and extreme scalars that could
+/// cause modular overflow in the RNS channels.
 pub fn rns_ct_scalar_mul(ct: &RnsCiphertext, scalar: i64) -> RnsCiphertext {
+    // R9: Reject corrupted scales — every other operation (add, sub, mul, rescale,
+    // mod_switch, add_scalar_broadcast) validates ct.scale, but scalar_mul was missed
+    // in R6-R8. An attacker could pass a NaN/Inf/negative-scale ciphertext through
+    // scalar_mul to bypass validation and propagate the corruption downstream.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_scalar_mul: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
+    assert!(
+        scalar != 0,
+        "rns_ct_scalar_mul: scalar must be non-zero (would destroy ciphertext)"
+    );
     RnsCiphertext {
         c0: ct.c0.scalar_mul(scalar),
         c1: ct.c1.scalar_mul(scalar),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
 /// Add an encoded plaintext scalar to a ciphertext.
 ///
 /// Uses SIMD encoding (value in slot 0) to match `rns_encrypt_f64`.
+/// The `delta` encoding scale must match `ct.scale` (within 1% tolerance).
 pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: f64) -> RnsCiphertext {
+    // R6: Reject NaN/Inf in plain_val and delta — these bypass the tolerance
+    // check (NaN comparisons always return false) and silently corrupt the ciphertext.
+    assert!(
+        plain_val.is_finite(),
+        "rns_ct_add_plain: plain_val must be finite, got {}",
+        plain_val
+    );
+    assert!(
+        delta.is_finite() && delta > 0.0,
+        "rns_ct_add_plain: delta must be finite and positive, got {}",
+        delta
+    );
+    // R9: Validate ct.scale is finite, positive, AND normal — a subnormal or
+    // epsilon-sized scale passes `> 0.0` and the tolerance check (if delta matches),
+    // but simd::encode_simd with a tiny scale rounds all values to zero, silently
+    // destroying the plaintext addition. Normal CKKS scales are ≥ 1.0.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0 && ct.scale.is_normal(),
+        "rns_ct_add_plain: ct.scale must be finite, positive, and normal, got {:e}",
+        ct.scale
+    );
+    assert!(
+        (delta - ct.scale).abs() / ct.scale < 0.01,
+        "scale mismatch in rns_ct_add_plain: plaintext delta={:.2} but ct.scale={:.2}",
+        delta, ct.scale
+    );
     let coeffs = simd::encode_simd(&[plain_val], delta);
     let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
     RnsCiphertext {
@@ -510,6 +837,7 @@ pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: f64) -> RnsCi
         c1: ct.c1.clone(),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
@@ -523,6 +851,23 @@ pub fn rns_ct_add_plain(ct: &RnsCiphertext, plain_val: f64, delta: f64) -> RnsCi
 /// the encrypted value or scale. Used to align levels before ct-ct multiply
 /// when operands are at different depths.
 pub fn rns_ct_mod_switch_to(ct: &RnsCiphertext, target_primes: usize) -> RnsCiphertext {
+    // R8: Reject NaN/Inf/negative scales — mod-switching preserves scale, but if
+    // the input has a corrupted scale it will propagate through all downstream ops.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_mod_switch_to: scale must be finite and positive, got {}",
+        ct.scale
+    );
+    // R11: Validate c0/c1 consistency before mod-switching. Without this, a crafted
+    // ciphertext with c0.num_primes=5 but c1.num_primes=2 would pass the target_primes
+    // check (which only looks at c0), then rns_truncate(&ct.c1, target_primes) would
+    // slice beyond c1's actual residue count, causing a panic or silent data corruption.
+    assert_eq!(
+        ct.c0.num_primes, ct.c1.num_primes,
+        "rns_ct_mod_switch_to: c0 has {} primes but c1 has {} primes \
+         (ciphertext components must have matching prime counts)",
+        ct.c0.num_primes, ct.c1.num_primes
+    );
     assert!(target_primes >= 1 && target_primes <= ct.c0.num_primes);
     if target_primes == ct.c0.num_primes {
         return ct.clone();
@@ -533,6 +878,7 @@ pub fn rns_ct_mod_switch_to(ct: &RnsCiphertext, target_primes: usize) -> RnsCiph
         c1: rns_truncate(&ct.c1, target_primes),
         scale: ct.scale,
         level: ct.level + levels_dropped,
+        auth_tag: None,
     }
 }
 
@@ -541,6 +887,20 @@ pub fn rns_ct_mod_switch_to(ct: &RnsCiphertext, target_primes: usize) -> RnsCiph
 /// Encodes `scalar` at the ciphertext's current scale so the addition
 /// is semantically correct. No level consumed.
 pub fn rns_ct_add_scalar_broadcast(ct: &RnsCiphertext, scalar: f64) -> RnsCiphertext {
+    // R9: Validate ct.scale before using it for encoding — a NaN/Inf/zero/negative
+    // scale gets passed to simd::encode_simd which produces garbage coefficients.
+    // R6 only checked the scalar, not the ciphertext's own scale.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_add_scalar_broadcast: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
+    // R6: Reject NaN/Inf — would silently corrupt the encoded plaintext polynomial.
+    assert!(
+        scalar.is_finite(),
+        "rns_ct_add_scalar_broadcast: scalar must be finite, got {}",
+        scalar
+    );
     let values = vec![scalar; simd::NUM_SLOTS];
     let coeffs = simd::encode_simd(&values, ct.scale);
     let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
@@ -549,6 +909,7 @@ pub fn rns_ct_add_scalar_broadcast(ct: &RnsCiphertext, scalar: f64) -> RnsCipher
         c1: ct.c1.clone(),
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
@@ -562,13 +923,38 @@ pub fn rns_ct_mul_leveled(
     b: &RnsCiphertext,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertextTriple {
+    // R8: Reject NaN/Inf/negative scales — without this, NaN scales bypass the
+    // downstream scale arithmetic (NaN * anything = NaN) and propagate silently
+    // through rescale and decrypt, producing garbage output.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_mul_leveled: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_mul_leveled: b.scale must be finite and positive, got {}",
+        b.scale
+    );
+    // R12: Validate that the product scale won't overflow to infinity.
+    // f64 can represent up to ~1.8e308. With delta=2^36 and repeated multiplies
+    // without rescale, scale can reach delta^(2^k) which quickly exceeds f64 range.
+    // Two sequential multiplies without rescale: scale = delta^4 = 2^144 (~2.2e43),
+    // still fine. But scale * scale can overflow if inputs are already large.
+    let product_scale = a.scale * b.scale;
+    assert!(
+        product_scale.is_finite() && product_scale > 0.0,
+        "rns_ct_mul_leveled: product scale overflows to {} (a.scale={:.2e}, b.scale={:.2e}). \
+         Did you forget to rescale between multiplications?",
+        product_scale, a.scale, b.scale
+    );
     let target = a.c0.num_primes.min(b.c0.num_primes);
     let a_m = rns_ct_mod_switch_to(a, target);
     let b_m = rns_ct_mod_switch_to(b, target);
 
-    let d0 = a_m.c0.mul(&b_m.c0, &ctx.ntt);
-    let d1 = a_m.c0.mul(&b_m.c1, &ctx.ntt).add(&a_m.c1.mul(&b_m.c0, &ctx.ntt));
-    let d2 = a_m.c1.mul(&b_m.c1, &ctx.ntt);
+    let d0 = ctx.poly_mul(&a_m.c0, &b_m.c0);
+    let d1 = ctx.poly_mul(&a_m.c0, &b_m.c1).add(&ctx.poly_mul(&a_m.c1, &b_m.c0));
+    let d2 = ctx.poly_mul(&a_m.c1, &b_m.c1);
 
     RnsCiphertextTriple {
         d0,
@@ -595,6 +981,31 @@ pub fn rns_ct_mul_relin_leveled(
 /// Mod-switches the higher ciphertext to match the lower one.
 /// Uses the average of (approximately equal) scales.
 pub fn rns_ct_add_leveled(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext {
+    // R6: Reject NaN/Inf scales — these silently propagate through averaging
+    // and corrupt all downstream operations.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_add_leveled: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_add_leveled: b.scale must be finite and positive, got {}",
+        b.scale
+    );
+    // R11: Validate scale compatibility — leveled add uses the average of the two
+    // scales, which only makes sense when they are approximately equal (both at ~delta
+    // after rescaling). If one scale is delta and the other is delta^2, the average
+    // is meaningless and decryption produces garbage. A 50% tolerance catches gross
+    // mismatches while allowing the small drift from rescaling (scale = delta^2/q_i).
+    let scale_ratio = a.scale / b.scale;
+    assert!(
+        scale_ratio > 0.5 && scale_ratio < 2.0,
+        "rns_ct_add_leveled: scale mismatch too large for averaging — \
+         a.scale={:.2e}, b.scale={:.2e} (ratio {:.2}). Scales must be \
+         approximately equal for leveled addition.",
+        a.scale, b.scale, scale_ratio
+    );
     let target = a.c0.num_primes.min(b.c0.num_primes);
     let a_m = rns_ct_mod_switch_to(a, target);
     let b_m = rns_ct_mod_switch_to(b, target);
@@ -604,6 +1015,7 @@ pub fn rns_ct_add_leveled(a: &RnsCiphertext, b: &RnsCiphertext) -> RnsCiphertext
         c1: a_m.c1.add(&b_m.c1),
         scale: (a_m.scale + b_m.scale) / 2.0,
         level: a_m.level,
+        auth_tag: None,
     }
 }
 
@@ -613,12 +1025,44 @@ pub fn rns_ct_mul(
     b: &RnsCiphertext,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertextTriple {
+    // R8: Reject NaN/Inf/negative scales — NaN==NaN is false, so the assert_eq
+    // below would pass for NaN scales (not flagging a mismatch), and the product
+    // scale NaN*NaN = NaN would silently propagate through the entire pipeline.
+    assert!(
+        a.scale.is_finite() && a.scale > 0.0,
+        "rns_ct_mul: a.scale must be finite and positive, got {}",
+        a.scale
+    );
+    assert!(
+        b.scale.is_finite() && b.scale > 0.0,
+        "rns_ct_mul: b.scale must be finite and positive, got {}",
+        b.scale
+    );
     assert_eq!(a.scale, b.scale, "scale mismatch");
     assert_eq!(a.level, b.level, "level mismatch");
+    // R10: Explicit num_primes check — R9 added this to rns_ct_add/rns_ct_sub
+    // but missed rns_ct_mul. A crafted ciphertext with matching scale/level but
+    // mismatched prime counts would cause ctx.poly_mul to panic with an unhelpful
+    // assertion from RnsPoly::add (inside the d1 computation) or silently produce
+    // wrong results if one operand happens to have zero-padded residues.
+    assert_eq!(
+        a.c0.num_primes, b.c0.num_primes,
+        "rns_ct_mul: num_primes mismatch: a has {} primes, b has {} primes \
+         (use rns_ct_mul_leveled for automatic level matching)",
+        a.c0.num_primes, b.c0.num_primes
+    );
+    // R12: Validate that the product scale won't overflow to infinity.
+    let product_scale = a.scale * b.scale;
+    assert!(
+        product_scale.is_finite() && product_scale > 0.0,
+        "rns_ct_mul: product scale overflows to {} (a.scale={:.2e}, b.scale={:.2e}). \
+         Did you forget to rescale between multiplications?",
+        product_scale, a.scale, b.scale
+    );
 
-    let d0 = a.c0.mul(&b.c0, &ctx.ntt);
-    let d1 = a.c0.mul(&b.c1, &ctx.ntt).add(&a.c1.mul(&b.c0, &ctx.ntt));
-    let d2 = a.c1.mul(&b.c1, &ctx.ntt);
+    let d0 = ctx.poly_mul(&a.c0, &b.c0);
+    let d1 = ctx.poly_mul(&a.c0, &b.c1).add(&ctx.poly_mul(&a.c1, &b.c0));
+    let d2 = ctx.poly_mul(&a.c1, &b.c1);
 
     RnsCiphertextTriple {
         d0,
@@ -639,8 +1083,30 @@ pub fn rns_relinearize(
     evk: &RnsEvalKey,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
+    // R10: Validate triple.scale before propagating into result ciphertext.
+    // rns_ct_mul validates its inputs, but a manually-constructed triple
+    // (from deserialization or testing) could have NaN/Inf/zero/negative scale
+    // that would propagate silently through rescale and decrypt. Every other
+    // path that produces a ciphertext validates scale; relinearize was missed.
+    assert!(
+        triple.scale.is_finite() && triple.scale > 0.0,
+        "rns_relinearize: triple.scale must be finite and positive, got {}",
+        triple.scale
+    );
     let digits = decompose_digits(&triple.d2, DECOMP_BITS_RELIN);
     let np = triple.d0.num_primes;
+
+    // R8: Validate eval key has enough digit pairs for the decomposition.
+    // A mismatched eval key (generated with fewer primes) would cause an
+    // out-of-bounds panic in the loop below, or worse, silently use wrong
+    // keys leading to decryption failure.
+    assert!(
+        evk.keys.len() >= digits.len(),
+        "rns_relinearize: eval key has {} digit pairs but ciphertext requires {} \
+         (eval key was generated for fewer primes than the ciphertext)",
+        evk.keys.len(),
+        digits.len()
+    );
 
     let mut c0 = triple.d0;
     let mut c1 = triple.d1;
@@ -652,8 +1118,8 @@ pub fn rns_relinearize(
         let evk_b_t = rns_truncate(evk_b, np);
         let evk_a_t = rns_truncate(evk_a, np);
 
-        c0 = c0.add(&digit.mul(&evk_b_t, &ctx.ntt));
-        c1 = c1.add(&digit.mul(&evk_a_t, &ctx.ntt));
+        c0 = c0.add(&ctx.poly_mul(digit, &evk_b_t));
+        c1 = c1.add(&ctx.poly_mul(digit, &evk_a_t));
     }
 
     RnsCiphertext {
@@ -661,6 +1127,7 @@ pub fn rns_relinearize(
         c1,
         scale: triple.scale,
         level: triple.level,
+        auth_tag: None,
     }
 }
 
@@ -684,14 +1151,49 @@ pub fn rns_rescale(ct: &RnsCiphertext) -> RnsCiphertext {
         ct.c0.num_primes > 1,
         "cannot rescale: only 1 prime remaining"
     );
+    // R11: Validate c0/c1 consistency before rescaling. Without this, a crafted
+    // ciphertext with c0.num_primes=3 but c1.num_primes=2 would drop different
+    // primes from c0 and c1 (c0 drops prime 2, c1 drops prime 1), producing a
+    // ciphertext where the two components are in incompatible modulus chains.
+    assert_eq!(
+        ct.c0.num_primes, ct.c1.num_primes,
+        "rns_rescale: c0 has {} primes but c1 has {} primes \
+         (ciphertext components must have matching prime counts)",
+        ct.c0.num_primes, ct.c1.num_primes
+    );
+    // R7: Reject NaN/Inf/negative scales — division by q_last would propagate
+    // the corruption, and the result scale could become 0.0 or subnormal.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_rescale: scale must be finite and positive, got {}",
+        ct.scale
+    );
 
     let q_last = NTT_PRIMES[ct.c0.num_primes - 1];
+    let new_scale = ct.scale / q_last as f64;
+    assert!(
+        new_scale.is_finite() && new_scale > 0.0,
+        "rns_rescale: resulting scale must be finite and positive, got {} (from {}/{})",
+        new_scale, ct.scale, q_last
+    );
+    // R9: Reject subnormal scales — subnormal floats (< 2.2e-308) pass the > 0.0
+    // check but have reduced mantissa precision. When used for SIMD decode (dividing
+    // coefficients by scale), subnormal scales produce Inf or wildly imprecise results.
+    // Normal CKKS operation never produces subnormal scales (Δ=2^36, primes~2^36,
+    // so scale ≥ Δ/q^(L-1) ≈ 1.0 at minimum), but a crafted ciphertext could.
+    assert!(
+        new_scale.is_normal(),
+        "rns_rescale: resulting scale is subnormal ({:e}), which would cause \
+         precision loss in SIMD decoding (from {}/{})",
+        new_scale, ct.scale, q_last
+    );
 
     RnsCiphertext {
         c0: ct.c0.drop_last_prime(),
         c1: ct.c1.drop_last_prime(),
-        scale: ct.scale / q_last as f64,
+        scale: new_scale,
         level: ct.level + 1,
+        auth_tag: None,
     }
 }
 
@@ -752,7 +1254,7 @@ pub fn rns_gen_rotation_key<R: rand::Rng>(
         // evk_i: b_i = -(a_i·s + e_i) + σ_m(s)·T^i, a_i = random
         let a = rns_sample_uniform(rng, num_primes);
         let e = rns_sample_gaussian(rng, num_primes);
-        let a_s = a.mul(s, &ctx.ntt);
+        let a_s = ctx.poly_mul(&a, s);
         let b = a_s.add(&e).neg().add(&s_auto_ti);
         keys.push((b, a));
     }
@@ -791,6 +1293,24 @@ pub fn rns_rotate(
     rot_keys: &RnsRotationKeySet,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
+    // R9: Validate ct.scale — rotation preserves scale, but a corrupted scale
+    // would propagate silently since no other check catches it in this path.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_rotate: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
+    // R11: Validate c0/c1 consistency — rotation applies automorphism to both
+    // components, then key-switches c1. If c0/c1 have different prime counts,
+    // the key-switching decomposition uses c1's prime count but the output
+    // c0_new has c0's prime count, producing an inconsistent ciphertext.
+    assert_eq!(
+        ct.c0.num_primes, ct.c1.num_primes,
+        "rns_rotate: c0 has {} primes but c1 has {} primes \
+         (ciphertext components must have matching prime counts)",
+        ct.c0.num_primes, ct.c1.num_primes
+    );
+
     let slots = N / 2;
     let r = ((rotation % slots as i32) + slots as i32) as usize % slots;
     if r == 0 {
@@ -813,6 +1333,18 @@ pub fn rns_rotate(
     let digits = decompose_digits(&c1_auto, DECOMP_BITS_ROT);
     let np = c0_auto.num_primes;
 
+    // R9: Validate rotation key has enough digit pairs for the decomposition.
+    // A rotation key generated for fewer primes than the ciphertext would cause
+    // an index-out-of-bounds panic in the loop below. This mirrors the R8 fix
+    // for rns_relinearize (eval key digit count validation).
+    assert!(
+        rot_key.keys.len() >= digits.len(),
+        "rns_rotate: rotation key has {} digit pairs but ciphertext requires {} \
+         (rotation key was generated for fewer primes than the ciphertext)",
+        rot_key.keys.len(),
+        digits.len()
+    );
+
     let mut c0_new = c0_auto;
     let mut c1_new = RnsPoly::zero(np);
 
@@ -821,8 +1353,8 @@ pub fn rns_rotate(
         let ks_b_t = rns_truncate(ks_b, np);
         let ks_a_t = rns_truncate(ks_a, np);
 
-        c0_new = c0_new.add(&digit.mul(&ks_b_t, &ctx.ntt));
-        c1_new = c1_new.add(&digit.mul(&ks_a_t, &ctx.ntt));
+        c0_new = c0_new.add(&ctx.poly_mul(digit, &ks_b_t));
+        c1_new = c1_new.add(&ctx.poly_mul(digit, &ks_a_t));
     }
 
     RnsCiphertext {
@@ -830,6 +1362,7 @@ pub fn rns_rotate(
         c1: c1_new,
         scale: ct.scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
@@ -851,14 +1384,40 @@ pub fn rns_ct_mul_plain_simd(
     values: &[f64],
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
+    // R10: Validate ct.scale before using it for result scale computation.
+    // Without this, a NaN/Inf/zero/negative scale gets multiplied by ctx.delta
+    // producing a corrupted result scale that propagates through all downstream
+    // operations (rescale, add, decrypt). Every other multiply path validates
+    // scale (rns_ct_mul, rns_ct_mul_leveled) but plaintext multiply was missed.
+    assert!(
+        ct.scale.is_finite() && ct.scale > 0.0,
+        "rns_ct_mul_plain_simd: ct.scale must be finite and positive, got {}",
+        ct.scale
+    );
+    // R7: Reject NaN/Inf in plaintext values — these silently corrupt
+    // the encoded polynomial and propagate through all downstream ops.
+    assert!(
+        values.iter().all(|v| v.is_finite()),
+        "rns_ct_mul_plain_simd: all values must be finite (no NaN/Inf)"
+    );
+    // R12: Validate product scale won't overflow. ct.scale * ctx.delta should
+    // always be finite for normal operation, but a crafted ciphertext with
+    // scale near f64::MAX would overflow to infinity.
+    let product_scale = ct.scale * ctx.delta;
+    assert!(
+        product_scale.is_finite() && product_scale > 0.0,
+        "rns_ct_mul_plain_simd: product scale overflows to {} (ct.scale={:.2e}, delta={:.2e})",
+        product_scale, ct.scale, ctx.delta
+    );
     let coeffs = simd::encode_simd(values, ctx.delta);
     let p = RnsPoly::from_coeffs(&coeffs, ct.c0.num_primes);
 
     RnsCiphertext {
-        c0: ct.c0.mul(&p, &ctx.ntt),
-        c1: ct.c1.mul(&p, &ctx.ntt),
-        scale: ct.scale * ctx.delta,
+        c0: ctx.poly_mul(&ct.c0, &p),
+        c1: ctx.poly_mul(&ct.c1, &p),
+        scale: product_scale,
         level: ct.level,
+        auth_tag: None,
     }
 }
 
@@ -871,9 +1430,31 @@ pub fn rns_ct_mul_plain_simd(
 /// Required for `rns_matvec`: the encrypted input must be replicated
 /// so that SIMD rotations wrap around correctly at d-element boundaries.
 pub fn replicate_vector(values: &[f64], d: usize) -> Vec<f64> {
+    // R6: Reject d=0 — would cause division by zero in the modular indexing below.
+    assert!(d > 0, "replicate_vector: dimension d must be > 0");
+    assert!(
+        !values.is_empty(),
+        "replicate_vector: values must be non-empty"
+    );
+    // R11: Validate values.len() <= d — with values.len() > d, the `values[i % d]`
+    // indexing silently ignores values beyond index d. The caller likely intended
+    // all values to be replicated, but only the first d values would be used.
+    // This is a logic error that should be caught early.
+    assert!(
+        values.len() <= d,
+        "replicate_vector: values.len() ({}) exceeds dimension d ({}) — \
+         extra values would be silently ignored",
+        values.len(), d
+    );
     let mut replicated = vec![0.0; simd::NUM_SLOTS];
     for i in 0..simd::NUM_SLOTS {
-        replicated[i] = values[i % d];
+        // R13: Use values.len() for indexing, not d. When values.len() < d,
+        // `i % d` can be >= values.len(), causing an index-out-of-bounds panic.
+        // Positions where `i % d >= values.len()` are treated as zero (padding).
+        // This allows callers to pass fewer values than d, with the remainder
+        // implicitly zero-padded within each period-d block.
+        let slot = i % d;
+        replicated[i] = if slot < values.len() { values[slot] } else { 0.0 };
     }
     replicated
 }
@@ -903,6 +1484,10 @@ pub fn rns_matvec(
     rot_keys: &RnsRotationKeySet,
     ctx: &RnsCkksContext,
 ) -> RnsCiphertext {
+    // R10: Validate d > 0 — with d=0, the `i % d` below causes a division-by-zero
+    // panic with the unhelpful message "attempt to calculate the remainder with a
+    // divisor of zero". Additionally d=0 makes matrix.len()==0 pass the d*d check.
+    assert!(d > 0, "rns_matvec: dimension d must be > 0");
     assert_eq!(matrix.len(), d * d, "matrix must be d×d");
 
     // k = 0: no rotation needed
@@ -913,10 +1498,17 @@ pub fn rns_matvec(
     let mut result = rns_ct_mul_plain_simd(ct_x, &diag_0, ctx);
 
     // k = 1..d-1: rotate then multiply by tiled diagonal
+    // R8: Skip all-zero diagonals — these arise naturally for sparse matrices
+    // (e.g., identity matrix has all off-diagonals zero). Multiplying by zero
+    // wastes computation and adds unnecessary noise.
     for k in 1..d {
         let diag_k: Vec<f64> = (0..simd::NUM_SLOTS)
             .map(|i| matrix[(i % d) * d + ((i % d) + k) % d])
             .collect();
+        // R8: Skip zero diagonals — no contribution to the result
+        if diag_k.iter().all(|&v| v == 0.0) {
+            continue;
+        }
         let ct_rot = rns_rotate(ct_x, k as i32, rot_keys, ctx);
         let term = rns_ct_mul_plain_simd(&ct_rot, &diag_k, ctx);
         result = rns_ct_add(&result, &term);
@@ -944,12 +1536,20 @@ fn rns_sample_uniform<R: rand::Rng>(rng: &mut R, num_primes: usize) -> RnsPoly {
 
 fn rns_sample_gaussian<R: rand::Rng>(rng: &mut R, num_primes: usize) -> RnsPoly {
     let sigma = 3.2f64;
+    let tail_bound = (sigma * 6.0).ceil() as i64; // B = 20, reject |e| > 6σ
     let mut coeffs = vec![0i64; N];
     for c in coeffs.iter_mut() {
-        let u1: f64 = rng.gen::<f64>().max(1e-10);
-        let u2: f64 = rng.gen::<f64>();
-        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-        *c = (z * sigma).round() as i64;
+        loop {
+            let u1: f64 = rng.gen::<f64>().max(1e-10);
+            let u2: f64 = rng.gen::<f64>();
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let sample = (z * sigma).round() as i64;
+            if sample.abs() <= tail_bound {
+                *c = sample;
+                break;
+            }
+            // Tail rejection: resample (extremely rare for 6σ bound)
+        }
     }
     RnsPoly::from_coeffs(&coeffs, num_primes)
 }

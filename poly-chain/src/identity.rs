@@ -113,11 +113,26 @@ impl IdentityRecord {
                     "identity record office field truncated".into(),
                 ));
             }
+            // R10: Reject trailing garbage bytes for canonical deserialization.
+            if data.len() > 80 + office_len {
+                return Err(ChainError::InvalidEncoding(format!(
+                    "identity record too long: {} bytes (expected {})",
+                    data.len(),
+                    80 + office_len,
+                )));
+            }
             Some(
                 String::from_utf8(data[80..80 + office_len].to_vec())
                     .map_err(|e| ChainError::InvalidEncoding(e.to_string()))?,
             )
         } else {
+            // R10: Reject trailing garbage bytes for canonical deserialization.
+            if data.len() > 80 {
+                return Err(ChainError::InvalidEncoding(format!(
+                    "identity record too long: {} bytes (expected 80)",
+                    data.len(),
+                )));
+            }
             None
         };
         Ok(Self {
@@ -139,13 +154,18 @@ impl IdentityRecord {
 
 /// Derive an identity hash from personal data.
 ///
-/// `H(DOMAIN_IDENTITY || national_id || dob || country)`
+/// `H(DOMAIN_IDENTITY || len(national_id) || national_id || len(dob) || dob || len(country) || country)`
 ///
+/// Length-prefixed to prevent concatenation collisions
+/// (e.g., ("AB","CD","EF") vs ("ABC","DE","F")).
 /// The plaintext is never stored on chain — only this hash.
 pub fn derive_identity_hash(national_id: &[u8], dob: &[u8], country: &[u8]) -> Hash {
-    let mut data = Vec::with_capacity(national_id.len() + dob.len() + country.len());
+    let mut data = Vec::with_capacity(12 + national_id.len() + dob.len() + country.len());
+    data.extend_from_slice(&(national_id.len() as u32).to_le_bytes());
     data.extend_from_slice(national_id);
+    data.extend_from_slice(&(dob.len() as u32).to_le_bytes());
     data.extend_from_slice(dob);
+    data.extend_from_slice(&(country.len() as u32).to_le_bytes());
     data.extend_from_slice(country);
     hash_with_domain(DOMAIN_IDENTITY, &data)
 }
@@ -226,6 +246,15 @@ mod tests {
     fn different_inputs_different_hashes() {
         let h1 = derive_identity_hash(b"123456789", b"1990-01-01", b"US");
         let h2 = derive_identity_hash(b"987654321", b"1990-01-01", b"US");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn attack_identity_hash_concatenation_collision_fixed() {
+        // FIXED: Length-prefixing makes field boundaries unambiguous.
+        // ("AB","CD","EF") and ("ABC","DE","F") now produce different hashes.
+        let h1 = derive_identity_hash(b"AB", b"CD", b"EF");
+        let h2 = derive_identity_hash(b"ABC", b"DE", b"F");
         assert_ne!(h1, h2);
     }
 }

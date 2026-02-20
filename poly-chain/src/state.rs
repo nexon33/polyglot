@@ -5,6 +5,103 @@ use std::collections::BTreeMap;
 
 use crate::primitives::*;
 
+/// R15: Decode hex string to bytes (shared helper for serde modules).
+fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err("odd hex string length".into());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| format!("invalid hex at {}: {}", i, e))
+        })
+        .collect()
+}
+
+/// R15: Custom serde for BTreeMap<Hash, Hash> — JSON requires string keys.
+/// The SparseMerkleTree stores [u8; 32] keys which cannot be JSON map keys.
+/// We encode both key and value as hex strings for JSON compatibility.
+mod serde_hash_map {
+    use super::*;
+    use serde::ser::SerializeMap;
+
+    pub fn serialize<S: serde::Serializer>(
+        leaves: &BTreeMap<Hash, Hash>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(leaves.len()))?;
+        for (key, value) in leaves {
+            let hex_key = hex_encode(key);
+            let hex_value = hex_encode(value);
+            map.serialize_entry(&hex_key, &hex_value)?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<Hash, Hash>, D::Error> {
+        let string_map: BTreeMap<String, String> = BTreeMap::deserialize(deserializer)?;
+        let mut result = BTreeMap::new();
+        for (hex_key, hex_value) in string_map {
+            let key_bytes = hex_decode(&hex_key).map_err(serde::de::Error::custom)?;
+            let val_bytes = hex_decode(&hex_value).map_err(serde::de::Error::custom)?;
+            if key_bytes.len() != 32 || val_bytes.len() != 32 {
+                return Err(serde::de::Error::custom("expected 32-byte key and value"));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&key_bytes);
+            let mut value = [0u8; 32];
+            value.copy_from_slice(&val_bytes);
+            result.insert(key, value);
+        }
+        Ok(result)
+    }
+}
+
+/// R15: Custom serde for BTreeMap<[u8; 32], u64> — JSON requires string keys.
+/// Without this, serde_json::to_vec(&GlobalState) panics with "key must be a
+/// string" because [u8; 32] is not a valid JSON map key. This breaks any code
+/// that attempts JSON-based state snapshots, RPC responses, or debug logging.
+/// We encode the [u8; 32] keys as hex strings for JSON compatibility.
+mod serde_nonces {
+    use super::*;
+    use serde::ser::SerializeMap;
+
+    pub fn serialize<S: serde::Serializer>(
+        nonces: &BTreeMap<AccountId, Nonce>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(nonces.len()))?;
+        for (key, value) in nonces {
+            let hex_key = hex_encode(key);
+            map.serialize_entry(&hex_key, value)?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<AccountId, Nonce>, D::Error> {
+        let string_map: BTreeMap<String, Nonce> = BTreeMap::deserialize(deserializer)?;
+        let mut result = BTreeMap::new();
+        for (hex_key, value) in string_map {
+            let bytes = hex_decode(&hex_key).map_err(serde::de::Error::custom)?;
+            if bytes.len() != 32 {
+                return Err(serde::de::Error::custom(format!(
+                    "expected 32-byte key, got {} bytes",
+                    bytes.len()
+                )));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            result.insert(key, value);
+        }
+        Ok(result)
+    }
+}
+
 /// A Sparse Merkle Tree mapping 32-byte keys to 32-byte value hashes.
 ///
 /// Stores only non-empty leaves. Empty leaves are implicitly ZERO_HASH.
@@ -12,6 +109,10 @@ use crate::primitives::*;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SparseMerkleTree {
     /// Non-empty leaf values: key → value_hash.
+    ///
+    /// R15: Uses custom serde to encode [u8; 32] keys/values as hex strings,
+    /// enabling JSON serialization.
+    #[serde(with = "serde_hash_map")]
     leaves: BTreeMap<Hash, Hash>,
     /// Cached root hash (recomputed on mutation).
     root: Hash,
@@ -117,6 +218,12 @@ pub struct GlobalState {
     pub stp: SparseMerkleTree,
     pub applications: SparseMerkleTree,
     pub swaps: SparseMerkleTree,
+    /// Per-account nonce tracking: prevents transaction replay.
+    ///
+    /// R15: Uses custom serde to encode [u8; 32] keys as hex strings,
+    /// enabling JSON serialization (which requires string keys).
+    #[serde(default, with = "serde_nonces")]
+    nonces: BTreeMap<AccountId, Nonce>,
 }
 
 impl GlobalState {
@@ -131,12 +238,19 @@ impl GlobalState {
             stp: SparseMerkleTree::new(),
             applications: SparseMerkleTree::new(),
             swaps: SparseMerkleTree::new(),
+            nonces: BTreeMap::new(),
         }
     }
 
-    /// Combined state root: H(wallets_root || identities_root || ... || swaps_root).
+    /// Combined state root: H(wallets_root || identities_root || ... || swaps_root || nonces_hash).
+    ///
+    /// R11: The nonces map is now included in the state root commitment.
+    /// Previously, nonces were excluded, meaning two states with different nonces
+    /// would produce the same state_root. This allowed an attacker who obtained a
+    /// state snapshot to forge a state with reset nonces, enabling transaction replays
+    /// that bypass the nonce check (because the replayed nonce would match the forged state).
     pub fn state_root(&self) -> Hash {
-        let mut data = Vec::with_capacity(8 * 32);
+        let mut data = Vec::with_capacity(9 * 32);
         data.extend_from_slice(&self.wallets.root());
         data.extend_from_slice(&self.identities.root());
         data.extend_from_slice(&self.compliance.root());
@@ -145,7 +259,23 @@ impl GlobalState {
         data.extend_from_slice(&self.stp.root());
         data.extend_from_slice(&self.applications.root());
         data.extend_from_slice(&self.swaps.root());
+        data.extend_from_slice(&self.nonces_hash());
         hash_with_domain(DOMAIN_BLOCK, &data)
+    }
+
+    /// R11: Compute a deterministic hash of all account nonces.
+    /// This ensures the nonce map is committed to in the state root,
+    /// preventing state forgery attacks that reset nonces.
+    fn nonces_hash(&self) -> Hash {
+        if self.nonces.is_empty() {
+            return ZERO_HASH;
+        }
+        let mut buf = Vec::new();
+        for (account_id, nonce) in &self.nonces {
+            buf.extend_from_slice(account_id);
+            buf.extend_from_slice(&nonce.to_le_bytes());
+        }
+        hash_with_domain(DOMAIN_BLOCK, &buf)
     }
 
     // -----------------------------------------------------------------------
@@ -245,6 +375,20 @@ impl GlobalState {
 
     pub fn remove_swap(&mut self, swap_id: &Hash) {
         self.swaps.delete(swap_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Nonce accessors
+    // -----------------------------------------------------------------------
+
+    /// Get the current nonce for an account (0 if never seen).
+    pub fn get_nonce(&self, account_id: &AccountId) -> Nonce {
+        self.nonces.get(account_id).copied().unwrap_or(0)
+    }
+
+    /// Set the nonce for an account.
+    pub fn set_nonce(&mut self, account_id: AccountId, nonce: Nonce) {
+        self.nonces.insert(account_id, nonce);
     }
 }
 

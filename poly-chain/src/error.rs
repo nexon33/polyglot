@@ -60,6 +60,36 @@ pub enum ChainError {
     #[error("invalid hash preimage")]
     InvalidPreimage,
 
+    #[error("self-transfer not allowed")]
+    SelfTransfer,
+
+    #[error("zero amount transfer")]
+    ZeroAmount,
+
+    #[error("invalid timestamp: outside acceptable drift window")]
+    InvalidTimestamp,
+
+    #[error("block height overflow")]
+    BlockHeightOverflow,
+
+    #[error("nonce overflow: account nonce would exceed u64::MAX")]
+    NonceOverflow,
+
+    #[error("backup too large: {size} bytes (max {max})")]
+    BackupTooLarge { size: usize, max: usize },
+
+    #[error("invalid swap ID derivation")]
+    InvalidSwapId,
+
+    #[error("unauthorized STP action: {0}")]
+    UnauthorizedSTPAction(String),
+
+    #[error("duplicate fraud evidence: {0}")]
+    DuplicateFraudEvidence(String),
+
+    #[error("duplicate STP contract: official already has a registered contract")]
+    DuplicateSTPContract,
+
     #[error("proof system error: {0}")]
     ProofSystem(#[from] poly_verified::error::ProofSystemError),
 }

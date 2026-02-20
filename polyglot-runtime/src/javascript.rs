@@ -4,7 +4,7 @@
 //! No Node.js or browser required - fully self-contained!
 
 use crate::{PolyglotError, Result};
-use boa_engine::{Context, JsValue, Source};
+use boa_engine::{Context, Source};
 
 /// JavaScript runtime wrapper (uses embedded Boa engine)
 pub struct JsRuntime;

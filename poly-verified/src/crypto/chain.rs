@@ -17,9 +17,16 @@ impl HashChain {
     }
 
     /// Append a state hash: tip := hash_chain_step(tip, state_hash).
+    ///
+    /// [V11-03 FIX] Uses checked_add to prevent u64 overflow. Panics on
+    /// overflow rather than silently wrapping to 0, which would break
+    /// the step_count == checkpoints.len() invariant in proof verification.
     pub fn append(&mut self, state_hash: &Hash) {
         self.tip = hash_chain_step(&self.tip, state_hash);
-        self.length += 1;
+        self.length = self
+            .length
+            .checked_add(1)
+            .expect("HashChain: length overflow (exceeded u64::MAX steps)");
     }
 }
 

@@ -111,7 +111,16 @@ pub fn mod_pow(mut base: i64, mut exp: u64, modulus: i64) -> i64 {
 
 /// Modular inverse via Fermat's little theorem: a^(-1) = a^(p-2) mod p.
 /// Only valid when p is prime and a ≢ 0 (mod p).
+///
+/// R6: Panics if `a ≡ 0 (mod p)` — zero has no modular inverse, and silently
+/// returning 0 would cause subtle correctness bugs in CRT reconstruction.
 pub fn mod_inv(a: i64, p: i64) -> i64 {
+    let a_mod = ((a as i128 % p as i128 + p as i128) % p as i128) as i64;
+    assert!(
+        a_mod != 0,
+        "mod_inv: a ≡ 0 (mod p) has no inverse (a={}, p={})",
+        a, p
+    );
     mod_pow(a, (p - 2) as u64, p)
 }
 

@@ -4,48 +4,47 @@
 //! disclosure from all modes, error handling, serialization roundtrips,
 //! and the full whitepaper §2.5 protocol flow.
 
+use sha2::{Digest, Sha256};
+
 use poly_client::encryption::{EncryptionBackend, MockCiphertext, MockEncryption};
 use poly_client::protocol::{InferRequest, InferResponse, Mode};
 use poly_client::PolyClient;
-use poly_verified::disclosure::verify_disclosure;
+use poly_verified::crypto::hash::hash_data;
+use poly_verified::disclosure::{disclosure_output_hash, verify_disclosure};
+use poly_verified::ivc::hash_ivc::HashIvc;
+use poly_verified::ivc::IvcBackend;
 use poly_verified::types::*;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn mock_proof() -> VerifiedProof {
-    VerifiedProof::Mock {
-        input_hash: ZERO_HASH,
-        output_hash: ZERO_HASH,
-        privacy_mode: PrivacyMode::Transparent,
+fn tokens_hash(tokens: &[u32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for &t in tokens {
+        hasher.update(t.to_le_bytes());
     }
+    hasher.finalize().into()
+}
+/// Build a valid HashIvc proof for given tokens (transparent mode).
+fn hash_ivc_proof_for(tokens: &[u32]) -> VerifiedProof {
+    hash_ivc_proof_with_mode_for(tokens, PrivacyMode::Transparent)
 }
 
-fn hash_ivc_proof() -> VerifiedProof {
-    VerifiedProof::HashIvc {
-        chain_tip: [0x01; 32],
-        merkle_root: [0x02; 32],
-        step_count: 1,
-        code_hash: [0x03; 32],
-        privacy_mode: PrivacyMode::Transparent,
-        blinding_commitment: None,
-    }
-}
-
-fn hash_ivc_proof_with_mode(mode: PrivacyMode) -> VerifiedProof {
-    VerifiedProof::HashIvc {
-        chain_tip: [0x01; 32],
-        merkle_root: [0x02; 32],
-        step_count: 1,
-        code_hash: [0x03; 32],
-        privacy_mode: mode,
-        blinding_commitment: if mode == PrivacyMode::Transparent {
-            None
-        } else {
-            Some([0x04; 32])
-        },
-    }
+/// Build a valid HashIvc proof for given tokens with specified privacy mode.
+fn hash_ivc_proof_with_mode_for(tokens: &[u32], mode: PrivacyMode) -> VerifiedProof {
+    let ivc = HashIvc;
+    let code_hash = [0x03; 32];
+    let mut acc = ivc.init(&code_hash, mode);
+    let witness = StepWitness {
+        state_before: hash_data(b"before"),
+        state_after: hash_data(b"after"),
+        step_inputs: hash_data(b"inputs"),
+    };
+    ivc.fold_step(&mut acc, &witness).unwrap();
+    acc.input_hash = ZERO_HASH;
+    acc.output_hash = disclosure_output_hash(tokens);
+    ivc.finalize(acc).unwrap()
 }
 
 fn mock_server_response(output_tokens: &[u32], proof: VerifiedProof) -> InferResponse {
@@ -74,7 +73,7 @@ fn protocol_flow_transparent_mode() {
     assert_eq!(req.model_id, "Qwen/Qwen3-0.6B");
 
     let output = vec![1, 2, 3, 10, 20, 30];
-    let resp = mock_server_response(&output, hash_ivc_proof_with_mode(PrivacyMode::Transparent));
+    let resp = mock_server_response(&output, hash_ivc_proof_with_mode_for(&output, PrivacyMode::Transparent));
     let verified = client.process_response(&resp);
 
     assert_eq!(verified.token_ids, output);
@@ -89,7 +88,7 @@ fn protocol_flow_private_proven_mode() {
 
     let resp = mock_server_response(
         &[100, 200, 300],
-        hash_ivc_proof_with_mode(PrivacyMode::PrivateInputs),
+        hash_ivc_proof_with_mode_for(&[100, 200, 300], PrivacyMode::PrivateInputs),
     );
     let verified = client.process_response(&resp);
     assert_eq!(verified.token_ids, vec![100, 200, 300]);
@@ -104,7 +103,7 @@ fn protocol_flow_private_mode() {
 
     let resp = mock_server_response(
         &[50, 51, 52, 53],
-        hash_ivc_proof_with_mode(PrivacyMode::Private),
+        hash_ivc_proof_with_mode_for(&[50, 51, 52, 53], PrivacyMode::Private),
     );
     let verified = client.process_response(&resp);
     assert_eq!(verified.token_ids, vec![50, 51, 52, 53]);
@@ -122,7 +121,7 @@ fn protocol_flow_encrypted_mode() {
     // In encrypted mode, the server works on ciphertext
     let resp = mock_server_response(
         &[1, 2, 3, 4, 5, 10, 20, 30],
-        hash_ivc_proof_with_mode(PrivacyMode::Private),
+        hash_ivc_proof_with_mode_for(&[1, 2, 3, 4, 5, 10, 20, 30], PrivacyMode::Private),
     );
     let verified = client.process_response(&resp);
     assert_eq!(verified.token_ids.len(), 8);
@@ -137,7 +136,7 @@ fn protocol_flow_encrypted_mode() {
 fn disclosure_from_transparent_response() {
     let client = PolyClient::new("model", Mode::Transparent, MockEncryption);
     let output = vec![100, 200, 300, 400, 500];
-    let resp = mock_server_response(&output, hash_ivc_proof());
+    let resp = mock_server_response(&output, hash_ivc_proof_for(&output));
     let verified = client.process_response(&resp);
 
     let disclosure = verified.disclose(&[1, 3]).unwrap();
@@ -150,7 +149,7 @@ fn disclosure_from_transparent_response() {
 fn disclosure_from_private_response() {
     let client = PolyClient::new("model", Mode::Private, MockEncryption);
     let output: Vec<u32> = (0..10).collect();
-    let resp = mock_server_response(&output, hash_ivc_proof_with_mode(PrivacyMode::Private));
+    let resp = mock_server_response(&output, hash_ivc_proof_with_mode_for(&output, PrivacyMode::Private));
     let verified = client.process_response(&resp);
 
     // Pharmacist sees tokens 2..5
@@ -171,7 +170,7 @@ fn disclosure_from_private_response() {
 fn disclosure_from_encrypted_response() {
     let client = PolyClient::new("model", Mode::Encrypted, MockEncryption);
     let output: Vec<u32> = (0..20).collect();
-    let resp = mock_server_response(&output, hash_ivc_proof());
+    let resp = mock_server_response(&output, hash_ivc_proof_for(&output));
     let verified = client.process_response(&resp);
 
     let full = verified.disclose(&(0..20).collect::<Vec<_>>()).unwrap();
@@ -193,7 +192,7 @@ fn disclosure_from_encrypted_response() {
 #[test]
 fn process_empty_response() {
     let client = PolyClient::new("model", Mode::Transparent, MockEncryption);
-    let resp = mock_server_response(&[], hash_ivc_proof());
+    let resp = mock_server_response(&[], hash_ivc_proof_for(&[]));
     let verified = client.process_response(&resp);
 
     assert_eq!(verified.token_ids.len(), 0);
@@ -203,20 +202,21 @@ fn process_empty_response() {
 #[test]
 fn disclosure_from_empty_response() {
     let client = PolyClient::new("model", Mode::Transparent, MockEncryption);
-    let resp = mock_server_response(&[], hash_ivc_proof());
+    let resp = mock_server_response(&[], hash_ivc_proof_for(&[]));
     let verified = client.process_response(&resp);
 
     // Empty disclosure from empty output
     let disclosure = verified.disclose(&[]).unwrap();
     assert_eq!(disclosure.total_tokens, 0);
     assert_eq!(disclosure.proofs.len(), 0);
-    assert!(verify_disclosure(&disclosure));
+    // R6-V6-07: 0-token disclosures are now correctly rejected by verify_disclosure
+    assert!(!verify_disclosure(&disclosure));
 }
 
 #[test]
 fn disclosure_from_empty_response_out_of_bounds() {
     let client = PolyClient::new("model", Mode::Transparent, MockEncryption);
-    let resp = mock_server_response(&[], hash_ivc_proof());
+    let resp = mock_server_response(&[], hash_ivc_proof_for(&[]));
     let verified = client.process_response(&resp);
 
     // Any index is out of bounds on an empty output
@@ -226,7 +226,7 @@ fn disclosure_from_empty_response_out_of_bounds() {
 #[test]
 fn single_token_response() {
     let client = PolyClient::new("model", Mode::Encrypted, MockEncryption);
-    let resp = mock_server_response(&[42], hash_ivc_proof());
+    let resp = mock_server_response(&[42], hash_ivc_proof_for(&[42]));
     let verified = client.process_response(&resp);
 
     assert_eq!(verified.token_ids, vec![42]);
@@ -249,12 +249,12 @@ fn sequential_inferences_independent() {
 
     // First inference
     let req1 = client.prepare_request(&[1, 2, 3], 50, 700, 42);
-    let resp1 = mock_server_response(&[10, 20, 30], hash_ivc_proof());
+    let resp1 = mock_server_response(&[10, 20, 30], hash_ivc_proof_for(&[10, 20, 30]));
     let v1 = client.process_response(&resp1);
 
     // Second inference (different prompt)
     let req2 = client.prepare_request(&[4, 5, 6], 50, 700, 43);
-    let resp2 = mock_server_response(&[40, 50, 60], hash_ivc_proof());
+    let resp2 = mock_server_response(&[40, 50, 60], hash_ivc_proof_for(&[40, 50, 60]));
     let v2 = client.process_response(&resp2);
 
     // Both valid independently
@@ -307,7 +307,7 @@ fn infer_request_roundtrip_all_modes() {
 
 #[test]
 fn infer_response_roundtrip() {
-    let resp = mock_server_response(&[100, 200, 300], hash_ivc_proof());
+    let resp = mock_server_response(&[100, 200, 300], hash_ivc_proof_for(&[100, 200, 300]));
     let json = serde_json::to_string(&resp).unwrap();
     let resp2: InferResponse = serde_json::from_str(&json).unwrap();
 
@@ -325,7 +325,7 @@ fn mock_encryption_large_input() {
     let (pk, sk) = backend.keygen();
 
     let large_input: Vec<u32> = (0..10_000).collect();
-    let ct = backend.encrypt(&large_input, &pk);
+    let ct = backend.encrypt(&large_input, &pk, &sk);
     let decrypted = backend.decrypt(&ct, &sk);
 
     assert_eq!(large_input, decrypted);
@@ -343,10 +343,10 @@ fn mock_encryption_keys_are_deterministic() {
 #[test]
 fn mock_encryption_ciphertext_is_json_stable() {
     let backend = MockEncryption;
-    let (pk, _sk) = backend.keygen();
+    let (pk, sk) = backend.keygen();
 
-    let ct1 = backend.encrypt(&[1, 2, 3], &pk);
-    let ct2 = backend.encrypt(&[1, 2, 3], &pk);
+    let ct1 = backend.encrypt(&[1, 2, 3], &pk, &sk);
+    let ct2 = backend.encrypt(&[1, 2, 3], &pk, &sk);
 
     let json1 = serde_json::to_string(&ct1).unwrap();
     let json2 = serde_json::to_string(&ct2).unwrap();
@@ -383,20 +383,13 @@ fn only_encrypted_mode_requires_encryption() {
 // Proof type handling
 // ---------------------------------------------------------------------------
 
-#[test]
-fn process_response_with_mock_proof() {
-    let client = PolyClient::new("model", Mode::Transparent, MockEncryption);
-    let resp = mock_server_response(&[10, 20, 30], mock_proof());
-    let verified = client.process_response(&resp);
-
-    assert!(verified.is_verified());
-    assert_eq!(verified.token_ids, vec![10, 20, 30]);
-}
+// NOTE: process_response_with_mock_proof removed — Mock proofs are correctly
+// rejected by __macro_new's guard in non-test builds (poly-verified feature="mock").
 
 #[test]
 fn process_response_with_hash_ivc_proof() {
     let client = PolyClient::new("model", Mode::Private, MockEncryption);
-    let resp = mock_server_response(&[10, 20, 30], hash_ivc_proof());
+    let resp = mock_server_response(&[10, 20, 30], hash_ivc_proof_for(&[10, 20, 30]));
     let verified = client.process_response(&resp);
 
     assert!(verified.is_verified());
@@ -414,7 +407,7 @@ fn process_response_with_hash_ivc_proof() {
 fn large_response_with_selective_disclosure() {
     let client = PolyClient::new("model", Mode::Encrypted, MockEncryption);
     let large_output: Vec<u32> = (0..2000).collect();
-    let resp = mock_server_response(&large_output, hash_ivc_proof());
+    let resp = mock_server_response(&large_output, hash_ivc_proof_for(&large_output));
     let verified = client.process_response(&resp);
 
     assert_eq!(verified.token_ids.len(), 2000);

@@ -23,11 +23,24 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::hash::hash_leaf;
+use sha2::{Digest, Sha256};
+
+use crate::crypto::hash::{hash_combine, hash_leaf};
 use crate::crypto::merkle::{self, MerkleTree};
 use crate::error::{ProofSystemError, Result};
-use crate::types::{Hash, MerkleProof, VerifiedProof, ZERO_HASH};
+use crate::ivc::hash_ivc::HashIvc;
+use crate::ivc::IvcBackend;
+use crate::types::{hash_eq, Hash, MerkleProof, VerifiedProof, ZERO_HASH};
 use crate::verified_type::Verified;
+
+/// Compute SHA-256 of raw token bytes for I/O binding.
+fn tokens_hash(tokens: &[u32]) -> Hash {
+    let mut hasher = Sha256::new();
+    for &t in tokens {
+        hasher.update(t.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
 
 /// A single token position in a disclosure — either revealed or redacted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,11 +86,29 @@ pub struct Disclosure {
     pub total_tokens: usize,
     /// The execution proof from `#[verified]` — proves genuine computation.
     pub execution_proof: VerifiedProof,
+    /// SHA-256 hash binding the output tokens to the execution proof.
+    /// Must match the execution proof's `output_hash` to prevent proof detachment.
+    pub output_binding: Hash,
 }
 
 /// Hash a token ID into a Merkle leaf.
-fn token_leaf(token_id: u32) -> Hash {
+pub fn token_leaf(token_id: u32) -> Hash {
     hash_leaf(&token_id.to_le_bytes())
+}
+
+/// Compute the combined output hash for disclosure proofs.
+///
+/// [V14-02 FIX] The output hash binds both the raw token content (via tokens_hash)
+/// AND the Merkle tree structure of token leaves (via output_root). This prevents
+/// cross-disclosure splicing where an attacker takes redacted leaf hashes from one
+/// disclosure and an execution_proof from a different one.
+///
+/// The combined output hash is: `hash_combine(tokens_hash(tokens), token_merkle_root)`
+pub fn disclosure_output_hash(tokens: &[u32]) -> Hash {
+    let raw_hash = tokens_hash(tokens);
+    let leaves: Vec<Hash> = tokens.iter().map(|&t| token_leaf(t)).collect();
+    let tree = MerkleTree::build(&leaves);
+    hash_combine(&raw_hash, &tree.root)
 }
 
 /// Create a selective disclosure from a verified output.
@@ -136,12 +167,22 @@ pub fn create_disclosure(
         }
     }
 
+    // [V14-02 FIX] output_binding stores the raw tokens_hash. The execution
+    // proof's output_hash must be hash_combine(tokens_hash, token_merkle_root).
+    // During verification, we recompute hash_combine(output_binding, reconstructed_root)
+    // and check it matches the execution_proof's output_hash. This prevents
+    // cross-disclosure splicing: an attacker using A's leaf hashes (reconstructing
+    // A's Merkle root) with B's execution_proof (committed to B's Merkle root)
+    // produces hash_combine(B_tokens_hash, A_root) != hash_combine(B_tokens_hash, B_root).
+    let output_binding = tokens_hash(tokens);
+
     Ok(Disclosure {
         tokens: disclosed_tokens,
         proofs,
         output_root: tree.root,
         total_tokens,
         execution_proof: verified.proof().clone(),
+        output_binding,
     })
 }
 
@@ -170,6 +211,12 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
         return false;
     }
 
+    // A disclosure with zero tokens is structurally invalid.
+    // There must be at least one token to form a meaningful disclosure.
+    if disclosure.total_tokens == 0 {
+        return false;
+    }
+
     // Check sequential indices (no gaps, no reordering)
     for (expected_idx, token) in disclosure.tokens.iter().enumerate() {
         if token.index() != expected_idx {
@@ -177,9 +224,11 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
         }
     }
 
-    // Verify each revealed token against its Merkle proof
+    // Collect ALL leaf hashes (revealed = recomputed from token, redacted = as-provided)
+    // and verify each revealed token against its Merkle proof.
+    let mut all_leaves: Vec<Hash> = Vec::with_capacity(disclosure.total_tokens);
     let mut proof_idx = 0;
-    for token in &disclosure.tokens {
+    for (position, token) in disclosure.tokens.iter().enumerate() {
         match token {
             DisclosedToken::Revealed { token_id, .. } => {
                 if proof_idx >= disclosure.proofs.len() {
@@ -187,9 +236,17 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
                 }
                 let proof = &disclosure.proofs[proof_idx];
 
-                // Check leaf matches the token
+                // [V7-03 FIX] Check leaf_index matches the actual token position.
+                // Without this, an attacker could present a valid Merkle proof for
+                // position X while claiming it corresponds to position Y, allowing
+                // token position spoofing within a disclosure.
+                if proof.leaf_index != position as u64 {
+                    return false;
+                }
+
+                // Check leaf matches the token (constant-time)
                 let expected_leaf = token_leaf(*token_id);
-                if proof.leaf != expected_leaf {
+                if !hash_eq(&proof.leaf, &expected_leaf) {
                     return false;
                 }
 
@@ -198,18 +255,20 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
                     return false;
                 }
 
-                // Check proof root matches disclosure root
-                if proof.root != disclosure.output_root {
+                // Check proof root matches disclosure root (constant-time)
+                if !hash_eq(&proof.root, &disclosure.output_root) {
                     return false;
                 }
 
+                all_leaves.push(expected_leaf);
                 proof_idx += 1;
             }
             DisclosedToken::Redacted { leaf_hash, .. } => {
-                // Redacted positions must have a real commitment
-                if *leaf_hash == ZERO_HASH {
+                // Redacted positions must have a real commitment (constant-time)
+                if hash_eq(leaf_hash, &ZERO_HASH) {
                     return false;
                 }
+                all_leaves.push(*leaf_hash);
             }
         }
     }
@@ -219,35 +278,121 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
         return false;
     }
 
-    // Execution proof structural check
+    // [V5-03 FIX] Reconstruct the Merkle tree from ALL leaves and verify the
+    // root matches the disclosure's output_root. This ensures redacted leaf
+    // hashes are genuine (they must be the correct leaves to produce the
+    // committed root). Without this check, an attacker could substitute
+    // arbitrary non-zero hashes for redacted positions.
+    if !all_leaves.is_empty() {
+        let reconstructed = MerkleTree::build(&all_leaves);
+        if !hash_eq(&reconstructed.root, &disclosure.output_root) {
+            return false;
+        }
+    }
+
+    // [V10-02 FIX] When ALL tokens are revealed (no redacted positions),
+    // recompute tokens_hash from the revealed values and verify it matches
+    // the output_binding. This prevents cross-disclosure splicing where an
+    // attacker pairs execution_proof+output_binding from disclosure A with
+    // tokens+proofs+output_root from disclosure B. Without this check,
+    // both the Merkle reconstruction (against B's root) and the output_binding
+    // check (against A's proof) pass independently, but they are derived from
+    // different token sets.
+    //
+    // For partial disclosures (with redacted tokens), we cannot recompute
+    // tokens_hash because the raw values of redacted tokens are unknown.
+    // In that case the Merkle root binding provides the primary integrity
+    // guarantee: the redacted leaf hashes must be genuine to reconstruct
+    // the committed root.
+    let all_revealed = disclosure.tokens.iter().all(|t| matches!(t, DisclosedToken::Revealed { .. }));
+    if all_revealed {
+        let revealed_tokens: Vec<u32> = disclosure.tokens.iter().map(|t| {
+            match t {
+                DisclosedToken::Revealed { token_id, .. } => *token_id,
+                _ => unreachable!(), // we just checked all_revealed
+            }
+        }).collect();
+        // [V14-02 FIX] output_binding is the raw tokens_hash. Recompute it
+        // from the revealed tokens for the all-revealed cross-check.
+        let recomputed_binding = tokens_hash(&revealed_tokens);
+        if !hash_eq(&recomputed_binding, &disclosure.output_binding) {
+            return false;
+        }
+    }
+
+    // Verify output binding: disclosure must be tied to the execution proof
     match &disclosure.execution_proof {
-        VerifiedProof::HashIvc { step_count, .. } => *step_count > 0,
-        VerifiedProof::Mock { .. } => true,
+        VerifiedProof::HashIvc {
+            step_count,
+            input_hash,
+            output_hash,
+            ..
+        } => {
+            if *step_count == 0 {
+                return false;
+            }
+            // [V14-02 FIX] The execution proof's output_hash must equal
+            // hash_combine(output_binding, output_root). This cryptographically
+            // binds the disclosure's Merkle tree (output_root) to the execution
+            // proof. An attacker splicing A's leaf hashes (A's output_root) with
+            // B's execution_proof (B's output_hash committed to B's root) fails
+            // because hash_combine(B_tokens_hash, A_root) != B_output_hash.
+            let bound_output = hash_combine(&disclosure.output_binding, &disclosure.output_root);
+            if !hash_eq(&bound_output, output_hash) {
+                return false;
+            }
+            // Verify the cryptographic chain integrity (chain_tip, merkle_root,
+            // checkpoints, blinding commitment). Without this, an attacker could
+            // fabricate a proof with correct output_hash but invalid chain.
+            let ivc = HashIvc;
+            match ivc.verify(&disclosure.execution_proof, input_hash, output_hash) {
+                Ok(true) => true,
+                _ => false,
+            }
+        }
+        VerifiedProof::Mock { output_hash, .. } => {
+            // [V14-02 FIX] Same binding check as HashIvc: the combined
+            // hash_combine(output_binding, output_root) must match output_hash.
+            let bound_output = hash_combine(&disclosure.output_binding, &disclosure.output_root);
+            if !hash_eq(&bound_output, output_hash) {
+                return false;
+            }
+            true
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PrivacyMode, ZERO_HASH};
+    use crate::crypto::hash::hash_data;
+    use crate::ivc::hash_ivc::HashIvc;
+    use crate::ivc::IvcBackend;
+    use crate::types::{PrivacyMode, StepWitness, ZERO_HASH};
 
-    fn mock_proof() -> VerifiedProof {
+    fn mock_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
         VerifiedProof::Mock {
             input_hash: ZERO_HASH,
-            output_hash: ZERO_HASH,
+            output_hash: disclosure_output_hash(tokens),
             privacy_mode: PrivacyMode::Transparent,
         }
     }
 
-    fn mock_hash_ivc_proof() -> VerifiedProof {
-        VerifiedProof::HashIvc {
-            chain_tip: [0x01; 32],
-            merkle_root: [0x02; 32],
-            step_count: 1,
-            code_hash: [0x03; 32],
-            privacy_mode: PrivacyMode::Transparent,
-            blinding_commitment: None,
-        }
+    /// Build a valid HashIvc proof whose output_hash matches the given tokens.
+    fn valid_hash_ivc_proof_for_tokens(tokens: &[u32]) -> VerifiedProof {
+        let ivc = HashIvc;
+        let code_hash = [0x03; 32];
+        let mut acc = ivc.init(&code_hash, PrivacyMode::Transparent);
+        let witness = StepWitness {
+            state_before: hash_data(b"before"),
+            state_after: hash_data(b"after"),
+            step_inputs: hash_data(b"inputs"),
+        };
+        ivc.fold_step(&mut acc, &witness).unwrap();
+        // [V14-02 FIX] Patch I/O hashes to include token Merkle root binding
+        acc.input_hash = ZERO_HASH;
+        acc.output_hash = disclosure_output_hash(tokens);
+        ivc.finalize(acc).unwrap()
     }
 
     fn sample_tokens() -> Vec<u32> {
@@ -255,7 +400,8 @@ mod tests {
     }
 
     fn make_verified(tokens: Vec<u32>) -> Verified<Vec<u32>> {
-        Verified::__macro_new(tokens, mock_hash_ivc_proof())
+        let proof = valid_hash_ivc_proof_for_tokens(&tokens);
+        Verified::__macro_new(tokens, proof)
     }
 
     // ── Happy path tests ──────────────────────────────────────────────
@@ -494,7 +640,8 @@ mod tests {
 
     #[test]
     fn test_mock_proof_passes_verification() {
-        let verified = Verified::__macro_new(sample_tokens(), mock_proof());
+        let tokens = sample_tokens();
+        let verified = Verified::__macro_new(tokens.clone(), mock_proof_for_tokens(&tokens));
         let disclosure = create_disclosure(&verified, &[0, 1]).unwrap();
         assert!(verify_disclosure(&disclosure));
     }

@@ -52,7 +52,10 @@ fn add_mock(a: u64, b: u64) -> u64 {
 fn test_verified_mock_backend() {
     let result = add_mock(10, 20);
     assert_eq!(*result.value(), 30);
-    assert!(result.is_verified());
+    // R7-V7-08: Mock proofs are rejected by is_verified() in production builds.
+    // poly-verified is compiled as a regular dependency here (not in test mode),
+    // so cfg!(test) inside poly-verified is false.
+    assert!(!result.is_verified());
 
     match result.proof() {
         VerifiedProof::Mock { privacy_mode, .. } => {
@@ -184,8 +187,14 @@ fn test_verify_proof_via_backend() {
     let result = add_scores(42, 58);
     let backend = poly_verified::ivc::hash_ivc::HashIvc;
 
+    // Extract the proof's committed I/O hashes for verification
+    let (input_hash, output_hash) = match result.proof() {
+        VerifiedProof::HashIvc { input_hash, output_hash, .. } => (*input_hash, *output_hash),
+        _ => panic!("expected HashIvc proof"),
+    };
+
     let ok = backend
-        .verify(result.proof(), &[0u8; 32], &[0u8; 32])
+        .verify(result.proof(), &input_hash, &output_hash)
         .expect("verification should not error");
     assert!(ok, "proof should verify");
 }

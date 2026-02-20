@@ -1,5 +1,6 @@
 use crate::interface::parser::InterfaceItem;
 use crate::types::{FunctionSig, Param, WitType};
+use log::{debug, warn};
 use regex::Regex;
 
 use std::collections::HashMap;
@@ -376,15 +377,14 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
         let content = &source[open_pos + 1..pos - 1];
         Some((content.to_string(), pos))
     } else {
-        eprintln!("  → depth={}, opens={}, closes={} (diff={})",
+        debug!("Brace matching failed: depth={}, opens={}, closes={} (diff={})",
             depth, open_count, close_count, open_count as i64 - close_count as i64);
-        eprintln!("  → in_double={}, in_template={}, in_line_comment={}", 
+        debug!("  in_double={}, in_template={}, in_line_comment={}",
             in_double_string, in_template, in_line_comment);
         // Show unmatched brace positions
         for brace_pos in brace_stack.iter().take(5) {
             let line = source[..=*brace_pos].matches('\n').count() + 1;
             let start = brace_pos.saturating_sub(20);
-            // Find valid UTF-8 boundary
             let mut safe_start = start;
             while safe_start > 0 && !source.is_char_boundary(safe_start) {
                 safe_start -= 1;
@@ -395,7 +395,7 @@ fn find_matching_brace(source: &str, open_pos: usize) -> Option<(String, usize)>
                 safe_end += 1;
             }
             let context = &source[safe_start..safe_end];
-            eprintln!("  → Unmatched {{ at line {}: {:?}", line, context.replace('\n', "↵"));
+            debug!("  Unmatched {{ at line {}: {:?}", line, context.replace('\n', "↵"));
         }
         None
     }
@@ -613,7 +613,7 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
                 code_start_line,
             });
         } else {
-            eprintln!("⚠️  Block [{}] FAILED brace matching at position {}", lang, m.end() - 1);
+            warn!("Block [{}] failed brace matching at position {}", lang, m.end() - 1);
         }
     }
 
@@ -665,8 +665,8 @@ pub fn parse_poly(source: &str) -> Result<ParsedFile, ParseError> {
         let start_line = source[..m.start()].lines().count();
 
         // For now, just record these as warnings - syntax is reserved but not implemented
-        eprintln!(
-            "⚠️ Line {}: Expression syntax `{}!{{}}` is reserved but not yet implemented. Use block syntax `{} {{}}` for now.",
+        warn!(
+            "Line {}: Expression syntax `{}!{{}}` is reserved but not yet implemented. Use block syntax `{} {{}}` for now.",
             start_line, lang, lang
         );
     }

@@ -196,6 +196,9 @@ mod tests {
             chunks: vec![(c0, c1)],
             token_count: 0,
             scale: DELTA,
+            auth_tag: None,
+            key_id: None,
+            nonce: None,
         }
     }
 

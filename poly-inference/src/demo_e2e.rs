@@ -9,9 +9,12 @@ use std::time::Instant;
 use poly_client::encryption::MockEncryption;
 use poly_client::protocol::{InferResponse, Mode};
 use poly_client::PolyClient;
+use poly_inference::compliance::default_policy;
 use poly_inference::http::HttpServer;
 use poly_inference::model;
-use poly_inference::server::{InferenceBackend, MockInferenceBackend, RealInferenceBackend};
+use poly_inference::server::{
+    ComplianceInferenceBackend, InferenceBackend, MockInferenceBackend, RealInferenceBackend,
+};
 use poly_verified::disclosure::verify_disclosure;
 use poly_verified::types::{PrivacyMode, VerifiedProof};
 
@@ -85,6 +88,14 @@ fn main() {
 
     run_http_flow(&input_ids, max_tokens);
 
+    // ── [7.5] Compliance-aware inference ───────────────────────────────
+    separator();
+    eprintln!("  PHASE 2.5: Compliance-Aware Inference (per-token proof gate)");
+    separator();
+    eprintln!();
+
+    run_compliance_flow(&input_ids, max_tokens);
+
     // ── [8] Mock backend (fast, for protocol demo) ──────────────────────
     separator();
     eprintln!("  PHASE 3: Mock Backend (no model, real proofs)");
@@ -100,18 +111,18 @@ fn main() {
     eprintln!();
 }
 
+/// R9: Use atomic counter instead of `static mut` which is undefined behavior
+/// in Rust. The previous code used `unsafe { static mut STEP }` which can cause
+/// data races if `run_client_server_flow` is ever called concurrently.
+static STEP_COUNTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(3);
+
 fn run_client_server_flow(
     label: &str,
     mode: Mode,
     input_ids: &[u32],
     max_tokens: u32,
 ) {
-    static mut STEP: u8 = 3;
-    let step = unsafe {
-        let s = STEP;
-        STEP += 1;
-        s
-    };
+    let step = STEP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     eprintln!("[{}/8] {} mode — full client-server flow", step, label);
     eprintln!();
@@ -276,6 +287,70 @@ fn run_mock_flow(input_ids: &[u32]) {
     eprintln!("  Mock proofs are real HashIvc — not hand-crafted values.");
 }
 
+fn run_compliance_flow(input_ids: &[u32], max_tokens: u32) {
+    eprintln!("[7.5/8] Compliance-aware generation — per-token proof gate");
+    eprintln!();
+
+    let policy = default_policy();
+    eprintln!("  Policy: v{}, {} blocked IDs, {} blocked n-grams, max {} tokens",
+        policy.version, policy.blocked_token_ids.len(),
+        policy.blocked_ngrams.len(), policy.max_sequence_length);
+    eprintln!();
+
+    // Use ComplianceInferenceBackend
+    let backend = ComplianceInferenceBackend::with_default_policy();
+    let client = PolyClient::new("Qwen/Qwen3-0.6B", Mode::Transparent, MockEncryption);
+    let req = client.prepare_request(input_ids, max_tokens, 700, 42);
+
+    eprint!("  [server] compliant infer()...");
+    let t = Instant::now();
+    let resp = backend.infer(&req).unwrap();
+    let elapsed = t.elapsed();
+    eprintln!(" done ({:.3}s)", elapsed.as_secs_f64());
+
+    // Process response
+    let result = client.process_response(&resp);
+    let total_tokens = result.token_ids.len();
+    let new_tokens = total_tokens - input_ids.len();
+    let decoded = model::decode(&result.token_ids);
+
+    eprintln!("  [client] {} new tokens ({:.1} tok/s)",
+        new_tokens, new_tokens as f64 / elapsed.as_secs_f64());
+    eprintln!("           Output: \"{}\"", decoded);
+    eprintln!();
+
+    // Show compliance proof
+    if let Some(compliance_proof) = backend.last_compliance_proof() {
+        let verified = compliance_proof.verify().unwrap_or(false);
+        eprintln!("  [compliance] IVC proof verified: {}", if verified { "PASS" } else { "FAIL" });
+        eprintln!("               Tokens checked:    {}", compliance_proof.total_tokens);
+        eprintln!("               Compliant:         {}", compliance_proof.compliant_tokens);
+        eprintln!("               All compliant:     {}", compliance_proof.all_compliant());
+        eprintln!("               Policy hash:       {}...",
+            &hex::encode(compliance_proof.policy_hash)[..16]);
+        eprintln!("               State hash:        {}...",
+            &hex::encode(compliance_proof.final_state_hash)[..16]);
+
+        // Show the underlying IVC proof structure
+        match &compliance_proof.ivc_proof {
+            VerifiedProof::HashIvc { chain_tip, merkle_root, step_count, .. } => {
+                eprintln!("               IVC chain tip:     {}...", &hex::encode(chain_tip)[..16]);
+                eprintln!("               IVC merkle root:   {}...", &hex::encode(merkle_root)[..16]);
+                eprintln!("               IVC steps:         {}", step_count);
+            }
+            _ => {}
+        }
+    } else {
+        eprintln!("  [compliance] No compliance proof available");
+    }
+    eprintln!();
+
+    // Also show the computation proof
+    eprintln!("  [computation proof]");
+    print_proof_summary("           ", &resp.proof);
+    eprintln!();
+}
+
 fn print_proof_summary(indent: &str, proof: &VerifiedProof) {
     match proof {
         VerifiedProof::HashIvc {
@@ -285,6 +360,7 @@ fn print_proof_summary(indent: &str, proof: &VerifiedProof) {
             code_hash,
             privacy_mode,
             blinding_commitment,
+            ..
         } => {
             eprintln!("{}Proof: HashIvc (quantum-resistant)", indent);
             eprintln!("{}  chain_tip:   {}...", indent, &hex::encode(chain_tip)[..16]);
@@ -300,7 +376,8 @@ fn print_proof_summary(indent: &str, proof: &VerifiedProof) {
                 eprintln!("{}  blinding:    {}...", indent, &hex::encode(bc)[..16]);
             }
         }
-        VerifiedProof::Mock { .. } => {
+        #[allow(unreachable_patterns)]
+        _ => {
             eprintln!("{}Proof: Mock", indent);
         }
     }

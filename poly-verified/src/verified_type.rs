@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::disclosure::{self, Disclosure};
 use crate::error::{self, VerifiedError};
@@ -14,7 +14,14 @@ use crate::types::{PrivacyMode, VerifiedProof};
 ///
 /// Every `Verified<T>` carries a `VerifiedProof` that any receiver can check
 /// in milliseconds without re-executing anything.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// # Security Note
+///
+/// `Verified<T>` intentionally does NOT implement `Deserialize`. Allowing
+/// arbitrary deserialization would let an attacker forge verified values by
+/// pairing arbitrary data with a stolen or replayed proof. Use
+/// [`Verified::to_transferable`] and [`Verified::from_transferable`] for
+/// safe serialization that validates the value-proof binding on reconstruction.
+#[derive(Clone, Debug, Serialize)]
 pub struct Verified<T> {
     value: T,
     proof: VerifiedProof,
@@ -25,6 +32,7 @@ impl<T> Verified<T> {
     ///
     /// This is `pub(crate)` — only the IVC proof system can create
     /// `Verified<T>` values. User code cannot call this.
+    #[allow(dead_code)]
     pub(crate) fn new_proven(value: T, proof: VerifiedProof) -> Self {
         Self { value, proof }
     }
@@ -36,6 +44,13 @@ impl<T> Verified<T> {
     /// to create `Verified<T>` values.
     #[doc(hidden)]
     pub fn __macro_new(value: T, proof: VerifiedProof) -> Self {
+        // In production builds, Mock variant doesn't exist (gated by cfg).
+        // In test/mock builds, reject Mock proofs via runtime check when
+        // the "mock" feature is enabled but we're not in a test context.
+        #[cfg(all(feature = "mock", not(test)))]
+        if matches!(&proof, VerifiedProof::Mock { .. }) {
+            panic!("Mock proofs are not allowed in production builds");
+        }
         Self { value, proof }
     }
 
@@ -56,11 +71,21 @@ impl<T> Verified<T> {
 
     /// Check whether this value carries a valid proof structure.
     /// For full cryptographic verification, use `verify_with_backend`.
+    ///
+    /// Mock proofs are only accepted when the `mock` feature is enabled
+    /// or in unit tests. In production builds without the `mock` feature,
+    /// `is_verified()` returns `false` for Mock proofs to prevent an
+    /// attacker from constructing a Verified<T> that claims to be verified
+    /// while carrying a trivially forgeable Mock proof.
     pub fn is_verified(&self) -> bool {
         // Structural check: proof is well-formed
         match &self.proof {
             VerifiedProof::HashIvc { step_count, .. } => *step_count > 0,
-            VerifiedProof::Mock { .. } => true,
+            VerifiedProof::Mock { .. } => {
+                // In test or mock-feature builds, accept Mock proofs.
+                // In production, reject them.
+                cfg!(any(test, feature = "mock"))
+            }
         }
     }
 
@@ -75,6 +100,9 @@ impl<T> Verified<T> {
     }
 
     /// Map the inner value while preserving the proof.
+    ///
+    /// The proof is carried through unchanged — the caller cannot forge
+    /// or alter it. Only the wrapped value is transformed.
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Verified<U> {
         Verified {
             value: f(self.value),

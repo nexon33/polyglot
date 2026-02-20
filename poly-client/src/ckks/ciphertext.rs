@@ -3,9 +3,19 @@
 //! A ciphertext is a pair (c0, c1) of polynomials in Z_q[X]/(X^N+1).
 //! Encryption: c0 = b·u + e1 + m, c1 = a·u + e2
 //! Decryption: m_noisy = c0 + c1·s ≈ m (noise << Δ/2)
+//!
+//! ## Authentication
+//!
+//! Ciphertexts include an `auth_tag` (SHA-256 over all ciphertext data + metadata),
+//! a `key_id` (SHA-256 hash of the encrypting public key), and a random `nonce`
+//! for replay protection. Use `verify_integrity()` to check before decrypting.
 
+use hmac::{Hmac, Mac};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 use super::encoding::{decode, encode};
 use super::keys::{CkksPublicKey, CkksSecretKey};
@@ -19,6 +29,9 @@ fn default_scale() -> i64 {
 
 /// A CKKS ciphertext encoding up to N token IDs.
 /// For sequences longer than N, multiple chunks are stored.
+///
+/// Includes authentication metadata: `auth_tag` for integrity,
+/// `key_id` for key binding, and `nonce` for replay protection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CkksCiphertext {
     /// Ciphertext polynomial pairs, one per chunk of N tokens.
@@ -30,18 +43,133 @@ pub struct CkksCiphertext {
     /// Decryption divides by this scale to recover the plaintext.
     #[serde(default = "default_scale")]
     pub scale: i64,
+    /// SHA-256 authentication tag over ciphertext + metadata.
+    /// Detects any tampering with ciphertext coefficients, token_count, or scale.
+    #[serde(default)]
+    pub auth_tag: Option<[u8; 32]>,
+    /// SHA-256 hash of the public key used for encryption.
+    /// Allows recipients to verify the ciphertext was encrypted for them.
+    #[serde(default)]
+    pub key_id: Option<[u8; 32]>,
+    /// Random nonce for replay protection.
+    /// Included in auth_tag computation to ensure ciphertext uniqueness.
+    #[serde(default)]
+    pub nonce: Option<[u8; 16]>,
+}
+
+/// Compute SHA-256 hash of a public key to create a key identifier.
+pub fn compute_key_id(pk: &CkksPublicKey) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hasher = Sha256::new();
+    hasher.update(b"ckks_key_id_v1");
+    for c in &pk.a.coeffs {
+        hasher.update(c.to_le_bytes());
+    }
+    for c in &pk.b.coeffs {
+        hasher.update(c.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+/// Compute HMAC-SHA256 authentication tag over ciphertext data + metadata.
+///
+/// Uses proper HMAC construction (not prefix-MAC) to prevent
+/// length-extension attacks on the Merkle-Damgard structure of SHA-256.
+fn compute_auth_tag(
+    chunks: &[(Poly, Poly)],
+    token_count: usize,
+    scale: i64,
+    nonce: &[u8; 16],
+    key_id: &[u8; 32],
+    mac_key: &[u8; 32],
+) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(mac_key)
+        .expect("HMAC accepts any key length");
+    mac.update(b"ckks_auth_v1");
+    mac.update(key_id);
+    mac.update(nonce);
+    mac.update(&(token_count as u64).to_le_bytes());
+    mac.update(&scale.to_le_bytes());
+    for (c0, c1) in chunks {
+        for c in &c0.coeffs {
+            mac.update(&c.to_le_bytes());
+        }
+        for c in &c1.coeffs {
+            mac.update(&c.to_le_bytes());
+        }
+    }
+    mac.finalize().into_bytes().into()
+}
+
+/// Constant-time comparison of two byte slices.
+///
+/// Returns `true` if the slices are equal, using bitwise OR accumulation
+/// to avoid timing side-channels that could leak partial tag information.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+impl CkksCiphertext {
+    /// Verify the integrity and authenticity of this ciphertext.
+    ///
+    /// Returns `true` if all authentication checks pass:
+    /// - `auth_tag` matches recomputed tag over ciphertext + metadata
+    /// - `key_id` matches the provided public key
+    ///
+    /// Returns `false` if any check fails (tampering detected) or if
+    /// authentication fields are missing (unauthenticated ciphertext).
+    ///
+    /// All comparisons use constant-time equality to prevent timing
+    /// side-channels from leaking partial tag or key-id information.
+    pub fn verify_integrity(&self, pk: &CkksPublicKey, mac_key: &[u8; 32]) -> bool {
+        let (Some(auth_tag), Some(key_id), Some(nonce)) =
+            (self.auth_tag, self.key_id, self.nonce)
+        else {
+            return false; // unauthenticated ciphertext
+        };
+
+        // Check key binding (constant-time)
+        let expected_key_id = compute_key_id(pk);
+        if !constant_time_eq(&key_id, &expected_key_id) {
+            return false;
+        }
+
+        // Check integrity (constant-time)
+        let expected_tag = compute_auth_tag(&self.chunks, self.token_count, self.scale, &nonce, &key_id, mac_key);
+        constant_time_eq(&auth_tag, &expected_tag)
+    }
 }
 
 /// Encrypt a sequence of token IDs under the given public key.
 ///
 /// Tokens are split into chunks of N, each encrypted independently.
 /// Empty input produces a ciphertext with zero chunks.
-pub fn encrypt<R: Rng>(tokens: &[u32], pk: &CkksPublicKey, rng: &mut R) -> CkksCiphertext {
+///
+/// The ciphertext includes authentication metadata: `auth_tag` for
+/// integrity verification, `key_id` for key binding, and a random
+/// `nonce` for replay protection.
+pub fn encrypt<R: Rng>(tokens: &[u32], pk: &CkksPublicKey, sk: &CkksSecretKey, rng: &mut R) -> CkksCiphertext {
+    let mac_key = super::keys::derive_mac_key(sk);
+    let key_id = compute_key_id(pk);
+    let mut nonce = [0u8; 16];
+    rng.fill(&mut nonce);
+
     if tokens.is_empty() {
+        let auth_tag = compute_auth_tag(&[], 0, DELTA, &nonce, &key_id, &mac_key);
         return CkksCiphertext {
             chunks: vec![],
             token_count: 0,
             scale: DELTA,
+            auth_tag: Some(auth_tag),
+            key_id: Some(key_id),
+            nonce: Some(nonce),
         };
     }
 
@@ -65,17 +193,42 @@ pub fn encrypt<R: Rng>(tokens: &[u32], pk: &CkksPublicKey, rng: &mut R) -> CkksC
         chunks.push((c0, c1));
     }
 
+    let token_count = tokens.len();
+    let auth_tag = compute_auth_tag(&chunks, token_count, DELTA, &nonce, &key_id, &mac_key);
+
     CkksCiphertext {
         chunks,
-        token_count: tokens.len(),
+        token_count,
         scale: DELTA,
+        auth_tag: Some(auth_tag),
+        key_id: Some(key_id),
+        nonce: Some(nonce),
     }
 }
 
 /// Decrypt a ciphertext using the secret key, recovering token IDs.
 ///
 /// For each chunk: m_noisy = c0 + c1·s, then decode coefficients back to u32.
+///
+/// If the ciphertext has an authentication tag, the MAC is verified
+/// automatically using the mac_key derived from the secret key. Tampered
+/// ciphertexts cause a panic. Use `decrypt_unchecked` to bypass this.
 pub fn decrypt(ct: &CkksCiphertext, sk: &CkksSecretKey) -> Vec<u32> {
+    // Enforce MAC verification if auth_tag is present
+    if let (Some(auth_tag), Some(nonce), Some(key_id)) = (ct.auth_tag, ct.nonce, ct.key_id) {
+        let mac_key = super::keys::derive_mac_key(sk);
+        let expected_tag = compute_auth_tag(&ct.chunks, ct.token_count, ct.scale, &nonce, &key_id, &mac_key);
+        assert!(
+            constant_time_eq(&auth_tag, &expected_tag),
+            "ciphertext integrity check failed: auth_tag mismatch (possible tampering)"
+        );
+    }
+
+    decrypt_unchecked(ct, sk)
+}
+
+/// Decrypt without integrity verification. For internal/testing use only.
+pub fn decrypt_unchecked(ct: &CkksCiphertext, sk: &CkksSecretKey) -> Vec<u32> {
     if ct.token_count == 0 {
         return vec![];
     }
@@ -111,8 +264,10 @@ mod tests {
     fn encrypt_decrypt_single_token() {
         let mut rng = test_rng();
         let (pk, sk) = keygen(&mut rng);
+        let mac_key = super::super::keys::derive_mac_key(&sk);
         let tokens = vec![42];
-        let ct = encrypt(&tokens, &pk, &mut rng);
+        let ct = encrypt(&tokens, &pk, &sk, &mut rng);
+        assert!(ct.verify_integrity(&pk, &mac_key));
         let decrypted = decrypt(&ct, &sk);
         assert_eq!(decrypted, tokens);
     }
@@ -121,8 +276,10 @@ mod tests {
     fn encrypt_decrypt_multiple_tokens() {
         let mut rng = test_rng();
         let (pk, sk) = keygen(&mut rng);
+        let mac_key = super::super::keys::derive_mac_key(&sk);
         let tokens = vec![100, 200, 300, 400, 500];
-        let ct = encrypt(&tokens, &pk, &mut rng);
+        let ct = encrypt(&tokens, &pk, &sk, &mut rng);
+        assert!(ct.verify_integrity(&pk, &mac_key));
         let decrypted = decrypt(&ct, &sk);
         assert_eq!(decrypted, tokens);
     }
@@ -131,10 +288,12 @@ mod tests {
     fn encrypt_decrypt_max_chunk() {
         let mut rng = test_rng();
         let (pk, sk) = keygen(&mut rng);
+        let mac_key = super::super::keys::derive_mac_key(&sk);
         // Exactly N tokens = one full chunk
         let tokens: Vec<u32> = (0..N as u32).collect();
-        let ct = encrypt(&tokens, &pk, &mut rng);
+        let ct = encrypt(&tokens, &pk, &sk, &mut rng);
         assert_eq!(ct.chunks.len(), 1);
+        assert!(ct.verify_integrity(&pk, &mac_key));
         let decrypted = decrypt(&ct, &sk);
         assert_eq!(decrypted, tokens);
     }
@@ -143,10 +302,12 @@ mod tests {
     fn encrypt_decrypt_multi_chunk() {
         let mut rng = test_rng();
         let (pk, sk) = keygen(&mut rng);
+        let mac_key = super::super::keys::derive_mac_key(&sk);
         // N+5 tokens = 2 chunks
         let tokens: Vec<u32> = (0..(N as u32 + 5)).collect();
-        let ct = encrypt(&tokens, &pk, &mut rng);
+        let ct = encrypt(&tokens, &pk, &sk, &mut rng);
         assert_eq!(ct.chunks.len(), 2);
+        assert!(ct.verify_integrity(&pk, &mac_key));
         let decrypted = decrypt(&ct, &sk);
         assert_eq!(decrypted, tokens);
     }
@@ -155,9 +316,11 @@ mod tests {
     fn encrypt_decrypt_empty() {
         let mut rng = test_rng();
         let (pk, sk) = keygen(&mut rng);
+        let mac_key = super::super::keys::derive_mac_key(&sk);
         let tokens: Vec<u32> = vec![];
-        let ct = encrypt(&tokens, &pk, &mut rng);
+        let ct = encrypt(&tokens, &pk, &sk, &mut rng);
         assert_eq!(ct.chunks.len(), 0);
+        assert!(ct.verify_integrity(&pk, &mac_key));
         let decrypted = decrypt(&ct, &sk);
         assert_eq!(decrypted, tokens);
     }
@@ -166,8 +329,10 @@ mod tests {
     fn encrypt_decrypt_large_values() {
         let mut rng = test_rng();
         let (pk, sk) = keygen(&mut rng);
+        let mac_key = super::super::keys::derive_mac_key(&sk);
         let tokens = vec![u32::MAX, u32::MAX - 1, 0, 1, 50000];
-        let ct = encrypt(&tokens, &pk, &mut rng);
+        let ct = encrypt(&tokens, &pk, &sk, &mut rng);
+        assert!(ct.verify_integrity(&pk, &mac_key));
         let decrypted = decrypt(&ct, &sk);
         assert_eq!(decrypted, tokens);
     }
@@ -176,13 +341,63 @@ mod tests {
     fn ciphertext_serialization_roundtrip() {
         let mut rng = test_rng();
         let (pk, sk) = keygen(&mut rng);
+        let mac_key = super::super::keys::derive_mac_key(&sk);
         let tokens = vec![10, 20, 30];
-        let ct = encrypt(&tokens, &pk, &mut rng);
+        let ct = encrypt(&tokens, &pk, &sk, &mut rng);
 
         let json = serde_json::to_string(&ct).unwrap();
         let ct2: CkksCiphertext = serde_json::from_str(&json).unwrap();
 
+        assert!(ct2.verify_integrity(&pk, &mac_key));
         let decrypted = decrypt(&ct2, &sk);
         assert_eq!(decrypted, tokens);
+    }
+
+    #[test]
+    fn auth_tag_present_after_encrypt() {
+        let mut rng = test_rng();
+        let (pk, sk) = keygen(&mut rng);
+        let ct = encrypt(&[1, 2, 3], &pk, &sk, &mut rng);
+        assert!(ct.auth_tag.is_some());
+        assert!(ct.key_id.is_some());
+        assert!(ct.nonce.is_some());
+    }
+
+    #[test]
+    fn verify_integrity_detects_token_count_tampering() {
+        let mut rng = test_rng();
+        let (pk, sk) = keygen(&mut rng);
+        let mac_key = super::super::keys::derive_mac_key(&sk);
+        let mut ct = encrypt(&[100, 200, 300], &pk, &sk, &mut rng);
+        assert!(ct.verify_integrity(&pk, &mac_key));
+
+        ct.token_count = 2;
+        assert!(!ct.verify_integrity(&pk, &mac_key));
+    }
+
+    #[test]
+    fn verify_integrity_detects_coefficient_tampering() {
+        let mut rng = test_rng();
+        let (pk, sk) = keygen(&mut rng);
+        let mac_key = super::super::keys::derive_mac_key(&sk);
+        let mut ct = encrypt(&[100, 200, 300], &pk, &sk, &mut rng);
+        assert!(ct.verify_integrity(&pk, &mac_key));
+
+        ct.chunks[0].0.coeffs[0] ^= 1;
+        assert!(!ct.verify_integrity(&pk, &mac_key));
+    }
+
+    #[test]
+    fn verify_integrity_detects_wrong_key() {
+        let mut rng1 = StdRng::seed_from_u64(1);
+        let mut rng2 = StdRng::seed_from_u64(2);
+        let (pk1, sk1) = keygen(&mut rng1);
+        let (pk2, sk2) = keygen(&mut rng2);
+        let mac_key1 = super::super::keys::derive_mac_key(&sk1);
+        let mac_key2 = super::super::keys::derive_mac_key(&sk2);
+
+        let ct = encrypt(&[42], &pk1, &sk1, &mut rng1);
+        assert!(ct.verify_integrity(&pk1, &mac_key1));
+        assert!(!ct.verify_integrity(&pk2, &mac_key2));
     }
 }

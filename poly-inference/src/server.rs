@@ -4,16 +4,20 @@
 //! client's `EncryptionBackend`. Two implementations:
 //!
 //! - `MockInferenceBackend` — predictable output, real HashIvc proofs, no model weights.
-//! - `RealInferenceBackend` — actual Qwen3-0.6B inference via Candle.
+//! - `RealInferenceBackend` — actual model inference via Candle (Qwen3, LLaMA/Nanbeige).
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 use poly_client::encryption::MockCiphertext;
 use poly_client::protocol::{InferRequest, InferResponse, Mode};
+use poly_verified::disclosure::disclosure_output_hash;
 use poly_verified::ivc::hash_ivc::HashIvc;
 use poly_verified::ivc::IvcBackend;
 use poly_verified::types::{PrivacyMode, StepWitness, VerifiedProof};
+
+use crate::compliance::{default_policy, ContentPolicy};
+use crate::compliance_proof::ComplianceProof;
 
 /// Server-side inference backend trait.
 ///
@@ -55,15 +59,19 @@ impl InferenceBackend for MockInferenceBackend {
         let input_tokens = &input_ct.tokens;
 
         // 2. Generate predictable output: input tokens + sequential new tokens
+        // R10: Use saturating arithmetic to prevent overflow panic when
+        // input_tokens.len() * 100 or seed exceeds u32::MAX.
         let mut output_tokens = input_tokens.clone();
-        let base = (input_tokens.len() as u32) * 100 + request.seed as u32;
+        let base = (input_tokens.len() as u32)
+            .saturating_mul(100)
+            .saturating_add(request.seed as u32);
         for i in 0..self.new_tokens {
-            output_tokens.push(base + i as u32);
+            output_tokens.push(base.saturating_add(i as u32));
         }
 
-        // 3. Create a real HashIvc proof
+        // 3. Create a real HashIvc proof with correct I/O binding
         let privacy = request.mode.to_privacy_mode();
-        let proof = create_proof(&output_tokens, privacy)?;
+        let proof = create_proof(input_tokens, &output_tokens, privacy)?;
 
         // 4. Re-encrypt output (MockEncryption: wrap in MockCiphertext)
         let output_ct = MockCiphertext {
@@ -140,6 +148,93 @@ impl InferenceBackend for RealInferenceBackend {
 }
 
 // ---------------------------------------------------------------------------
+// ComplianceInferenceBackend — real model + per-token compliance gate
+// ---------------------------------------------------------------------------
+
+/// Real inference with per-token compliance enforcement.
+///
+/// Wraps `RealInferenceBackend` with `generate_compliant()` — every token
+/// is checked against the content policy. If a token violates the policy,
+/// generation halts and the compliance proof records the violation.
+///
+/// The compliance proof is stored after each request and can be retrieved
+/// via `last_compliance_proof()`.
+///
+/// **R7 SAFETY NOTE:** The `last_proof` pattern stores only the most recent
+/// compliance proof. Under concurrent access, a caller may retrieve another
+/// request's proof (TOCTOU race). The HTTP server's `serve()` loop processes
+/// requests sequentially, but callers using `handle_one()` from multiple
+/// threads must be aware of this limitation. In production, the compliance
+/// proof should be keyed by a unique request identifier.
+pub struct ComplianceInferenceBackend {
+    policy: ContentPolicy,
+    last_proof: std::sync::Mutex<Option<ComplianceProof>>,
+}
+
+impl ComplianceInferenceBackend {
+    pub fn new(policy: ContentPolicy) -> Self {
+        Self {
+            policy,
+            last_proof: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn with_default_policy() -> Self {
+        Self::new(default_policy())
+    }
+
+    /// Retrieve the compliance proof from the most recent `infer()` call.
+    ///
+    /// R7: Recovers from poisoned mutex instead of panicking.
+    pub fn last_compliance_proof(&self) -> Option<ComplianceProof> {
+        self.last_proof.lock().unwrap_or_else(|e| {
+            eprintln!("WARN: recovering from poisoned last_proof mutex");
+            e.into_inner()
+        }).clone()
+    }
+}
+
+impl InferenceBackend for ComplianceInferenceBackend {
+    fn infer(&self, request: &InferRequest) -> Result<InferResponse> {
+        // 1. Decrypt input
+        let input_ct: MockCiphertext = serde_json::from_slice(&request.encrypted_input)?;
+        let input_tokens = input_ct.tokens;
+
+        // 2. Run compliant generation (halts on policy violation)
+        let (output_tokens, compliance_proof) = crate::inference::generate_compliant(
+            input_tokens.clone(),
+            request.max_tokens,
+            request.temperature,
+            request.seed,
+            self.policy.clone(),
+        );
+
+        // 3. Create computation proof with correct I/O binding
+        let privacy = request.mode.to_privacy_mode();
+        let proof = create_proof(&input_tokens, &output_tokens, privacy)?;
+
+        // 4. Store compliance proof for caller to retrieve
+        // R7: Recover from poisoned mutex instead of panicking
+        *self.last_proof.lock().unwrap_or_else(|e| {
+            eprintln!("WARN: recovering from poisoned last_proof mutex");
+            e.into_inner()
+        }) = Some(compliance_proof);
+
+        // 5. Re-encrypt output
+        let output_ct = MockCiphertext {
+            tokens: output_tokens,
+        };
+        let encrypted_output = serde_json::to_vec(&output_ct)?;
+
+        Ok(InferResponse {
+            encrypted_output,
+            proof,
+            model_id: request.model_id.clone(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -147,7 +242,7 @@ impl InferenceBackend for RealInferenceBackend {
 ///
 /// Uses SHA-256 of input/output tokens as state hashes, then runs the full
 /// HashIvc pipeline (init → fold_step → finalize).
-fn create_proof(output_tokens: &[u32], privacy: PrivacyMode) -> Result<VerifiedProof> {
+fn create_proof(input_tokens: &[u32], output_tokens: &[u32], privacy: PrivacyMode) -> Result<VerifiedProof> {
     let backend = HashIvc;
 
     // Code hash: identifies the inference function
@@ -155,8 +250,8 @@ fn create_proof(output_tokens: &[u32], privacy: PrivacyMode) -> Result<VerifiedP
 
     let mut acc = backend.init(&code_hash, privacy);
 
-    // Hash the input and output as state
-    let input_hash = sha256(&tokens_to_bytes(output_tokens));
+    // Hash input and output separately for correct I/O binding
+    let input_hash = sha256(&tokens_to_bytes(input_tokens));
     let output_hash = sha256(&tokens_to_bytes(output_tokens));
 
     let witness = StepWitness {
@@ -165,6 +260,12 @@ fn create_proof(output_tokens: &[u32], privacy: PrivacyMode) -> Result<VerifiedP
         step_inputs: input_hash,
     };
     backend.fold_step(&mut acc, &witness)?;
+
+    // Bind I/O hashes to the proof before finalize.
+    // [V14-02] output_hash must use disclosure_output_hash to bind both
+    // token content and Merkle tree structure, preventing cross-disclosure splicing.
+    acc.input_hash = input_hash;
+    acc.output_hash = disclosure_output_hash(output_tokens);
 
     let proof = backend.finalize(acc)?;
     Ok(proof)

@@ -41,6 +41,15 @@ impl BlockHeader {
                 "block header too short".into(),
             ));
         }
+        // R9: Reject trailing garbage bytes. A header must be exactly 116 bytes.
+        // Without this check, an attacker could append arbitrary data to a valid
+        // header, creating non-canonical serializations that hash differently but
+        // decode to the same logical header.
+        if data.len() > 116 {
+            return Err(ChainError::InvalidEncoding(
+                format!("block header too long: {} bytes (expected 116)", data.len()),
+            ));
+        }
         let height = u64::from_le_bytes(data[0..8].try_into().unwrap());
         let timestamp = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let mut prev_block_hash = [0u8; 32];
@@ -101,13 +110,89 @@ impl Block {
     }
 
     /// Create a new block on top of a parent block.
+    ///
+    /// Panics if the parent block height is `u64::MAX` (overflow).
+    /// Prefer `try_new` for fallible construction.
     pub fn new(
         parent: &BlockHeader,
         transactions: Vec<Transaction>,
         state_root: Hash,
         timestamp: Timestamp,
     ) -> Self {
-        let tx_count = transactions.len() as u32;
+        Self::try_new(parent, transactions, state_root, timestamp)
+            .expect("block height overflow")
+    }
+
+    /// R8: Validate a block against its expected parent.
+    ///
+    /// Checks:
+    /// 1. Height is exactly parent.height + 1 (no gaps, no rewrites)
+    /// 2. prev_block_hash matches the parent's actual block hash
+    /// 3. Timestamp is >= parent timestamp (monotonically non-decreasing)
+    /// 4. tx_count matches the actual number of transactions
+    /// 5. transactions_root matches the computed Merkle root
+    pub fn validate_against_parent(&self, parent: &BlockHeader) -> Result<()> {
+        // 1. Height continuity
+        let expected_height = parent.height.checked_add(1).ok_or(ChainError::BlockHeightOverflow)?;
+        if self.header.height != expected_height {
+            return Err(ChainError::InvalidEncoding(format!(
+                "block height gap: expected {}, got {}",
+                expected_height, self.header.height,
+            )));
+        }
+
+        // 2. Parent hash chain integrity
+        let expected_parent_hash = parent.block_hash();
+        if self.header.prev_block_hash != expected_parent_hash {
+            return Err(ChainError::InvalidEncoding(format!(
+                "parent hash mismatch: expected {}, got {}",
+                hex_encode(&expected_parent_hash[..4]),
+                hex_encode(&self.header.prev_block_hash[..4]),
+            )));
+        }
+
+        // 3. Timestamp ordering (must be non-decreasing)
+        if self.header.timestamp < parent.timestamp {
+            return Err(ChainError::InvalidTimestamp);
+        }
+
+        // 4. tx_count consistency
+        let actual_count: u32 = self.transactions.len().try_into().map_err(|_| {
+            ChainError::InvalidEncoding(format!("too many transactions: {}", self.transactions.len()))
+        })?;
+        if self.header.tx_count != actual_count {
+            return Err(ChainError::InvalidEncoding(format!(
+                "tx_count mismatch: header says {}, actual {}",
+                self.header.tx_count, actual_count,
+            )));
+        }
+
+        // 5. Transactions root integrity
+        if !self.verify_transactions_root() {
+            return Err(ChainError::InvalidEncoding(
+                "transactions_root does not match computed Merkle root".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Fallible block construction -- returns an error on block height overflow.
+    pub fn try_new(
+        parent: &BlockHeader,
+        transactions: Vec<Transaction>,
+        state_root: Hash,
+        timestamp: Timestamp,
+    ) -> Result<Self> {
+        let new_height = parent
+            .height
+            .checked_add(1)
+            .ok_or(ChainError::BlockHeightOverflow)?;
+
+        let tx_count: u32 = transactions.len().try_into()
+            .map_err(|_| ChainError::InvalidEncoding(
+                format!("too many transactions in block: {}", transactions.len())
+            ))?;
         let leaves: Vec<Hash> = transactions.iter().map(|tx| tx.tx_hash()).collect();
         let transactions_root = if leaves.is_empty() {
             ZERO_HASH
@@ -116,7 +201,7 @@ impl Block {
         };
 
         let header = BlockHeader {
-            height: parent.height + 1,
+            height: new_height,
             timestamp,
             prev_block_hash: parent.block_hash(),
             state_root,
@@ -124,10 +209,10 @@ impl Block {
             tx_count,
         };
 
-        Block {
+        Ok(Block {
             header,
             transactions,
-        }
+        })
     }
 }
 

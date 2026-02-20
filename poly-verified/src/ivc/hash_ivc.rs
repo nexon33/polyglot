@@ -1,9 +1,9 @@
 use crate::crypto::chain::HashChain;
-use crate::crypto::hash::{hash_blinding, hash_combine, hash_transition};
+use crate::crypto::hash::{hash_blinding, hash_combine, hash_data, hash_transition};
 use crate::crypto::merkle::MerkleTree;
 use crate::error::{ProofSystemError, Result};
 use crate::ivc::IvcBackend;
-use crate::types::{Hash, PrivacyMode, StepWitness, VerifiedProof, ZERO_HASH};
+use crate::types::{hash_eq, Hash, PrivacyMode, StepWitness, VerifiedProof, ZERO_HASH};
 
 /// Hash-chain based Incrementally Verifiable Computation.
 ///
@@ -29,6 +29,10 @@ pub struct HashIvcAccumulator {
     privacy_mode: PrivacyMode,
     /// Accumulated H(blinding_factors) — only non-zero when privacy is enabled.
     blinding_hash: Hash,
+    /// Committed input hash — set before finalize for I/O binding.
+    pub input_hash: Hash,
+    /// Committed output hash — set before finalize for I/O binding.
+    pub output_hash: Hash,
 }
 
 impl IvcBackend for HashIvc {
@@ -41,6 +45,8 @@ impl IvcBackend for HashIvc {
             code_hash: *code_hash,
             privacy_mode: privacy,
             blinding_hash: ZERO_HASH,
+            input_hash: ZERO_HASH,
+            output_hash: ZERO_HASH,
         }
     }
 
@@ -84,37 +90,130 @@ impl IvcBackend for HashIvc {
             None
         };
 
+        // Bind code_hash and privacy_mode into chain_tip so they can't be swapped
+        let code_binding = hash_data(&accumulator.code_hash);
+        let mode_binding = hash_data(&[accumulator.privacy_mode as u8]);
+        let bound_tip = hash_combine(
+            &hash_combine(&accumulator.chain.tip, &code_binding),
+            &mode_binding,
+        );
+
         Ok(VerifiedProof::HashIvc {
-            chain_tip: accumulator.chain.tip,
+            chain_tip: bound_tip,
             merkle_root: tree.root,
             step_count: accumulator.chain.length,
             code_hash: accumulator.code_hash,
             privacy_mode: accumulator.privacy_mode,
             blinding_commitment,
+            checkpoints: accumulator.checkpoints,
+            input_hash: accumulator.input_hash,
+            output_hash: accumulator.output_hash,
         })
     }
 
     fn verify(
         &self,
         proof: &VerifiedProof,
-        _input_hash: &Hash,
-        _output_hash: &Hash,
+        expected_input: &Hash,
+        expected_output: &Hash,
     ) -> Result<bool> {
         match proof {
             VerifiedProof::HashIvc {
+                chain_tip,
+                merkle_root,
                 step_count,
+                code_hash,
                 privacy_mode,
                 blinding_commitment,
-                ..
+                checkpoints,
+                input_hash,
+                output_hash,
             } => {
-                // Structural check: must have at least one step.
+                // 1. Structural: must have at least one step.
                 if *step_count == 0 {
                     return Ok(false);
                 }
-                // In private modes, the blinding commitment must be present.
-                if privacy_mode.is_private() && blinding_commitment.is_none() {
+
+                // 2. Checkpoint count must match step_count.
+                if checkpoints.len() as u64 != *step_count {
                     return Ok(false);
                 }
+
+                // [V9-03 FIX] Cap checkpoint count to prevent DoS. Rebuilding
+                // a hash chain + Merkle tree is O(N), so an attacker crafting a
+                // proof with millions of checkpoints forces expensive verification.
+                // 1,000,000 checkpoints is the absolute maximum for any realistic
+                // computation; beyond this, reject as adversarial.
+                const MAX_CHECKPOINTS: usize = 1_000_000;
+                if checkpoints.len() > MAX_CHECKPOINTS {
+                    return Ok(false);
+                }
+
+                // 3. Rebuild hash chain from checkpoints, bind code_hash + privacy_mode → verify chain_tip.
+                let mut chain = HashChain::new();
+                for cp in checkpoints {
+                    chain.append(cp);
+                }
+                let code_binding = hash_data(code_hash);
+                let mode_binding = hash_data(&[*privacy_mode as u8]);
+                let expected_tip = hash_combine(
+                    &hash_combine(&chain.tip, &code_binding),
+                    &mode_binding,
+                );
+                if !hash_eq(&expected_tip, chain_tip) {
+                    return Ok(false);
+                }
+
+                // 4. Rebuild Merkle tree from checkpoints → verify merkle_root.
+                let tree = MerkleTree::build(checkpoints);
+                if !hash_eq(&tree.root, merkle_root) {
+                    return Ok(false);
+                }
+
+                // 5. I/O hash verification (privacy-aware, constant-time).
+                match privacy_mode {
+                    PrivacyMode::Transparent => {
+                        if !hash_eq(input_hash, expected_input) {
+                            return Ok(false);
+                        }
+                        if !hash_eq(output_hash, expected_output) {
+                            return Ok(false);
+                        }
+                    }
+                    PrivacyMode::PrivateInputs => {
+                        // Inputs hidden, but output must match.
+                        if !hash_eq(output_hash, expected_output) {
+                            return Ok(false);
+                        }
+                    }
+                    PrivacyMode::Private => {
+                        // Both hidden — skip I/O check.
+                    }
+                }
+
+                // 6. Blinding commitment verification (private modes).
+                if privacy_mode.is_private() {
+                    if blinding_commitment.is_none() {
+                        return Ok(false);
+                    }
+                    let mut expected_blinding = ZERO_HASH;
+                    for (i, cp) in checkpoints.iter().enumerate() {
+                        let counter = ((i + 1) as u64).to_le_bytes();
+                        let mut blinding_input = Vec::with_capacity(40);
+                        blinding_input.extend_from_slice(cp);
+                        blinding_input.extend_from_slice(&counter);
+                        let blinding = hash_blinding(&blinding_input);
+                        expected_blinding = hash_combine(&expected_blinding, &blinding);
+                    }
+                    match blinding_commitment {
+                        Some(bc) if hash_eq(bc, &expected_blinding) => {}
+                        _ => return Ok(false),
+                    }
+                } else if blinding_commitment.is_some() {
+                    // Transparent mode shouldn't have a blinding commitment.
+                    return Ok(false);
+                }
+
                 Ok(true)
             }
             _ => Err(ProofSystemError::ProofVerificationFailed(
@@ -131,7 +230,6 @@ impl IvcBackend for HashIvc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::hash::hash_data;
 
     #[test]
     fn test_hash_ivc_roundtrip() {
@@ -149,10 +247,14 @@ mod tests {
             backend.fold_step(&mut acc, &witness).unwrap();
         }
 
-        let proof = backend.finalize(acc).unwrap();
-
+        // Set I/O hashes before finalize
         let input_hash = hash_data(&[0]);
         let output_hash = hash_data(&[3]);
+        acc.input_hash = input_hash;
+        acc.output_hash = output_hash;
+
+        let proof = backend.finalize(acc).unwrap();
+
         assert!(backend.verify(&proof, &input_hash, &output_hash).unwrap());
     }
 

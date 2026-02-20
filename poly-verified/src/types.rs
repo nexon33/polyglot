@@ -62,9 +62,12 @@ impl Commitment {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        // [V10-01 FIX] Reject trailing bytes. Lax parsing (< instead of !=)
+        // allowed appending arbitrary data after the fixed-size structure,
+        // which could cause signature confusion or parser differential attacks.
+        if data.len() != Self::SIZE {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "commitment: expected {} bytes, got {}",
+                "commitment: expected exactly {} bytes, got {}",
                 Self::SIZE,
                 data.len()
             )));
@@ -87,10 +90,14 @@ impl Commitment {
 
 impl PartialEq for Commitment {
     fn eq(&self, other: &Self) -> bool {
+        // Constant-time comparison for all fields to prevent timing side-channels.
+        // The total_checkpoints field is compared via XOR to avoid short-circuit
+        // leakage of the checkpoint count.
+        let checkpoints_eq = (self.total_checkpoints ^ other.total_checkpoints) == 0;
         hash_eq(&self.root, &other.root)
-            && self.total_checkpoints == other.total_checkpoints
-            && hash_eq(&self.chain_tip, &other.chain_tip)
-            && hash_eq(&self.code_hash, &other.code_hash)
+            & checkpoints_eq
+            & hash_eq(&self.chain_tip, &other.chain_tip)
+            & hash_eq(&self.code_hash, &other.code_hash)
     }
 }
 
@@ -120,9 +127,10 @@ impl SignedCommitment {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        // [V10-01 FIX] Reject trailing bytes for strict parsing.
+        if data.len() != Self::SIZE {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "signed commitment: expected {} bytes, got {}",
+                "signed commitment: expected exactly {} bytes, got {}",
                 Self::SIZE,
                 data.len()
             )));
@@ -162,9 +170,10 @@ impl ProofNode {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        // [V10-01 FIX] Reject trailing bytes for strict parsing.
+        if data.len() != Self::SIZE {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "proof node: expected {} bytes, got {}",
+                "proof node: expected exactly {} bytes, got {}",
                 Self::SIZE,
                 data.len()
             )));
@@ -203,6 +212,12 @@ impl MerkleProof {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        // Safety: reject if sibling count exceeds our max (64) or u32 range.
+        assert!(
+            self.siblings.len() <= 64,
+            "MerkleProof: sibling count {} exceeds maximum 64",
+            self.siblings.len()
+        );
         let sibling_count = self.siblings.len() as u32;
         let size = 108 + 33 * self.siblings.len();
         let mut buf = Vec::with_capacity(size);
@@ -229,10 +244,17 @@ impl MerkleProof {
         let leaf_index = u64::from_le_bytes(data[32..40].try_into().unwrap());
         let sibling_count = u32::from_be_bytes(data[40..44].try_into().unwrap()) as usize;
 
+        if sibling_count > 64 {
+            return Err(ProofSystemError::InvalidEncoding(
+                "merkle proof: sibling count > 64 is unreasonable".to_string(),
+            ));
+        }
+
         let expected_size = 108 + 33 * sibling_count;
-        if data.len() < expected_size {
+        // [V10-01 FIX] Reject trailing bytes for strict parsing.
+        if data.len() != expected_size {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "merkle proof: expected {} bytes, got {}",
+                "merkle proof: expected exactly {} bytes, got {}",
                 expected_size,
                 data.len()
             )));
@@ -295,9 +317,10 @@ impl CodeAttestation {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SIZE {
+        // [V10-01 FIX] Reject trailing bytes for strict parsing.
+        if data.len() != Self::SIZE {
             return Err(ProofSystemError::InvalidEncoding(format!(
-                "code attestation: expected {} bytes, got {}",
+                "code attestation: expected exactly {} bytes, got {}",
                 Self::SIZE,
                 data.len()
             )));
@@ -421,8 +444,14 @@ pub enum VerifiedProof {
         privacy_mode: PrivacyMode,
         /// H(blinding_factors) — present when privacy_mode != Transparent.
         blinding_commitment: Option<Hash>,
+        /// Step transition hashes — verifier reconstructs chain and Merkle tree from these.
+        checkpoints: Vec<Hash>,
+        /// Committed input hash (for I/O binding).
+        input_hash: Hash,
+        /// Committed output hash (for I/O binding).
+        output_hash: Hash,
     },
-    /// Mock proof for testing.
+    /// Mock proof for testing. Only accepted by verifiers in test/mock builds.
     Mock {
         input_hash: Hash,
         output_hash: Hash,

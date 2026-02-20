@@ -5,12 +5,18 @@ edition = "2021"
 description = "Thin client SDK for Poly Network private verified inference"
 
 [dependencies]
-poly-verified = { path = "../poly-verified" }
+poly-verified = { path = "../poly-verified", features = ["mock"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+hmac = { version = "0.12", optional = true }
+hkdf = { version = "0.12", optional = true }
 rand = { version = "0.8", optional = true }
+bincode = { version = "1.3", optional = true }
+zstd = { version = "0.13", optional = true }
+cudarc = { version = "0.12", optional = true, features = ["cuda-12060"] }
 
 [features]
 default = []
-ckks = ["rand"]
+ckks = ["rand", "bincode", "zstd", "hmac", "hkdf"]
+cuda = ["ckks", "cudarc"]

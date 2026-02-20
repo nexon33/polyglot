@@ -1,6 +1,6 @@
 use crate::error::{ProofSystemError, Result};
 use crate::crypto::hash::hash_combine;
-use crate::types::{Hash, MerkleProof, ProofNode, ZERO_HASH};
+use crate::types::{hash_eq, Hash, MerkleProof, ProofNode, ZERO_HASH};
 
 /// A Merkle tree built from an ordered list of leaf hashes.
 #[derive(Clone, Debug)]
@@ -103,6 +103,12 @@ impl MerkleTree {
 }
 
 /// Verify a Merkle inclusion proof.
+///
+/// Note: This function does NOT validate `leaf_index` against the tree depth
+/// implied by `siblings.len()`. It only verifies that the sibling path
+/// reconstructs the root. Callers who rely on `leaf_index` for position
+/// semantics (e.g., `verify_disclosure`) must validate it independently.
+/// Use [`verify_proof_strict`] for full validation including leaf_index bounds.
 pub fn verify_proof(proof: &MerkleProof) -> bool {
     let mut current = proof.leaf;
 
@@ -114,7 +120,35 @@ pub fn verify_proof(proof: &MerkleProof) -> bool {
         }
     }
 
-    current == proof.root
+    hash_eq(&current, &proof.root)
+}
+
+/// Strict Merkle proof verification with leaf_index bounds checking.
+///
+/// [V15-13 FIX] In addition to the standard path reconstruction check,
+/// this validates that `leaf_index` is consistent with the tree depth
+/// implied by `siblings.len()`. A tree with `d` siblings has at most
+/// 2^d leaves, so `leaf_index` must be in `[0, 2^d)`.
+///
+/// Without this check, an attacker can set `leaf_index` to any value
+/// and standard `verify_proof` will still pass because it only uses the
+/// sibling path for root reconstruction. This enables position spoofing
+/// when `leaf_index` is trusted by callers.
+pub fn verify_proof_strict(proof: &MerkleProof) -> bool {
+    let depth = proof.siblings.len();
+    if depth == 0 {
+        if proof.leaf_index != 0 {
+            return false;
+        }
+    } else if depth < 64 {
+        let max_leaves: u64 = 1u64 << depth;
+        if proof.leaf_index >= max_leaves {
+            return false;
+        }
+    }
+    // depth >= 64: any u64 leaf_index is valid (tree can hold up to 2^64 leaves)
+
+    verify_proof(proof)
 }
 
 #[cfg(test)]

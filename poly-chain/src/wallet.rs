@@ -23,6 +23,8 @@ pub struct WalletState {
 
 impl WalletState {
     /// Create a new wallet with zero balance.
+    ///
+    /// R10: Uses saturating arithmetic for rolling_reset_at to prevent overflow.
     pub fn new(identity_hash: Hash, tier: Tier, now: Timestamp) -> Self {
         Self {
             balance: 0,
@@ -30,7 +32,7 @@ impl WalletState {
             identity_hash,
             tier,
             rolling_24h_total: 0,
-            rolling_reset_at: now + SECONDS_24H,
+            rolling_reset_at: now.saturating_add(SECONDS_24H),
             frozen: false,
             freeze_reason: None,
         }
@@ -42,10 +44,12 @@ impl WalletState {
     }
 
     /// Update the rolling window: if reset_at has passed, zero the counter.
+    ///
+    /// R10: Uses saturating arithmetic to prevent overflow when `now` is near u64::MAX.
     pub fn maybe_reset_rolling(&mut self, now: Timestamp) {
         if now >= self.rolling_reset_at {
             self.rolling_24h_total = 0;
-            self.rolling_reset_at = now + SECONDS_24H;
+            self.rolling_reset_at = now.saturating_add(SECONDS_24H);
         }
     }
 
@@ -85,13 +89,38 @@ impl WalletState {
         let rolling_reset_at = u64::from_le_bytes(data[57..65].try_into().unwrap());
         let frozen = data[65] != 0;
         let freeze_reason = match data[66] {
-            0x00 => None,
-            0x01 => Some(FreezeReason::FraudDetected),
+            0x00 => {
+                // R10: Reject trailing garbage bytes for canonical deserialization.
+                if data.len() > 67 {
+                    return Err(ChainError::InvalidEncoding(format!(
+                        "wallet state too long: {} bytes (expected 67 for no freeze reason)",
+                        data.len()
+                    )));
+                }
+                None
+            }
+            0x01 => {
+                // R10: Reject trailing garbage bytes for canonical deserialization.
+                if data.len() > 67 {
+                    return Err(ChainError::InvalidEncoding(format!(
+                        "wallet state too long: {} bytes (expected 67 for FraudDetected freeze)",
+                        data.len()
+                    )));
+                }
+                Some(FreezeReason::FraudDetected)
+            }
             0x02 => {
                 if data.len() < 75 {
                     return Err(ChainError::InvalidEncoding(
                         "wallet state: STP freeze reason truncated".into(),
                     ));
+                }
+                // R10: Reject trailing garbage bytes for canonical deserialization.
+                if data.len() > 75 {
+                    return Err(ChainError::InvalidEncoding(format!(
+                        "wallet state too long: {} bytes (expected 75 for STP freeze reason)",
+                        data.len()
+                    )));
                 }
                 let deadline = u64::from_le_bytes(data[67..75].try_into().unwrap());
                 Some(FreezeReason::STPNonCompliance { deadline })
@@ -141,6 +170,13 @@ impl WalletStateCommitment {
             return Err(ChainError::InvalidEncoding(
                 "wallet commitment too short".into(),
             ));
+        }
+        // R10: Reject trailing garbage bytes for canonical deserialization.
+        if data.len() > 81 {
+            return Err(ChainError::InvalidEncoding(format!(
+                "wallet commitment too long: {} bytes (expected 81)",
+                data.len()
+            )));
         }
         let mut account_id = [0u8; 32];
         account_id.copy_from_slice(&data[0..32]);
