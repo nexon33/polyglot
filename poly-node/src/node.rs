@@ -65,6 +65,16 @@
 //! - R13: Zero public key ([0u8; 32]) explicitly rejected in Hello validation
 //! - R13: Duplicate addresses in NodeInfo rejected (prevents gossip amplification)
 //! - R13: Client-side HelloAck version validation (must match PROTOCOL_VERSION)
+//! - R15: InferRequest.model_id empty documented as audit finding (backward-compat with R8 audit)
+//! - R15: InferRequest.model_id control characters documented as audit finding (Phase 2)
+//! - R15: InferRequest.max_tokens == 0 documented as audit finding (wastes compute but backward-compatible)
+//! - R15: NodeInfo.timestamp must be > 0 (epoch floor defense-in-depth)
+//! - R15: NodeInfo addresses must not be multicast (QUIC requires unicast)
+//! - R15: NodeInfo addresses must not be broadcast (255.255.255.255)
+//! - R15: NodeInfo addresses must not be link-local (169.254.x.x, fe80::/10)
+//! - R15: Duplicate model names in NodeInfo rejected (prevents gossip inflation)
+//! - R15: Config listen_addr port must not be 0 (prevents unreachable nodes)
+//! - R15: Client-side HelloAck throughput -0.0 rejection (matches R14 server-side)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -255,6 +265,17 @@ impl PolyNode {
         if config.model_name.bytes().any(|b| b < 0x20) {
             anyhow::bail!(
                 "model_name contains control characters (bytes < 0x20)"
+            );
+        }
+        // R15: Reject listen_addr with port 0. Port 0 means "OS picks a random
+        // port", which makes the node unreachable by bootstrap peers (they don't
+        // know which port was assigned). While useful for tests, production nodes
+        // must specify an explicit port. Tests should use random ports obtained
+        // from UdpSocket::bind("127.0.0.1:0") and read back the assigned port.
+        if config.listen_addr.port() == 0 {
+            anyhow::bail!(
+                "listen_addr port must not be 0 (got {})",
+                config.listen_addr
             );
         }
         let identity = NodeIdentity::generate();
@@ -758,6 +779,11 @@ async fn handle_stream(
                 }
                 // R14: Reject addresses with unspecified IP (0.0.0.0 or [::])
                 // or port 0. These are non-routable and waste gossip table entries.
+                // R15: Also reject multicast (224.0.0.0/4, ff00::/8), broadcast
+                // (255.255.255.255), and link-local (169.254.0.0/16, fe80::/10)
+                // addresses. QUIC requires unicast endpoints; multicast addresses
+                // are unreachable and pollute gossip tables. Link-local addresses
+                // require scope IDs and are meaningless in cross-network gossip.
                 if accepted {
                     for a in &hello.node_info.addresses {
                         if a.ip().is_unspecified() || a.port() == 0 {
@@ -767,6 +793,47 @@ async fn handle_stream(
                             );
                             accepted = false;
                             break;
+                        }
+                        if a.ip().is_multicast() {
+                            warn!(
+                                "Rejecting Hello: multicast address {} (QUIC requires unicast)",
+                                a
+                            );
+                            accepted = false;
+                            break;
+                        }
+                        // R15: Reject broadcast and link-local addresses
+                        match a.ip() {
+                            std::net::IpAddr::V4(v4) => {
+                                if v4.is_broadcast() {
+                                    warn!(
+                                        "Rejecting Hello: broadcast address {}",
+                                        a
+                                    );
+                                    accepted = false;
+                                    break;
+                                }
+                                if v4.is_link_local() {
+                                    warn!(
+                                        "Rejecting Hello: link-local address {} (unreachable cross-network)",
+                                        a
+                                    );
+                                    accepted = false;
+                                    break;
+                                }
+                            }
+                            std::net::IpAddr::V6(v6) => {
+                                // fe80::/10 (link-local)
+                                let segments = v6.segments();
+                                if (segments[0] & 0xffc0) == 0xfe80 {
+                                    warn!(
+                                        "Rejecting Hello: IPv6 link-local address {} (unreachable without scope)",
+                                        a
+                                    );
+                                    accepted = false;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -807,6 +874,23 @@ async fn handle_stream(
                 }
             }
 
+            // R15: Reject duplicate model names. A peer advertising the same
+            // model name twice inflates their apparent capability count in
+            // Phase 2 gossip load balancing. Each model should be unique.
+            if accepted {
+                let mut unique_model_names = std::collections::HashSet::new();
+                for m in &hello.node_info.models {
+                    if !unique_model_names.insert(&m.model_name) {
+                        warn!(
+                            "Rejecting Hello: duplicate model name '{}'",
+                            m.model_name
+                        );
+                        accepted = false;
+                        break;
+                    }
+                }
+            }
+
             // Check timestamp freshness — reject stale Hellos (replay defense)
             if accepted {
                 let now = std::time::SystemTime::now()
@@ -814,9 +898,18 @@ async fn handle_stream(
                     .unwrap_or_default()
                     .as_secs();
                 let ts = hello.node_info.timestamp;
+                // R15: Reject timestamp == 0 (epoch floor). Timestamp 0 is a
+                // sentinel value that should never appear in production. It
+                // protects against edge cases where system clock is wrong or
+                // timestamp arithmetic underflows.
+                if ts == 0 {
+                    warn!(
+                        "Rejecting Hello: timestamp is zero (epoch floor)"
+                    );
+                    accepted = false;
                 // R5: Reject future timestamps too — prevents pre-computed replay
                 // windows where attacker mints a Hello valid far into the future.
-                if ts > now + MAX_HELLO_TIMESTAMP_DRIFT_SECS {
+                } else if ts > now + MAX_HELLO_TIMESTAMP_DRIFT_SECS {
                     warn!(
                         "Rejecting Hello: timestamp too far in the future (ts={}, now={}, max_drift={}s)",
                         ts, now, MAX_HELLO_TIMESTAMP_DRIFT_SECS
@@ -1251,6 +1344,14 @@ pub async fn connect_and_infer(
                 anyhow::bail!(
                     "server HelloAck has invalid throughput_estimate ({})",
                     m.throughput_estimate
+                );
+            }
+            // R15: Also reject -0.0 on client side (matches R14 server-side fix).
+            // IEEE 754 -0.0 passes the < 0.0 check above, but has a different
+            // bit pattern that can cause inconsistent hashing in gossip tables.
+            if m.throughput_estimate == 0.0 && m.throughput_estimate.is_sign_negative() {
+                anyhow::bail!(
+                    "server HelloAck has negative-zero throughput_estimate"
                 );
             }
         }

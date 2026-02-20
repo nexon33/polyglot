@@ -1008,6 +1008,12 @@ fn check_json_depth(body: &[u8]) -> bool {
 /// - Strict-Transport-Security: max-age=63072000; includeSubDomains — instructs browsers
 ///   to only access the server over HTTPS for 2 years, preventing MITM downgrade attacks
 ///   that intercept inference requests/responses containing sensitive data.
+/// R15: Added X-DNS-Prefetch-Control and Permissions-Policy headers.
+/// - X-DNS-Prefetch-Control: off — prevents browsers from pre-resolving DNS for
+///   external domains found in response content, which could leak information about
+///   inference results to DNS observers.
+/// - Permissions-Policy: interest-cohort=() — disables FLoC/Topics API to prevent
+///   browser-side profiling of inference usage patterns.
 fn security_headers() -> Vec<Header> {
     vec![
         Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap(),
@@ -1019,6 +1025,8 @@ fn security_headers() -> Vec<Header> {
         Header::from_bytes(&b"Cross-Origin-Opener-Policy"[..], &b"same-origin"[..]).unwrap(),
         Header::from_bytes(&b"Cross-Origin-Resource-Policy"[..], &b"same-origin"[..]).unwrap(),
         Header::from_bytes(&b"Strict-Transport-Security"[..], &b"max-age=63072000; includeSubDomains"[..]).unwrap(),
+        Header::from_bytes(&b"X-DNS-Prefetch-Control"[..], &b"off"[..]).unwrap(),
+        Header::from_bytes(&b"Permissions-Policy"[..], &b"interest-cohort=()"[..]).unwrap(),
     ]
 }
 

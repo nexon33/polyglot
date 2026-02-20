@@ -574,6 +574,17 @@ fn validate_identity_register(
         ));
     }
 
+    // R15: Non-PublicOfficial tier must not have an office field.
+    // The office field is only meaningful for PublicOfficial accounts.
+    // Allowing it on other tiers creates confusion (e.g., an "Identified"
+    // user with office="Senator" appears to have official status without
+    // the corresponding tier restrictions).
+    if tx.tier != Tier::PublicOfficial && tx.office.is_some() {
+        return Err(ChainError::InvalidEncoding(
+            "office field is only allowed for PublicOfficial tier".into(),
+        ));
+    }
+
     // R9: Limit office string length to prevent memory exhaustion.
     // An unbounded string could be multi-megabyte, causing excessive memory
     // use during serialization (to_bytes, serde_json, signing messages).
@@ -992,6 +1003,16 @@ fn validate_stp_action(
         }
 
         STPAction::TriggerInvestigation { target, pool_id } => {
+            // R15: Reject self-investigation. An official triggering an investigation
+            // on themselves can game the system — e.g., creating a controlled
+            // investigation they immediately resolve, blocking legitimate third-party
+            // investigations for the same pool_id (since duplicates are rejected).
+            if tx.submitter == *target {
+                return Err(ChainError::UnauthorizedSTPAction(
+                    "cannot trigger investigation on yourself".into(),
+                ));
+            }
+
             // R6: Only accounts with an active STP service contract can be
             // investigated. Without this check, any account can be targeted,
             // leading to spurious investigations against non-officials.

@@ -482,7 +482,17 @@ fn is_invisible_char(ch: char) -> bool {
         // pattern matching. Strip all three PUA ranges.
         '\u{E000}'..='\u{F8FF}' |   // Basic Multilingual Plane PUA
         '\u{F0000}'..='\u{FFFFD}' | // Supplementary PUA-A
-        '\u{100000}'..='\u{10FFFD}'  // Supplementary PUA-B
+        '\u{100000}'..='\u{10FFFD}' | // Supplementary PUA-B
+        // R15: Interlinear Annotation characters are invisible formatting
+        // used in East Asian annotation systems. Attackers insert them between
+        // letters to break substring matching.
+        '\u{FFF9}'..='\u{FFFB}' | // Interlinear Annotation Anchor/Separator/Terminator
+        // R15: Object Replacement Character is an invisible placeholder for inline
+        // objects in rich text. Can be used as invisible padding between letters.
+        '\u{FFFC}' | // Object Replacement Character
+        // R15: Mongolian Vowel Separator is an invisible format character from
+        // the Mongolian block, similar to zero-width space.
+        '\u{180E}'   // Mongolian Vowel Separator
     )
 }
 
@@ -741,6 +751,125 @@ fn confusable_to_ascii(ch: char) -> Option<char> {
         '\u{01A1}' => Some('o'), // Latin small letter o with horn
         '\u{01AD}' => Some('t'), // Latin small letter t with hook
         '\u{01B4}' => Some('y'), // Latin small letter y with hook
+        // R15: Additional Cyrillic confusables not covered in R6
+        // Cyrillic Capital У was missing (only lowercase у/U+0443 was mapped)
+        '\u{0423}' => Some('Y'), // Cyrillic Capital У (looks like Y)
+        '\u{0413}' => Some('r'), // Cyrillic Capital Г (Ghe, looks like Gamma/r in italic)
+        '\u{0433}' => Some('r'), // Cyrillic Small г (looks like r)
+        '\u{0490}' => Some('r'), // Cyrillic Capital Ґ (Ghe with upturn)
+        '\u{0491}' => Some('r'), // Cyrillic Small ґ (looks like r)
+        '\u{0417}' => Some('z'), // Cyrillic Capital З (Ze, looks like 3/z)
+        '\u{0437}' => Some('z'), // Cyrillic Small з (looks like 3/z)
+        '\u{0404}' => Some('E'), // Cyrillic Capital Є (Ukrainian Ie, looks like E)
+        '\u{0454}' => Some('e'), // Cyrillic Small є (looks like e)
+        '\u{0407}' => Some('I'), // Cyrillic Capital Ї (Ukrainian Yi, looks like I)
+        '\u{0457}' => Some('i'), // Cyrillic Small ї (looks like i)
+        '\u{0419}' => Some('I'), // Cyrillic Capital Й (Short I)
+        '\u{0439}' => Some('i'), // Cyrillic Small й (looks like i)
+        // R15: Armenian confusables (visually similar to Latin letters)
+        '\u{0570}' => Some('h'), // Armenian Small Ho (looks like 'h')
+        '\u{0578}' => Some('n'), // Armenian Small Vo (looks like 'n')
+        '\u{057D}' => Some('s'), // Armenian Small Seh (looks like 's')
+        '\u{0585}' => Some('o'), // Armenian Small Oh (looks like 'o')
+        '\u{0561}' => Some('a'), // Armenian Small Ayb (looks like 'a' in some fonts)
+        '\u{0575}' => Some('y'), // Armenian Small Yi (looks like 'y')
+        '\u{0572}' => Some('q'), // Armenian Small Gim (looks like 'q')
+        '\u{057A}' => Some('p'), // Armenian Small Peh (looks like 'p')
+        '\u{0566}' => Some('g'), // Armenian Small Za (looks like 'g' in some fonts)
+        // R15: Coptic confusables (derived from Greek, visually identical to Latin)
+        '\u{2C80}' => Some('A'), // Coptic Capital Alfa
+        '\u{2C81}' => Some('a'), // Coptic Small Alfa
+        '\u{2C82}' => Some('B'), // Coptic Capital Vida
+        '\u{2C83}' => Some('b'), // Coptic Small Vida
+        '\u{2C88}' => Some('E'), // Coptic Capital Ei
+        '\u{2C89}' => Some('e'), // Coptic Small Ei
+        '\u{2C8E}' => Some('H'), // Coptic Capital Hate
+        '\u{2C8F}' => Some('h'), // Coptic Small Hate
+        '\u{2C92}' => Some('I'), // Coptic Capital Iauda
+        '\u{2C93}' => Some('i'), // Coptic Small Iauda
+        '\u{2C94}' => Some('K'), // Coptic Capital Kapa
+        '\u{2C95}' => Some('k'), // Coptic Small Kapa
+        '\u{2C98}' => Some('M'), // Coptic Capital Mi
+        '\u{2C99}' => Some('m'), // Coptic Small Mi
+        '\u{2C9A}' => Some('N'), // Coptic Capital Ni
+        '\u{2C9B}' => Some('n'), // Coptic Small Ni
+        '\u{2C9E}' => Some('O'), // Coptic Capital O
+        '\u{2C9F}' => Some('o'), // Coptic Small O
+        '\u{2CA2}' => Some('P'), // Coptic Capital Ro
+        '\u{2CA3}' => Some('p'), // Coptic Small Ro
+        '\u{2CA6}' => Some('T'), // Coptic Capital Tau
+        '\u{2CA7}' => Some('t'), // Coptic Small Tau
+        '\u{2CAC}' => Some('X'), // Coptic Capital Khi
+        '\u{2CAD}' => Some('x'), // Coptic Small Khi
+        // R15: Latin Extended-B confusable gaps
+        '\u{0180}' => Some('b'), // Latin Small Letter B with Stroke
+        '\u{01DD}' => Some('e'), // Latin Small Letter Turned E
+        '\u{0111}' => Some('d'), // Latin Small Letter D with Stroke
+        '\u{0110}' => Some('D'), // Latin Capital Letter D with Stroke
+        '\u{0127}' => Some('h'), // Latin Small Letter H with Stroke
+        '\u{0126}' => Some('H'), // Latin Capital Letter H with Stroke
+        // R15: Latin Extended-A precomposed accented characters
+        // These are NOT in the 1E00-1EFF range and were missed by
+        // latin_ext_additional_to_ascii(). Each maps to its base letter.
+        '\u{00C0}'..='\u{00C5}' => Some('A'), // À Á Â Ã Ä Å
+        '\u{00C7}' => Some('C'),               // Ç
+        '\u{00C8}'..='\u{00CB}' => Some('E'),  // È É Ê Ë
+        '\u{00CC}'..='\u{00CF}' => Some('I'),  // Ì Í Î Ï
+        '\u{00D0}' => Some('D'),               // Ð (Eth)
+        '\u{00D1}' => Some('N'),               // Ñ
+        '\u{00D2}'..='\u{00D6}' => Some('O'),  // Ò Ó Ô Õ Ö
+        '\u{00D8}' => Some('O'),               // Ø
+        '\u{00D9}'..='\u{00DC}' => Some('U'),  // Ù Ú Û Ü
+        '\u{00DD}' => Some('Y'),               // Ý
+        '\u{00E0}'..='\u{00E5}' => Some('a'),  // à á â ã ä å
+        '\u{00E7}' => Some('c'),               // ç
+        '\u{00E8}'..='\u{00EB}' => Some('e'),  // è é ê ë
+        '\u{00EC}'..='\u{00EF}' => Some('i'),  // ì í î ï
+        '\u{00F0}' => Some('d'),               // ð (eth)
+        '\u{00F1}' => Some('n'),               // ñ
+        '\u{00F2}'..='\u{00F6}' => Some('o'),  // ò ó ô õ ö
+        '\u{00F8}' => Some('o'),               // ø
+        '\u{00F9}'..='\u{00FC}' => Some('u'),  // ù ú û ü
+        '\u{00FD}'..='\u{00FF}' => Some('y'),  // ý ÿ
+        // Latin Extended-A (U+0100-U+017F): strip accents from precomposed characters
+        '\u{0100}' | '\u{0102}' | '\u{0104}' => Some('A'),
+        '\u{0101}' | '\u{0103}' | '\u{0105}' => Some('a'),
+        '\u{0106}' | '\u{0108}' | '\u{010A}' | '\u{010C}' => Some('C'),
+        '\u{0107}' | '\u{0109}' | '\u{010B}' | '\u{010D}' => Some('c'),
+        '\u{010E}' => Some('D'),
+        '\u{010F}' => Some('d'),
+        '\u{0112}' | '\u{0114}' | '\u{0116}' | '\u{0118}' | '\u{011A}' => Some('E'),
+        '\u{0113}' | '\u{0115}' | '\u{0117}' | '\u{0119}' | '\u{011B}' => Some('e'),
+        '\u{011C}' | '\u{011E}' | '\u{0120}' | '\u{0122}' => Some('G'),
+        '\u{011D}' | '\u{011F}' | '\u{0121}' | '\u{0123}' => Some('g'),
+        '\u{0124}' => Some('H'),
+        '\u{0125}' => Some('h'),
+        '\u{0128}' | '\u{012A}' | '\u{012C}' | '\u{012E}' | '\u{0130}' => Some('I'),
+        '\u{0129}' | '\u{012B}' | '\u{012D}' | '\u{012F}' => Some('i'),
+        '\u{0134}' => Some('J'),
+        '\u{0135}' => Some('j'),
+        '\u{0136}' => Some('K'),
+        '\u{0137}' => Some('k'),
+        '\u{0139}' | '\u{013B}' | '\u{013D}' | '\u{013F}' | '\u{0141}' => Some('L'),
+        '\u{013A}' | '\u{013C}' | '\u{013E}' | '\u{0140}' | '\u{0142}' => Some('l'),
+        '\u{0143}' | '\u{0145}' | '\u{0147}' => Some('N'),
+        '\u{0144}' | '\u{0146}' | '\u{0148}' => Some('n'),
+        '\u{014C}' | '\u{014E}' | '\u{0150}' => Some('O'),
+        '\u{014D}' | '\u{014F}' | '\u{0151}' => Some('o'),
+        '\u{0154}' | '\u{0156}' | '\u{0158}' => Some('R'),
+        '\u{0155}' | '\u{0157}' | '\u{0159}' => Some('r'),
+        '\u{015A}' | '\u{015C}' | '\u{015E}' | '\u{0160}' => Some('S'),
+        '\u{015B}' | '\u{015D}' | '\u{015F}' | '\u{0161}' => Some('s'),
+        '\u{0162}' | '\u{0164}' => Some('T'),
+        '\u{0163}' | '\u{0165}' => Some('t'),
+        '\u{0168}' | '\u{016A}' | '\u{016C}' | '\u{016E}' | '\u{0170}' | '\u{0172}' => Some('U'),
+        '\u{0169}' | '\u{016B}' | '\u{016D}' | '\u{016F}' | '\u{0171}' | '\u{0173}' => Some('u'),
+        '\u{0174}' => Some('W'),
+        '\u{0175}' => Some('w'),
+        '\u{0176}' | '\u{0178}' => Some('Y'),
+        '\u{0177}' => Some('y'),
+        '\u{0179}' | '\u{017B}' | '\u{017D}' => Some('Z'),
+        '\u{017A}' | '\u{017C}' | '\u{017E}' => Some('z'),
         _ => None,
     }
 }
