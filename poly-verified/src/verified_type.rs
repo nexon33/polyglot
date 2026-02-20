@@ -44,10 +44,12 @@ impl<T> Verified<T> {
     /// to create `Verified<T>` values.
     #[doc(hidden)]
     pub fn __macro_new(value: T, proof: VerifiedProof) -> Self {
-        // In production builds, Mock variant doesn't exist (gated by cfg).
-        // In test/mock builds, reject Mock proofs via runtime check when
-        // the "mock" feature is enabled but we're not in a test context.
-        #[cfg(all(feature = "mock", not(test)))]
+        // When the mock feature is OFF and we're not in a unit test, reject
+        // Mock proofs at construction time as a defense-in-depth measure.
+        // When mock is ON (dev/test builds), allow construction — callers
+        // must still check is_verified() which returns false for Mock proofs
+        // outside cfg(test).
+        #[cfg(all(not(feature = "mock"), not(test)))]
         if matches!(&proof, VerifiedProof::Mock { .. }) {
             panic!("Mock proofs are not allowed in production builds");
         }
@@ -72,9 +74,9 @@ impl<T> Verified<T> {
     /// Check whether this value carries a valid proof structure.
     /// For full cryptographic verification, use `verify_with_backend`.
     ///
-    /// Mock proofs are only accepted when the `mock` feature is enabled
-    /// or in unit tests. In production builds without the `mock` feature,
-    /// `is_verified()` returns `false` for Mock proofs to prevent an
+    /// Mock proofs are only accepted in the crate's own unit tests.
+    /// Integration tests and external consumers — even with the `mock`
+    /// feature enabled — get `false` for Mock proofs. This prevents an
     /// attacker from constructing a Verified<T> that claims to be verified
     /// while carrying a trivially forgeable Mock proof.
     pub fn is_verified(&self) -> bool {
@@ -82,9 +84,10 @@ impl<T> Verified<T> {
         match &self.proof {
             VerifiedProof::HashIvc { step_count, .. } => *step_count > 0,
             VerifiedProof::Mock { .. } => {
-                // In test or mock-feature builds, accept Mock proofs.
-                // In production, reject them.
-                cfg!(any(test, feature = "mock"))
+                // Only accept Mock proofs in the crate's own unit tests.
+                // Integration tests and external consumers (even with the
+                // "mock" feature) get false — they must use real proofs.
+                cfg!(test)
             }
         }
     }
