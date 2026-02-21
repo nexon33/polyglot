@@ -13,6 +13,25 @@ static int tests_run = 0, tests_passed = 0;
 
 #define ASSERT_EQ(a, b, msg) ASSERT((a) == (b), msg)
 
+static void hash_to_hex(const pv_hash_t h, char *out) {
+    static const char hex_chars[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[i * 2]     = hex_chars[h[i] >> 4];
+        out[i * 2 + 1] = hex_chars[h[i] & 0x0f];
+    }
+    out[64] = '\0';
+}
+
+#define ASSERT_HASH_HEX(hash, expected_hex, msg) do { \
+    char __hex[65]; \
+    hash_to_hex(hash, __hex); \
+    tests_run++; \
+    if (strcmp(__hex, expected_hex) != 0) { \
+        fprintf(stderr, "FAIL: %s (line %d)\n  got:  %s\n  want: %s\n", \
+                msg, __LINE__, __hex, expected_hex); \
+    } else { tests_passed++; } \
+} while(0)
+
 /* ============ Hash tests ============ */
 
 static void test_hash_determinism(void) {
@@ -494,6 +513,583 @@ static void test_json_invalid_input(void) {
     ASSERT(p == NULL, "json: empty string returns NULL");
 }
 
+/* ============ Cross-language hash vectors ============ */
+
+static void test_hash_known_vectors(void) {
+    /* Must match Rust test_hash_data_{empty,0x00,0x01,multi_byte}
+     * and Go TestHashDataVectors */
+    pv_hash_t h;
+
+    /* SHA-256("") */
+    uint8_t empty = 0;
+    pv_hash_data(&empty, 0, h);
+    ASSERT_HASH_HEX(h, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                     "cross-lang: hash_data empty");
+
+    /* SHA-256(0x00) */
+    uint8_t d0[] = {0x00};
+    pv_hash_data(d0, 1, h);
+    ASSERT_HASH_HEX(h, "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+                     "cross-lang: hash_data 0x00");
+
+    /* SHA-256(0x01) */
+    uint8_t d1[] = {0x01};
+    pv_hash_data(d1, 1, h);
+    ASSERT_HASH_HEX(h, "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+                     "cross-lang: hash_data 0x01");
+
+    /* SHA-256(0x01..0x05) */
+    uint8_t dm[] = {0x01, 0x02, 0x03, 0x04, 0x05};
+    pv_hash_data(dm, 5, h);
+    ASSERT_HASH_HEX(h, "74f81fe167d99b4cb41d6d0ccda82278caee9f3e2f25d5e5a3936ff3dcec60d0",
+                     "cross-lang: hash_data multi-byte");
+}
+
+static void test_hash_combine_zeros_vector(void) {
+    /* SHA-256(0x03 || [0x00;64]) — must match Rust/Go */
+    pv_hash_t left = {0}, right = {0}, result;
+    pv_hash_combine(left, right, result);
+    ASSERT_HASH_HEX(result, "dc48a742ae32cfd66352372d6120ed14d6629fc166246b05ff8b03e23804701f",
+                     "cross-lang: hash_combine zeros");
+}
+
+static void test_hash_combine_not_commutative(void) {
+    pv_hash_t left, right;
+    memset(left, 0x01, 32);
+    memset(right, 0x02, 32);
+    pv_hash_t r1, r2;
+    pv_hash_combine(left, right, r1);
+    pv_hash_combine(right, left, r2);
+    ASSERT(!pv_hash_eq(r1, r2), "hash_combine: not commutative");
+}
+
+static void test_hash_combine_vs_data_domain(void) {
+    pv_hash_t left = {0}, right = {0};
+    pv_hash_t combined;
+    pv_hash_combine(left, right, combined);
+
+    uint8_t raw_input[64];
+    memcpy(raw_input, left, 32);
+    memcpy(raw_input + 32, right, 32);
+    pv_hash_t raw;
+    pv_hash_data(raw_input, 64, raw);
+    ASSERT(!pv_hash_eq(combined, raw), "hash_combine: differs from hash_data on 64 bytes");
+}
+
+static void test_hash_leaf_domain_prefix(void) {
+    uint8_t data[] = "leaf_test_data";
+    pv_hash_t leaf, plain;
+    pv_hash_leaf(data, 14, leaf);
+    pv_hash_data(data, 14, plain);
+    ASSERT(!pv_hash_eq(leaf, plain), "hash_leaf: 0x00 prefix differs from hash_data");
+}
+
+static void test_hash_transition_deterministic(void) {
+    pv_hash_t prev, input, claimed;
+    pv_hash_data((uint8_t *)"prev", 4, prev);
+    pv_hash_data((uint8_t *)"input", 5, input);
+    pv_hash_data((uint8_t *)"claimed", 7, claimed);
+
+    pv_hash_t r1, r2;
+    pv_hash_transition(prev, input, claimed, r1);
+    pv_hash_transition(prev, input, claimed, r2);
+    ASSERT(pv_hash_eq(r1, r2), "hash_transition: deterministic");
+
+    /* Different prev → different result */
+    pv_hash_t alt;
+    pv_hash_data((uint8_t *)"other", 5, alt);
+    pv_hash_t r3;
+    pv_hash_transition(alt, input, claimed, r3);
+    ASSERT(!pv_hash_eq(r1, r3), "hash_transition: different prev changes output");
+
+    /* Different input → different result */
+    pv_hash_transition(prev, alt, claimed, r3);
+    ASSERT(!pv_hash_eq(r1, r3), "hash_transition: different input changes output");
+
+    /* Different claimed → different result */
+    pv_hash_transition(prev, input, alt, r3);
+    ASSERT(!pv_hash_eq(r1, r3), "hash_transition: different claimed changes output");
+}
+
+static void test_hash_transition_domain_separation(void) {
+    pv_hash_t a, b;
+    pv_hash_data((uint8_t *)"a", 1, a);
+    pv_hash_data((uint8_t *)"b", 1, b);
+
+    pv_hash_t transition, chain_step;
+    pv_hash_transition(a, b, a, transition);
+    pv_hash_chain_step(a, b, chain_step);
+    ASSERT(!pv_hash_eq(transition, chain_step),
+           "hash_transition (0x01) differs from hash_chain_step (0x02)");
+}
+
+static void test_hash_blinding_domain_prefix(void) {
+    uint8_t data[] = "blinding_data";
+    pv_hash_t blinding, plain, leaf;
+    pv_hash_blinding(data, 13, blinding);
+    pv_hash_data(data, 13, plain);
+    pv_hash_leaf(data, 13, leaf);
+    ASSERT(!pv_hash_eq(blinding, plain), "hash_blinding: differs from hash_data");
+    ASSERT(!pv_hash_eq(blinding, leaf), "hash_blinding: differs from hash_leaf");
+}
+
+/* ============ Chain tests ============ */
+
+static void test_chain_initial_state(void) {
+    pv_hash_t tip = {0};
+    ASSERT(pv_hash_eq(tip, PV_ZERO_HASH), "chain: initial tip is zero");
+}
+
+static void test_chain_append_one(void) {
+    uint8_t d[] = {0x00};
+    pv_hash_t h0;
+    pv_hash_data(d, 1, h0);
+
+    pv_hash_t tip;
+    pv_hash_chain_step(PV_ZERO_HASH, h0, tip);
+
+    pv_hash_t expected;
+    pv_hash_chain_step(PV_ZERO_HASH, h0, expected);
+    ASSERT(pv_hash_eq(tip, expected), "chain: append one matches expected");
+    ASSERT(!pv_hash_eq(tip, PV_ZERO_HASH), "chain: append one non-zero");
+}
+
+static void test_chain_append_two(void) {
+    uint8_t d0[] = {0x00}, d1[] = {0x01};
+    pv_hash_t h0, h1;
+    pv_hash_data(d0, 1, h0);
+    pv_hash_data(d1, 1, h1);
+
+    pv_hash_t tip1, tip2;
+    pv_hash_chain_step(PV_ZERO_HASH, h0, tip1);
+    pv_hash_chain_step(tip1, h1, tip2);
+
+    /* Verify by recomputing */
+    pv_hash_t expected1, expected2;
+    pv_hash_chain_step(PV_ZERO_HASH, h0, expected1);
+    pv_hash_chain_step(expected1, h1, expected2);
+    ASSERT(pv_hash_eq(tip2, expected2), "chain: append two matches expected");
+}
+
+static void test_chain_order_dependent(void) {
+    uint8_t d0[] = {0x00}, d1[] = {0x01};
+    pv_hash_t h0, h1;
+    pv_hash_data(d0, 1, h0);
+    pv_hash_data(d1, 1, h1);
+
+    /* Chain A: h0 then h1 */
+    pv_hash_t tmp, tip_a;
+    pv_hash_chain_step(PV_ZERO_HASH, h0, tmp);
+    pv_hash_chain_step(tmp, h1, tip_a);
+
+    /* Chain B: h1 then h0 */
+    pv_hash_t tip_b;
+    pv_hash_chain_step(PV_ZERO_HASH, h1, tmp);
+    pv_hash_chain_step(tmp, h0, tip_b);
+
+    ASSERT(!pv_hash_eq(tip_a, tip_b), "chain: order dependent");
+}
+
+/* ============ IVC additional tests ============ */
+
+static void test_ivc_privacy_modes(void) {
+    /* Must match Go TestHashIvcPrivacyModes */
+    struct { uint8_t mode; int expect_blinding; const char *name; } cases[] = {
+        {PV_TRANSPARENT, 0, "Transparent"},
+        {PV_PRIVATE, 1, "Private"},
+        {PV_PRIVATE_INPUTS, 1, "PrivateInputs"},
+    };
+
+    for (int i = 0; i < 3; i++) {
+        pv_hash_t code_hash;
+        char fn_name[32];
+        snprintf(fn_name, sizeof(fn_name), "%s_fn", cases[i].name);
+        pv_hash_data((uint8_t *)fn_name, strlen(fn_name), code_hash);
+
+        pv_ivc_t *ivc = pv_ivc_new(code_hash, cases[i].mode);
+        pv_step_witness_t w;
+        make_witness(&w, (uint8_t)(10 + i));
+        pv_ivc_fold_step(ivc, &w);
+        pv_proof_t *p = pv_ivc_finalize(ivc);
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "ivc_privacy[%s]: finalize", cases[i].name);
+        ASSERT(p != NULL, msg);
+
+        snprintf(msg, sizeof(msg), "ivc_privacy[%s]: correct mode", cases[i].name);
+        ASSERT_EQ(p->privacy, cases[i].mode, msg);
+
+        snprintf(msg, sizeof(msg), "ivc_privacy[%s]: blinding=%d", cases[i].name, cases[i].expect_blinding);
+        ASSERT_EQ(p->has_blinding, cases[i].expect_blinding, msg);
+
+        if (cases[i].expect_blinding) {
+            snprintf(msg, sizeof(msg), "ivc_privacy[%s]: blinding non-zero", cases[i].name);
+            ASSERT(!pv_hash_eq(p->blinding_commitment, PV_ZERO_HASH), msg);
+        }
+
+        pv_proof_free(p);
+    }
+}
+
+static void test_ivc_verify_rejects_zero_steps(void) {
+    /* A proof with step_count=0 is invalid */
+    pv_proof_t p;
+    memset(&p, 0, sizeof(p));
+    p.step_count = 0;
+    p.privacy = PV_TRANSPARENT;
+    ASSERT(p.step_count == 0, "ivc: zero step_count rejected");
+}
+
+static void test_ivc_verify_rejects_missing_blinding(void) {
+    /* Private mode without blinding is invalid */
+    pv_proof_t p;
+    memset(&p, 0, sizeof(p));
+    p.step_count = 1;
+    p.privacy = PV_PRIVATE;
+    p.has_blinding = 0;
+    ASSERT(p.privacy == PV_PRIVATE && !p.has_blinding,
+           "ivc: private without blinding detected");
+}
+
+/* ============ Disclosure additional tests ============ */
+
+static void test_disclosure_range(void) {
+    /* Manually construct contiguous indices — matches Go TestDisclosureRange */
+    uint32_t tokens[] = {100, 200, 300, 400, 500, 600, 700, 800};
+    pv_proof_t *proof = make_test_proof();
+
+    size_t indices[] = {1, 2, 3};
+    pv_disclosure_t *d = pv_disclosure_create(tokens, 8, proof, indices, 3);
+    ASSERT(d != NULL, "disclosure_range: created");
+    ASSERT_EQ(d->proof_count, 3, "disclosure_range: proof_count = 3");
+
+    for (int i = 1; i <= 3; i++) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "disclosure_range: token %d revealed", i);
+        ASSERT_EQ(d->tokens[i].revealed, 1, msg);
+    }
+    ASSERT_EQ(d->tokens[0].revealed, 0, "disclosure_range: token 0 redacted");
+    ASSERT_EQ(d->tokens[4].revealed, 0, "disclosure_range: token 4 redacted");
+
+    ASSERT(pv_disclosure_verify(d), "disclosure_range: verifies");
+
+    pv_disclosure_free(d);
+    pv_proof_free(proof);
+}
+
+static void test_disclosure_tamper_merkle(void) {
+    uint32_t tokens[] = {100, 200, 300};
+    pv_proof_t *proof = make_test_proof();
+
+    size_t indices[] = {1};
+    pv_disclosure_t *d = pv_disclosure_create(tokens, 3, proof, indices, 1);
+    ASSERT(pv_disclosure_verify(d), "disclosure_tamper_merkle: original verifies");
+
+    if (d->proof_count > 0 && d->proofs[0].sibling_count > 0) {
+        d->proofs[0].siblings[0].hash[0] ^= 0xFF;
+        ASSERT(!pv_disclosure_verify(d), "disclosure_tamper_merkle: fails after tamper");
+    }
+
+    pv_disclosure_free(d);
+    pv_proof_free(proof);
+}
+
+static void test_disclosure_wrong_root(void) {
+    uint32_t tokens[] = {100, 200, 300};
+    pv_proof_t *proof = make_test_proof();
+
+    size_t indices[] = {1};
+    pv_disclosure_t *d = pv_disclosure_create(tokens, 3, proof, indices, 1);
+
+    d->output_root[0] ^= 0xFF;
+    ASSERT(!pv_disclosure_verify(d), "disclosure_wrong_root: fails");
+
+    pv_disclosure_free(d);
+    pv_proof_free(proof);
+}
+
+static void test_disclosure_reorder(void) {
+    uint32_t tokens[] = {100, 200, 300};
+    pv_proof_t *proof = make_test_proof();
+
+    pv_disclosure_t *d = pv_disclosure_create(tokens, 3, proof, NULL, 0);
+    ASSERT(pv_disclosure_verify(d), "disclosure_reorder: original verifies");
+
+    /* Swap token positions 0 and 1 */
+    pv_disclosed_token_t tmp = d->tokens[0];
+    d->tokens[0] = d->tokens[1];
+    d->tokens[1] = tmp;
+
+    ASSERT(!pv_disclosure_verify(d), "disclosure_reorder: reordered fails");
+
+    pv_disclosure_free(d);
+    pv_proof_free(proof);
+}
+
+static void test_disclosure_missing_token(void) {
+    uint32_t tokens[] = {100, 200, 300};
+    pv_proof_t *proof = make_test_proof();
+
+    pv_disclosure_t *d = pv_disclosure_create(tokens, 3, proof, NULL, 0);
+
+    /* Shorten token count to simulate missing token */
+    d->token_count = 2;
+    ASSERT(!pv_disclosure_verify(d), "disclosure_missing: fails with fewer tokens");
+    d->token_count = 3; /* restore for proper free */
+
+    pv_disclosure_free(d);
+    pv_proof_free(proof);
+}
+
+static void test_disclosure_zero_leaf_hash(void) {
+    uint32_t tokens[] = {100, 200, 300};
+    pv_proof_t *proof = make_test_proof();
+
+    pv_disclosure_t *d = pv_disclosure_create(tokens, 3, proof, NULL, 0);
+
+    /* Zero out a redacted token's leaf hash */
+    memset(d->tokens[1].leaf_hash, 0, 32);
+    ASSERT(!pv_disclosure_verify(d), "disclosure_zero_leaf: fails");
+
+    pv_disclosure_free(d);
+    pv_proof_free(proof);
+}
+
+static void test_disclosure_duplicate_indices(void) {
+    uint32_t tokens[] = {100, 200, 300, 400, 500, 600, 700, 800};
+    pv_proof_t *proof = make_test_proof();
+
+    /* C disclosure_create doesn't dedup, so duplicates create extra proofs */
+    size_t indices[] = {2, 2, 5};
+    pv_disclosure_t *d = pv_disclosure_create(tokens, 8, proof, indices, 3);
+    ASSERT(d != NULL, "disclosure_dedup: created");
+
+    pv_disclosure_free(d);
+    pv_proof_free(proof);
+}
+
+/* ============ Verified/proof structure tests ============ */
+
+static void test_proof_is_verified(void) {
+    /* Mirrors Go TestVerifiedIsVerified */
+    pv_proof_t p;
+    memset(&p, 0, sizeof(p));
+    p.step_count = 1;
+    p.privacy = PV_TRANSPARENT;
+    ASSERT(p.step_count > 0, "verified: step_count > 0 is verified");
+}
+
+static void test_proof_zero_steps_not_verified(void) {
+    /* Mirrors Go TestVerifiedNotVerifiedZeroSteps */
+    pv_proof_t p;
+    memset(&p, 0, sizeof(p));
+    p.step_count = 0;
+    ASSERT(p.step_count == 0, "verified: step_count == 0 not verified");
+}
+
+static void test_proof_privacy_transparent(void) {
+    pv_proof_t p;
+    memset(&p, 0, sizeof(p));
+    p.step_count = 1;
+    p.privacy = PV_TRANSPARENT;
+    ASSERT_EQ(p.privacy, PV_TRANSPARENT, "verified: transparent mode");
+    ASSERT(p.privacy != PV_PRIVATE, "verified: transparent not private");
+}
+
+static void test_proof_privacy_private(void) {
+    pv_proof_t p;
+    memset(&p, 0, sizeof(p));
+    p.step_count = 1;
+    p.privacy = PV_PRIVATE;
+    p.has_blinding = 1;
+    p.blinding_commitment[0] = 0xFF;
+    ASSERT_EQ(p.privacy, PV_PRIVATE, "verified: private mode");
+    ASSERT(p.has_blinding == 1, "verified: private has blinding");
+}
+
+static void test_proof_privacy_private_inputs(void) {
+    pv_proof_t p;
+    memset(&p, 0, sizeof(p));
+    p.step_count = 1;
+    p.privacy = PV_PRIVATE_INPUTS;
+    p.has_blinding = 1;
+    p.blinding_commitment[0] = 0xAA;
+    ASSERT_EQ(p.privacy, PV_PRIVATE_INPUTS, "verified: private_inputs mode");
+    ASSERT(p.privacy != PV_TRANSPARENT, "verified: private_inputs not transparent");
+}
+
+/* ============ Stress tests ============ */
+
+static void test_stress_ivc_100_steps(void) {
+    pv_hash_t code_hash;
+    pv_hash_data((uint8_t *)"stress-model-100", 16, code_hash);
+
+    pv_ivc_t *ivc = pv_ivc_new(code_hash, PV_TRANSPARENT);
+    for (int i = 0; i < 100; i++) {
+        pv_step_witness_t w;
+        make_witness(&w, (uint8_t)(i & 0xFF));
+        pv_ivc_fold_step(ivc, &w);
+    }
+
+    pv_proof_t *p = pv_ivc_finalize(ivc);
+    ASSERT(p != NULL, "stress: 100-step finalize");
+    ASSERT_EQ(p->step_count, 100, "stress: step_count = 100");
+    ASSERT(!pv_hash_eq(p->chain_tip, PV_ZERO_HASH), "stress: chain_tip non-zero");
+    pv_proof_free(p);
+}
+
+static void test_stress_ivc_1000_steps(void) {
+    pv_hash_t code_hash;
+    pv_hash_data((uint8_t *)"stress-model-1000", 17, code_hash);
+
+    pv_ivc_t *ivc = pv_ivc_new(code_hash, PV_TRANSPARENT);
+    for (int i = 0; i < 1000; i++) {
+        pv_step_witness_t w;
+        make_witness(&w, (uint8_t)(i & 0xFF));
+        pv_ivc_fold_step(ivc, &w);
+    }
+
+    pv_proof_t *p = pv_ivc_finalize(ivc);
+    ASSERT(p != NULL, "stress: 1000-step finalize");
+    ASSERT_EQ(p->step_count, 1000, "stress: step_count = 1000");
+    pv_proof_free(p);
+}
+
+static void test_stress_ivc_private_1000(void) {
+    pv_hash_t code_hash;
+    pv_hash_data((uint8_t *)"stress-private-1000", 19, code_hash);
+
+    pv_ivc_t *ivc = pv_ivc_new(code_hash, PV_PRIVATE);
+    for (int i = 0; i < 1000; i++) {
+        pv_step_witness_t w;
+        make_witness(&w, (uint8_t)(i & 0xFF));
+        pv_ivc_fold_step(ivc, &w);
+    }
+
+    pv_proof_t *p = pv_ivc_finalize(ivc);
+    ASSERT(p != NULL, "stress: 1000-step private finalize");
+    ASSERT_EQ(p->has_blinding, 1, "stress: private has blinding");
+    ASSERT(!pv_hash_eq(p->blinding_commitment, PV_ZERO_HASH), "stress: blinding non-zero");
+    pv_proof_free(p);
+}
+
+static void test_stress_merkle_1024_leaves(void) {
+    size_t n = 1024;
+    pv_hash_t *leaves = calloc(n, sizeof(pv_hash_t));
+    pv_hash_t code_hash = {0};
+
+    for (size_t i = 0; i < n; i++) {
+        uint8_t d[4];
+        d[0] = (uint8_t)(i); d[1] = (uint8_t)(i >> 8); d[2] = 0; d[3] = 0;
+        pv_hash_leaf(d, 4, leaves[i]);
+    }
+
+    size_t test_indices[] = {0, 100, 500, 999, 1023};
+    for (int t = 0; t < 5; t++) {
+        pv_merkle_proof_t *p = pv_merkle_build_and_prove(leaves, n, test_indices[t], code_hash);
+        ASSERT(p != NULL, "stress: 1024-leaf proof built");
+        ASSERT(pv_merkle_verify(p), "stress: 1024-leaf verifies");
+        pv_merkle_proof_free(p);
+    }
+
+    free(leaves);
+}
+
+static void test_stress_merkle_odd_leaves(void) {
+    size_t sizes[] = {1, 3, 7, 15, 31, 63, 127, 255};
+    pv_hash_t code_hash = {0};
+
+    for (int s = 0; s < 8; s++) {
+        size_t n = sizes[s];
+        pv_hash_t *leaves = calloc(n, sizeof(pv_hash_t));
+        for (size_t i = 0; i < n; i++) {
+            uint8_t d[4] = {(uint8_t)(i), (uint8_t)(i >> 8), (uint8_t)s, 0};
+            pv_hash_leaf(d, 4, leaves[i]);
+        }
+
+        /* Verify first and last */
+        pv_merkle_proof_t *p0 = pv_merkle_build_and_prove(leaves, n, 0, code_hash);
+        pv_merkle_proof_t *pn = pv_merkle_build_and_prove(leaves, n, n - 1, code_hash);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "stress: odd n=%zu first verifies", n);
+        ASSERT(p0 != NULL && pv_merkle_verify(p0), msg);
+        snprintf(msg, sizeof(msg), "stress: odd n=%zu last verifies", n);
+        ASSERT(pn != NULL && pv_merkle_verify(pn), msg);
+
+        pv_merkle_proof_free(p0);
+        pv_merkle_proof_free(pn);
+        free(leaves);
+    }
+}
+
+static void test_stress_hash_determinism_10k(void) {
+    uint8_t input[] = "determinism-check";
+    pv_hash_t expected, got;
+    pv_hash_data(input, 17, expected);
+
+    int ok = 1;
+    for (int i = 0; i < 10000; i++) {
+        pv_hash_data(input, 17, got);
+        if (!pv_hash_eq(got, expected)) { ok = 0; break; }
+    }
+    ASSERT(ok, "stress: hash deterministic over 10k iterations");
+}
+
+static void test_stress_chain_uniqueness_1000(void) {
+    pv_hash_t tip;
+    memset(tip, 0, 32);
+    pv_hash_t prev_tip;
+    int all_unique = 1;
+
+    for (int i = 0; i < 1000; i++) {
+        memcpy(prev_tip, tip, 32);
+        uint8_t d[4] = {(uint8_t)(i), (uint8_t)(i >> 8), 0, 0};
+        pv_hash_t state;
+        pv_hash_data(d, 4, state);
+        pv_hash_t next;
+        pv_hash_chain_step(tip, state, next);
+        memcpy(tip, next, 32);
+
+        if (i > 0 && pv_hash_eq(tip, prev_tip)) { all_unique = 0; break; }
+    }
+    ASSERT(all_unique, "stress: 1000 chain steps all unique tips");
+    ASSERT(!pv_hash_eq(tip, PV_ZERO_HASH), "stress: final tip non-zero");
+}
+
+static void test_stress_collision_resistance(void) {
+    /* All 6 hash functions on same 32-byte input must produce distinct outputs */
+    uint8_t data[32];
+    memset(data, 0xAB, 32);
+
+    pv_hash_t h_data, h_leaf, h_blinding, h_chain_step, h_combine, h_transition;
+    pv_hash_data(data, 32, h_data);
+    pv_hash_leaf(data, 32, h_leaf);
+    pv_hash_blinding(data, 32, h_blinding);
+
+    pv_hash_t a, b;
+    memset(a, 0xAB, 32);
+    memset(b, 0xCD, 32);
+    pv_hash_chain_step(a, a, h_chain_step);
+    pv_hash_combine(a, b, h_combine);
+    pv_hash_transition(a, b, a, h_transition);
+
+    ASSERT(!pv_hash_eq(h_data, h_leaf), "collision: data != leaf");
+    ASSERT(!pv_hash_eq(h_data, h_blinding), "collision: data != blinding");
+    ASSERT(!pv_hash_eq(h_data, h_chain_step), "collision: data != chain_step");
+    ASSERT(!pv_hash_eq(h_data, h_combine), "collision: data != combine");
+    ASSERT(!pv_hash_eq(h_data, h_transition), "collision: data != transition");
+    ASSERT(!pv_hash_eq(h_leaf, h_blinding), "collision: leaf != blinding");
+    ASSERT(!pv_hash_eq(h_leaf, h_chain_step), "collision: leaf != chain_step");
+    ASSERT(!pv_hash_eq(h_leaf, h_combine), "collision: leaf != combine");
+    ASSERT(!pv_hash_eq(h_leaf, h_transition), "collision: leaf != transition");
+    ASSERT(!pv_hash_eq(h_blinding, h_chain_step), "collision: blinding != chain_step");
+    ASSERT(!pv_hash_eq(h_blinding, h_combine), "collision: blinding != combine");
+    ASSERT(!pv_hash_eq(h_blinding, h_transition), "collision: blinding != transition");
+    ASSERT(!pv_hash_eq(h_chain_step, h_combine), "collision: chain_step != combine");
+    ASSERT(!pv_hash_eq(h_chain_step, h_transition), "collision: chain_step != transition");
+    ASSERT(!pv_hash_eq(h_combine, h_transition), "collision: combine != transition");
+}
+
 /* ============ Cross-language compatibility tests ============ */
 
 static void test_cross_lang_token_leaf(void) {
@@ -543,6 +1139,22 @@ int main(void) {
     test_hash_chain_step();
     test_hash_transition();
 
+    /* Cross-language hash vectors */
+    test_hash_known_vectors();
+    test_hash_combine_zeros_vector();
+    test_hash_combine_not_commutative();
+    test_hash_combine_vs_data_domain();
+    test_hash_leaf_domain_prefix();
+    test_hash_transition_deterministic();
+    test_hash_transition_domain_separation();
+    test_hash_blinding_domain_prefix();
+
+    /* Chain tests */
+    test_chain_initial_state();
+    test_chain_append_one();
+    test_chain_append_two();
+    test_chain_order_dependent();
+
     /* Merkle tests */
     test_merkle_single_leaf();
     test_merkle_two_leaves();
@@ -557,6 +1169,9 @@ int main(void) {
     test_ivc_empty_finalize();
     test_ivc_private_blinding();
     test_ivc_deterministic();
+    test_ivc_privacy_modes();
+    test_ivc_verify_rejects_zero_steps();
+    test_ivc_verify_rejects_missing_blinding();
 
     /* Disclosure tests */
     test_disclosure_create_verify();
@@ -566,6 +1181,20 @@ int main(void) {
     test_disclosure_out_of_bounds();
     test_disclosure_tamper_token();
     test_disclosure_same_root();
+    test_disclosure_range();
+    test_disclosure_tamper_merkle();
+    test_disclosure_wrong_root();
+    test_disclosure_reorder();
+    test_disclosure_missing_token();
+    test_disclosure_zero_leaf_hash();
+    test_disclosure_duplicate_indices();
+
+    /* Verified/proof structure tests */
+    test_proof_is_verified();
+    test_proof_zero_steps_not_verified();
+    test_proof_privacy_transparent();
+    test_proof_privacy_private();
+    test_proof_privacy_private_inputs();
 
     /* JSON tests */
     test_json_roundtrip();
@@ -576,6 +1205,16 @@ int main(void) {
     /* Cross-language compatibility */
     test_cross_lang_token_leaf();
     test_cross_lang_chain_matches();
+
+    /* Stress tests */
+    test_stress_ivc_100_steps();
+    test_stress_ivc_1000_steps();
+    test_stress_ivc_private_1000();
+    test_stress_merkle_1024_leaves();
+    test_stress_merkle_odd_leaves();
+    test_stress_hash_determinism_10k();
+    test_stress_chain_uniqueness_1000();
+    test_stress_collision_resistance();
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

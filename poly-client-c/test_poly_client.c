@@ -229,6 +229,45 @@ static void test_invalid_response(void) {
     pc_client_free(c);
 }
 
+static void test_disclosure_range_from_response(void) {
+    /* Mirrors Go TestDisclosureRangeFromResponse — contiguous index range */
+    pc_client_t *c = pc_client_new("test-model", PV_MODE_PRIVATE_PROVEN);
+    uint32_t tokens[] = {10, 20, 30, 40, 50};
+    char *resp_json = mock_server_response(tokens, 5);
+
+    pc_verified_response_t *vr = pc_client_process_response_json(c, resp_json);
+    ASSERT(vr != NULL, "range_disclosure: response parsed");
+
+    size_t indices[] = {1, 2};
+    pv_disclosure_t *d = pc_verified_response_disclose(vr, indices, 2);
+    ASSERT(d != NULL, "range_disclosure: created");
+    ASSERT(pv_disclosure_verify(d), "range_disclosure: verifies");
+    ASSERT_EQ(d->proof_count, 2, "range_disclosure: proof_count = 2");
+
+    pv_disclosure_free(d);
+    pc_verified_response_free(vr);
+    free(resp_json);
+    pc_client_free(c);
+}
+
+static void test_serialization_roundtrip(void) {
+    /* Mirrors Go TestSerializationRoundtrip — verify request JSON contains expected fields */
+    pc_client_t *c = pc_client_new("test-model", PV_MODE_ENCRYPTED);
+    uint32_t tokens[] = {100, 200, 300};
+    char *req = pc_client_prepare_request_json(c, tokens, 3, 50, 700, 42);
+
+    ASSERT(req != NULL, "serialization: request produced");
+    ASSERT(strstr(req, "\"model_id\":\"test-model\"") != NULL, "serialization: model_id");
+    ASSERT(strstr(req, "\"mode\":\"Encrypted\"") != NULL, "serialization: mode");
+    ASSERT(strstr(req, "\"max_tokens\":50") != NULL, "serialization: max_tokens");
+    ASSERT(strstr(req, "\"temperature\":700") != NULL, "serialization: temperature");
+    ASSERT(strstr(req, "\"seed\":42") != NULL, "serialization: seed");
+    ASSERT(strstr(req, "\"tokens\":[100,200,300]") != NULL, "serialization: tokens");
+
+    free(req);
+    pc_client_free(c);
+}
+
 /* ---------- Main ---------- */
 
 int main(void) {
@@ -241,6 +280,8 @@ int main(void) {
     test_large_input();
     test_mode_propagation();
     test_invalid_response();
+    test_disclosure_range_from_response();
+    test_serialization_roundtrip();
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
