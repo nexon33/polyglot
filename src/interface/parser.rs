@@ -19,7 +19,7 @@ pub enum InterfaceItem {
 }
 
 /// Trait definition - compiles to WIT interface
-/// ```
+/// ```text
 /// trait Processor {
 ///     fn process(data: list<i32>) -> i32;
 ///     fn name() -> string;
@@ -128,7 +128,7 @@ pub fn parse_interface(input: &str) -> Result<Vec<InterfaceItem>, String> {
 }
 
 /// Parse a trait definition
-/// ```
+/// ```text
 /// trait Processor {
 ///     fn process(data: list<i32>) -> i32;
 ///     fn name() -> string;
