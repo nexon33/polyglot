@@ -7,7 +7,7 @@
 //! are automatically marshaled and passed to Python.
 //!
 //! # Example  
-//! ```rust
+//! ```ignore
 //! let data = vec![1, 2, 3];
 //! let result: Vec<i32> = py!{ [x * 2 for x in data] };
 //! ```

@@ -335,9 +335,17 @@ mod tests {
 
     #[test]
     fn horner_degree_7() {
-        // Degree-7 polynomial evaluated with 10 primes (9 levels, need 7)
+        // Release: degree-7 with 10 primes (9 levels, need 7).
+        // Debug: degree-3 with 5 primes (same eval path, lighter math).
         let mut rng = test_rng();
-        let ctx = RnsCkksContext::new(10);
+
+        let (num_primes, coeffs_slice, tol): (usize, &[f64], f64) = if cfg!(debug_assertions) {
+            (5, &[4.0, 3.0, 2.0, 1.0], 1.0) // degree-3
+        } else {
+            (10, &[0.0, 0.5, 0.0, 0.08333, 0.0, -0.00139, 0.0, 0.0000248], 0.5) // degree-7
+        };
+
+        let ctx = RnsCkksContext::new(num_primes);
         let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
         let evk = rns_gen_eval_key(&s, &ctx, &mut rng);
 
@@ -345,22 +353,21 @@ mod tests {
         let input = vec![x_val; simd::NUM_SLOTS];
         let ct_x = rns_encrypt_simd(&input, &pk_b, &pk_a, &ctx, &mut rng);
 
-        // Approximate SiLU-like polynomial (small coefficients)
-        let coeffs = [0.0, 0.5, 0.0, 0.08333, 0.0, -0.00139, 0.0, 0.0000248];
-        let ct_result = rns_poly_eval(&ct_x, &coeffs, &evk, &ctx);
+        let ct_result = rns_poly_eval(&ct_x, coeffs_slice, &evk, &ctx);
         let decrypted = rns_decrypt_simd(&ct_result, &s, &ctx, 4);
 
-        let expected = poly_eval_plain(x_val, &coeffs);
+        let expected = poly_eval_plain(x_val, coeffs_slice);
         println!(
-            "degree-7: x={}, expected {:.6}, decrypted {:?}",
-            x_val, expected, &decrypted[..4]
+            "degree-{}: x={}, expected {:.6}, decrypted {:?}",
+            coeffs_slice.len() - 1, x_val, expected, &decrypted[..4]
         );
         println!("  primes remaining: {}", ct_result.c0.num_primes);
         for i in 0..4 {
             assert!(
-                (decrypted[i] - expected).abs() < 0.5,
-                "slot {} degree-7: expected {:.6}, got {:.6}",
+                (decrypted[i] - expected).abs() < tol,
+                "slot {} degree-{}: expected {:.6}, got {:.6}",
                 i,
+                coeffs_slice.len() - 1,
                 expected,
                 decrypted[i]
             );

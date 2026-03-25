@@ -1740,11 +1740,17 @@ mod tests {
 
     #[test]
     fn deep_chain_10_primes() {
-        // Verify that 10-prime chain supports 8 sequential squarings.
-        // x=1.1, square 8 times → x^256 ≈ 39.5 billion.
-        // With delta=2^36 ≈ q, scale is preserved at every level.
+        // Full: 10-prime chain, 8 sequential squarings → x^256 ≈ 39.5 billion.
+        // Debug: 4-prime chain, 2 squarings → x^4 (same code paths, lighter math).
+        let (num_primes, num_squarings) = if cfg!(debug_assertions) {
+            (4, 2)
+        } else {
+            (10, 8)
+        };
+        let expected_primes_left = num_primes - num_squarings;
+
         let mut rng = test_rng();
-        let ctx = RnsCkksContext::new(10);
+        let ctx = RnsCkksContext::new(num_primes);
         let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
         let evk = rns_gen_eval_key(&s, &ctx, &mut rng);
 
@@ -1752,20 +1758,24 @@ mod tests {
 
         let mut ct_pow = ct.clone();
         let mut expected = 1.1f64;
-        for _ in 0..8 {
+        for _ in 0..num_squarings {
             ct_pow = rns_ct_mul_relin(&ct_pow, &ct_pow, &evk, &ctx);
             ct_pow = rns_rescale(&ct_pow);
             expected *= expected;
         }
 
-        assert_eq!(ct_pow.c0.num_primes, 2, "should have 2 primes after 8 squarings");
+        assert_eq!(
+            ct_pow.c0.num_primes, expected_primes_left,
+            "should have {} primes after {} squarings",
+            expected_primes_left, num_squarings
+        );
 
         let decrypted = rns_decrypt_f64(&ct_pow, &s, &ctx);
         let rel_error = (decrypted - expected).abs() / expected;
         assert!(
-            rel_error < 0.01, // within 1% relative error
-            "1.1^256: expected {:.2}, got {:.2}, rel_err {:.6}",
-            expected, decrypted, rel_error
+            rel_error < 0.01,
+            "1.1^{}: expected {:.2}, got {:.2}, rel_err {:.6}",
+            1 << num_squarings, expected, decrypted, rel_error
         );
     }
 
@@ -1888,17 +1898,19 @@ mod tests {
 
     #[test]
     fn simd_large_vector() {
-        // Fill all 2048 slots
+        // Release: fill all 2048 slots. Debug: 64 slots (same path, lighter).
+        let num_slots = if cfg!(debug_assertions) { 64 } else { simd::NUM_SLOTS };
+
         let mut rng = test_rng();
         let ctx = RnsCkksContext::new(3);
         let (s, pk_b, pk_a) = rns_keygen(&ctx, &mut rng);
 
-        let values: Vec<f64> = (0..simd::NUM_SLOTS)
+        let values: Vec<f64> = (0..num_slots)
             .map(|i| (i as f64 * 0.1).sin() * 5.0)
             .collect();
 
         let ct = rns_encrypt_simd(&values, &pk_b, &pk_a, &ctx, &mut rng);
-        let decrypted = rns_decrypt_simd(&ct, &s, &ctx, simd::NUM_SLOTS);
+        let decrypted = rns_decrypt_simd(&ct, &s, &ctx, num_slots);
 
         let max_err = values
             .iter()
@@ -1908,8 +1920,8 @@ mod tests {
 
         assert!(
             max_err < 0.01,
-            "2048-slot roundtrip max error {} too large",
-            max_err
+            "{}-slot roundtrip max error {} too large",
+            num_slots, max_err
         );
     }
 

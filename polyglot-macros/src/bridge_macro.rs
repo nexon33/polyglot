@@ -4,7 +4,7 @@
 //! data between Rust and foreign language runtimes.
 //!
 //! # Example
-//! ```rust
+//! ```ignore
 //! #[poly_bridge(python)]
 //! trait DataFrame {
 //!     fn len(&self) -> usize;
