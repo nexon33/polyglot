@@ -212,6 +212,13 @@ pub struct SmtProof {
 pub struct GlobalState {
     pub wallets: SparseMerkleTree,
     pub identities: SparseMerkleTree,
+    /// [R21-01] Reverse index: `identity_hash` -> owning `account_id`.
+    /// The `identities` SMT is keyed by `account_id`, so it cannot answer
+    /// "is this identity_hash already claimed by someone else?". This index
+    /// enforces one-account-per-identity. `#[serde(default)]` keeps older
+    /// serialized states (without this field) deserializable.
+    #[serde(default)]
+    pub identity_index: SparseMerkleTree,
     pub compliance: SparseMerkleTree,
     pub fraud: SparseMerkleTree,
     pub backups: SparseMerkleTree,
@@ -232,6 +239,7 @@ impl GlobalState {
         Self {
             wallets: SparseMerkleTree::new(),
             identities: SparseMerkleTree::new(),
+            identity_index: SparseMerkleTree::new(),
             compliance: SparseMerkleTree::new(),
             fraud: SparseMerkleTree::new(),
             backups: SparseMerkleTree::new(),
@@ -250,9 +258,12 @@ impl GlobalState {
     /// state snapshot to forge a state with reset nonces, enabling transaction replays
     /// that bypass the nonce check (because the replayed nonce would match the forged state).
     pub fn state_root(&self) -> Hash {
-        let mut data = Vec::with_capacity(9 * 32);
+        let mut data = Vec::with_capacity(10 * 32);
         data.extend_from_slice(&self.wallets.root());
         data.extend_from_slice(&self.identities.root());
+        // [R21-01] Commit the identity reverse-index into the state root so it
+        // cannot be forged from a state snapshot (mirrors the R11 nonce fix).
+        data.extend_from_slice(&self.identity_index.root());
         data.extend_from_slice(&self.compliance.root());
         data.extend_from_slice(&self.fraud.root());
         data.extend_from_slice(&self.backups.root());
@@ -307,6 +318,17 @@ impl GlobalState {
 
     pub fn set_identity(&mut self, account_id: AccountId, identity_hash: Hash) {
         self.identities.set(account_id, identity_hash);
+    }
+
+    /// [R21-01] Get the account that has claimed a given `identity_hash`.
+    pub fn get_identity_owner(&self, identity_hash: &Hash) -> Option<AccountId> {
+        self.identity_index.get(identity_hash).copied()
+    }
+
+    /// [R21-01] Bind an `identity_hash` to its owning account — the reverse
+    /// index of `identities`. Enforces that one identity maps to one account.
+    pub fn set_identity_owner(&mut self, identity_hash: Hash, account_id: AccountId) {
+        self.identity_index.set(identity_hash, account_id);
     }
 
     // -----------------------------------------------------------------------

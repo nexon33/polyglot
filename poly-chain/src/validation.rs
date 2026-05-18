@@ -401,9 +401,31 @@ fn validate_cash_transfer(
     new_state.set_nonce(tx.from, next_nonce);
 
     // 2. Verify proof (the circuit verified the computation was correct)
+    //
+    // [R22-01 FIX] Bind the authorization / compliance fields into the proof's
+    // I/O hashes. Previously the proof committed only to
+    // (from, state_pre, nonce) -> (to, amount, fee, timestamp), so
+    // `sender_frozen`, `recipient_frozen`, `sender_tier`, the identity hashes,
+    // `rolling_24h_total_after` and `jurisdiction` were NOT covered by the
+    // proof at all — they were only self-attested by the sender's signature.
+    // The validator checks (`if tx.sender_frozen { reject }`, the tier and
+    // rolling-total compliance checks) therefore operated on values a
+    // malicious sender freely chose: a frozen sender signs `sender_frozen =
+    // false`, or a sender under-reports `sender_tier` / `rolling_24h_total_after`
+    // to evade compliance reporting. Binding these fields means a sound proof
+    // must attest them, matching the "the proof attests frozen status / tier"
+    // design intent stated above.
     let input_hash = hash_with_domain(
         DOMAIN_TRANSFER,
-        &[tx.from.as_slice(), &tx.state_pre, &tx.nonce.to_le_bytes()].concat(),
+        &[
+            tx.from.as_slice(),
+            &tx.state_pre,
+            &tx.nonce.to_le_bytes(),
+            &[tx.sender_tier as u8],
+            &tx.sender_identity_hash,
+            &[if tx.sender_frozen { 1u8 } else { 0u8 }],
+        ]
+        .concat(),
     );
     let output_hash = hash_with_domain(
         DOMAIN_TRANSFER,
@@ -412,6 +434,10 @@ fn validate_cash_transfer(
             &tx.amount.to_le_bytes(),
             &tx.fee.to_le_bytes(),
             &tx.timestamp.to_le_bytes(),
+            &tx.recipient_identity_hash,
+            &[if tx.recipient_frozen { 1u8 } else { 0u8 }],
+            &tx.rolling_24h_total_after.to_le_bytes(),
+            &tx.jurisdiction.to_le_bytes(),
         ]
         .concat(),
     );
@@ -573,6 +599,18 @@ fn validate_identity_register(
         ));
     }
 
+    // [R21-01 FIX] Reject reuse of an identity_hash already bound to a
+    // DIFFERENT account. The duplicate check above is keyed by account_id, so
+    // it only catches the same account re-registering. Without this check an
+    // attacker registers a fresh account_id claiming a victim's identity_hash
+    // (H(national_id||dob||country)), stealing the victim's KYC tier and
+    // PublicOfficial status and breaking the one-identity-one-account invariant.
+    if let Some(existing_owner) = state.get_identity_owner(&tx.identity_hash) {
+        if existing_owner != tx.account_id {
+            return Err(ChainError::DuplicateIdentity);
+        }
+    }
+
     // PublicOfficial tier requires is_public_official flag
     if tx.tier == Tier::PublicOfficial && !tx.is_public_official {
         return Err(ChainError::TierViolation(
@@ -642,6 +680,9 @@ fn validate_identity_register(
         office: tx.office.clone(),
     };
     new_state.set_identity(tx.account_id, record.record_hash());
+    // [R21-01 FIX] Record the identity_hash -> account_id binding so any later
+    // registration that reuses this identity_hash is rejected above.
+    new_state.set_identity_owner(tx.identity_hash, tx.account_id);
 
     // If wallet doesn't exist yet, create it
     if state.get_wallet(&tx.account_id).is_none() {
