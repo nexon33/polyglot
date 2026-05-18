@@ -50,6 +50,10 @@ pub const DOMAIN_BLOCK: u8 = 0x14;
 pub const DOMAIN_FRAUD: u8 = 0x15;
 pub const DOMAIN_STP: u8 = 0x16;
 pub const DOMAIN_SWAP: u8 = 0x17;
+/// [R24-01] Domain for SparseMerkleTree leaf hashes. Distinct from
+/// `hash_combine`'s 0x03 prefix (used for Merkle interior nodes) so an SMT
+/// leaf hash can never be structurally confused with an interior node.
+pub const DOMAIN_SMT_LEAF: u8 = 0x18;
 
 /// Domain-separated SHA-256 hash: H(domain_byte || data).
 pub fn hash_with_domain(domain: u8, data: &[u8]) -> Hash {

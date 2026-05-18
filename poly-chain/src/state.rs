@@ -1,4 +1,3 @@
-use poly_verified::crypto::hash::hash_combine;
 use poly_verified::types::{Hash, ZERO_HASH};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -176,11 +175,24 @@ impl SparseMerkleTree {
             return;
         }
 
-        // Deterministic ordering via BTreeMap
+        // Deterministic ordering via BTreeMap.
+        //
+        // [R24-01 FIX] Domain-separate SMT leaf hashes from Merkle interior
+        // nodes. `MerkleTree::build` combines interior nodes with `hash_combine`
+        // (SHA-256 with the 0x03 prefix); leaves were ALSO `hash_combine(k, v)`,
+        // so a leaf hash and an interior-node hash were drawn from the same hash
+        // domain — the classic Merkle leaf/interior ambiguity, where an interior
+        // node can be reinterpreted as a leaf. Leaves now use a distinct domain
+        // (DOMAIN_SMT_LEAF = 0x18).
         let leaf_hashes: Vec<Hash> = self
             .leaves
             .iter()
-            .map(|(k, v)| hash_combine(k, v))
+            .map(|(k, v)| {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(k);
+                buf[32..].copy_from_slice(v);
+                hash_with_domain(DOMAIN_SMT_LEAF, &buf)
+            })
             .collect();
 
         // Build Merkle tree from leaf hashes
