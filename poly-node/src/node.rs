@@ -547,8 +547,23 @@ async fn handle_stream(
     handshake_attempted: Arc<std::sync::atomic::AtomicBool>,
     model_name: Arc<String>,
 ) -> Result<()> {
-    // Read entire request with timeout (max 16MB)
-    let data = tokio::time::timeout(STREAM_READ_TIMEOUT, recv.read_to_end(16 * 1024 * 1024))
+    // Read entire request with timeout.
+    // R17: Cap the read at the Hello size limit while the handshake is not yet
+    // complete. Before R17, every stream — including unauthenticated
+    // pre-handshake streams whose only valid message is a ~64 KB Hello — was
+    // read with a 16 MB limit. An unauthenticated peer could open up to
+    // MAX_PRE_HANDSHAKE_STREAMS streams per connection and send 16 MB on each,
+    // forcing the server to allocate 8 x 16 MB of attacker-controlled memory
+    // before the 64 KB Hello limit (enforced only inside bincode, after the
+    // full read) ever applied. Pre-handshake the cap is now MAX_HELLO_SIZE plus
+    // a small allowance for the frame header; post-handshake the 16 MB cap
+    // (covering the largest inference request) still applies.
+    let read_limit: usize = if handshake_done.load(std::sync::atomic::Ordering::SeqCst) {
+        16 * 1024 * 1024
+    } else {
+        (MAX_HELLO_SIZE + 1024) as usize
+    };
+    let data = tokio::time::timeout(STREAM_READ_TIMEOUT, recv.read_to_end(read_limit))
         .await
         .map_err(|_| anyhow::anyhow!("stream read timeout"))??;
 

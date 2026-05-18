@@ -81,7 +81,13 @@ fn verify_signature_if_not_mock(
 
 /// Validate that a timestamp is within acceptable drift of `now`.
 fn validate_timestamp(tx_timestamp: Timestamp, now: Timestamp) -> Result<()> {
-    if tx_timestamp > now + MAX_TIMESTAMP_DRIFT
+    // R17: Use saturating_add for the upper bound. Before R17, `now +
+    // MAX_TIMESTAMP_DRIFT` was an unchecked addition: if `now` is within
+    // MAX_TIMESTAMP_DRIFT of u64::MAX (a manipulated or corrupt clock value),
+    // the addition panics in debug builds and wraps in release builds. On wrap,
+    // the comparison becomes trivially satisfiable, disabling timestamp
+    // validation entirely. Saturating arithmetic clamps to u64::MAX instead.
+    if tx_timestamp > now.saturating_add(MAX_TIMESTAMP_DRIFT)
         || (now > MAX_TIMESTAMP_DRIFT && tx_timestamp < now - MAX_TIMESTAMP_DRIFT)
     {
         return Err(ChainError::InvalidTimestamp);
@@ -1032,6 +1038,22 @@ fn validate_stp_action(
             if state.get_stp_record(&target_key).is_some() {
                 return Err(ChainError::STPError(
                     "investigation already exists for this pool_id".into(),
+                ));
+            }
+
+            // R17: Reject a pool_id whose STP-subtree key is already occupied.
+            // STP service contracts are stored under the official's raw
+            // account_id key, while investigations are stored under the raw
+            // pool_id key — both share a single SMT namespace. If pool_id equals
+            // a registered official's account_id, creating the investigation
+            // record below would OVERWRITE (destroy) that official's contract
+            // record, letting the official escape CheckDeadline slashing or
+            // re-register a weaker contract. A fresh investigation must always
+            // target an unused key; the R10 check above only covers the case
+            // where the collided record is itself a prior investigation.
+            if state.get_stp_record(pool_id).is_some() {
+                return Err(ChainError::STPError(
+                    "pool_id collides with an existing STP record".into(),
                 ));
             }
 
