@@ -1355,6 +1355,102 @@ pub async fn connect_and_infer(
                 );
             }
         }
+        // R16: Validate server HelloAck NodeInfo addresses. The server validates
+        // these fields on the client's Hello (R13/R14/R15) but the client did
+        // not mirror the checks on the server's HelloAck. A malicious server
+        // could advertise non-routable, multicast, broadcast, or link-local
+        // addresses that the client would store in its peer table, polluting
+        // gossip routing for all downstream peers.
+        {
+            let mut unique_addrs = std::collections::HashSet::new();
+            for a in &ack.node_info.addresses {
+                if !unique_addrs.insert(a) {
+                    anyhow::bail!("server HelloAck has duplicate address {}", a);
+                }
+                if a.ip().is_unspecified() || a.port() == 0 {
+                    anyhow::bail!(
+                        "server HelloAck has non-routable address {} (unspecified IP or port 0)",
+                        a
+                    );
+                }
+                if a.ip().is_multicast() {
+                    anyhow::bail!(
+                        "server HelloAck has multicast address {} (QUIC requires unicast)",
+                        a
+                    );
+                }
+                match a.ip() {
+                    std::net::IpAddr::V4(v4) => {
+                        if v4.is_broadcast() {
+                            anyhow::bail!("server HelloAck has broadcast address {}", a);
+                        }
+                        if v4.is_link_local() {
+                            anyhow::bail!(
+                                "server HelloAck has link-local address {} (unreachable cross-network)",
+                                a
+                            );
+                        }
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        let segments = v6.segments();
+                        if (segments[0] & 0xffc0) == 0xfe80 {
+                            anyhow::bail!(
+                                "server HelloAck has IPv6 link-local address {}",
+                                a
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // R16: Validate server HelloAck NodeInfo capacity fields, mirroring the
+        // server-side R14 checks. A malicious server could claim max_sessions=0
+        // (cannot serve any traffic), active_sessions > max_sessions (illogical),
+        // or an absurd queue_depth to skew gossip load balancing.
+        {
+            let cap = &ack.node_info.capacity;
+            if cap.max_sessions == 0 {
+                anyhow::bail!("server HelloAck capacity has max_sessions=0");
+            }
+            if cap.max_sessions > MAX_SESSIONS_LIMIT {
+                anyhow::bail!(
+                    "server HelloAck capacity max_sessions {} exceeds limit {}",
+                    cap.max_sessions, MAX_SESSIONS_LIMIT
+                );
+            }
+            if cap.active_sessions > cap.max_sessions {
+                anyhow::bail!(
+                    "server HelloAck capacity active_sessions ({}) > max_sessions ({})",
+                    cap.active_sessions, cap.max_sessions
+                );
+            }
+            if cap.queue_depth > MAX_QUEUE_DEPTH {
+                anyhow::bail!(
+                    "server HelloAck capacity queue_depth {} exceeds limit {}",
+                    cap.queue_depth, MAX_QUEUE_DEPTH
+                );
+            }
+        }
+        // R16: Reject duplicate model names and control characters in model
+        // names from the server HelloAck, mirroring server-side R14/R15 checks.
+        // Control characters in a model name logged by the client enable log
+        // injection; duplicate names pollute the client's view of server models.
+        {
+            let mut unique_models = std::collections::HashSet::new();
+            for m in &ack.node_info.models {
+                if !unique_models.insert(&m.model_name) {
+                    anyhow::bail!(
+                        "server HelloAck has duplicate model name '{}'",
+                        m.model_name
+                    );
+                }
+                if m.model_name.bytes().any(|b| b < 0x20) {
+                    anyhow::bail!(
+                        "server HelloAck model_name contains control characters"
+                    );
+                }
+            }
+        }
     }
 
     // 2. Inference on second stream

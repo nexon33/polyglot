@@ -870,6 +870,42 @@ fn confusable_to_ascii(ch: char) -> Option<char> {
         '\u{0177}' => Some('y'),
         '\u{0179}' | '\u{017B}' | '\u{017D}' => Some('Z'),
         '\u{017A}' | '\u{017C}' | '\u{017E}' => Some('z'),
+        // R16: Lisu script confusables (U+A4D0-U+A4FF)
+        // Lisu letters are intentionally designed to look like Latin uppercase.
+        '\u{A4D0}' => Some('A'), // Lisu Letter Ba (looks like A)
+        '\u{A4D1}' => Some('B'), // Lisu Letter Pa (looks like B)
+        '\u{A4D3}' => Some('D'), // Lisu Letter Ta (looks like D)
+        '\u{A4D4}' => Some('E'), // Lisu Letter Ma (looks like E)
+        '\u{A4D6}' => Some('G'), // Lisu Letter Na (looks like G)
+        '\u{A4D7}' => Some('H'), // Lisu Letter Xa (looks like H)
+        '\u{A4D8}' => Some('I'), // Lisu Letter Tsa (looks like I)
+        '\u{A4DA}' => Some('K'), // Lisu Letter Tsha (looks like K)
+        '\u{A4DB}' => Some('L'), // Lisu Letter Dza (looks like L)
+        '\u{A4DC}' => Some('M'), // Lisu Letter Fa (looks like M)
+        '\u{A4DD}' => Some('N'), // Lisu Letter Pha (looks like N)
+        '\u{A4DE}' => Some('O'), // Lisu Letter Po (looks like O)
+        '\u{A4DF}' => Some('P'), // Lisu Letter Zha (looks like P)
+        '\u{A4E0}' => Some('R'), // Lisu Letter Ha (looks like R)
+        '\u{A4E1}' => Some('S'), // Lisu Letter Sa (looks like S)
+        '\u{A4E2}' => Some('T'), // Lisu Letter Sha (looks like T)
+        '\u{A4E3}' => Some('U'), // Lisu Letter Nga (looks like U)
+        '\u{A4E5}' => Some('W'), // Lisu Letter Wa (looks like W)
+        '\u{A4E7}' => Some('Y'), // Lisu Letter Ya (looks like Y)
+        // R16: Georgian Mkhedruli confusables (U+10D0-U+10FF)
+        // Georgian lowercase letters that visually resemble Latin letters.
+        '\u{10D8}' => Some('i'), // Georgian letter Ini (looks like i)
+        '\u{10DC}' => Some('n'), // Georgian letter Nar (looks like n)
+        '\u{10DD}' => Some('o'), // Georgian letter On (looks like o)
+        '\u{10E1}' => Some('n'), // Georgian letter Sin (looks like n)
+        '\u{10EE}' => Some('x'), // Georgian letter Xan (looks like x)
+        // R16: Vai syllabary confusables (U+A500-U+A62B)
+        '\u{A549}' => Some('A'), // Vai Syllable Na (looks like A)
+        // R16: Tifinagh script confusables (U+2D30-U+2D7F)
+        // Tifinagh (Berber alphabet) letters that resemble Latin.
+        '\u{2D31}' => Some('b'), // Tifinagh letter Yab (looks like b)
+        '\u{2D3C}' => Some('y'), // Tifinagh letter Yat (looks like y)
+        '\u{2D49}' => Some('i'), // Tifinagh letter Yi (looks like i)
+        '\u{2D4F}' => Some('n'), // Tifinagh letter Yan (looks like n)
         _ => None,
     }
 }
