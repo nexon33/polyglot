@@ -348,7 +348,20 @@ impl FromForeign for String {
     fn from_foreign(value: ForeignValue) -> crate::Result<Self> {
         match value {
             ForeignValue::String(s) => Ok(s),
-            other => Ok(format!("{:?}", other)), // Fallback to debug format
+            // [R27-01 FIX] Previously this fabricated a String from the Debug
+            // representation of any non-string value (`format!("{:?}", other)`).
+            // A foreign function declared to return a string that actually
+            // returned an Int/Array/Object/Handle then yielded a value that
+            // passed type-checking but was NOT what the foreign call produced
+            // (e.g. the literal text `Object({"role": String("admin")})`) —
+            // a type confusion at the marshaling boundary that could feed a
+            // fabricated string into a downstream security decision. Every
+            // other FromForeign impl errors on a type mismatch; String now
+            // does too.
+            other => Err(crate::PolyglotError::TypeConversion(format!(
+                "Expected string, got {:?}",
+                other
+            ))),
         }
     }
 }
