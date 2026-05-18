@@ -71,7 +71,7 @@ impl ForeignValue {
             ForeignValue::Int(i) => i.to_string(),
             ForeignValue::Float(f) => f.to_string(),
             ForeignValue::String(s) => {
-                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+                format!("\"{}\"", escape_js_string(s))
             }
             ForeignValue::Array(arr) => {
                 let items: Vec<String> = arr.iter().map(|v| v.to_js_literal()).collect();
@@ -80,13 +80,47 @@ impl ForeignValue {
             ForeignValue::Object(map) => {
                 let pairs: Vec<String> = map
                     .iter()
-                    .map(|(k, v)| format!("\"{}\": {}", k, v.to_js_literal()))
+                    // [R23-01 FIX] Object keys MUST be escaped. Previously the
+                    // key was interpolated raw (`format!("\"{}\":", k)`), so a
+                    // `ForeignValue::Object` whose key contained `"` — e.g.
+                    // `x": (maliciousJs()), "y` — produced syntactically valid
+                    // JS that executed attacker code when `call_method` evals
+                    // the assembled expression. Both key and value now go
+                    // through `escape_js_string`.
+                    .map(|(k, v)| format!("\"{}\": {}", escape_js_string(k), v.to_js_literal()))
                     .collect();
                 format!("{{{}}}", pairs.join(", "))
             }
             ForeignValue::Handle(id) => format!("__handle_{}", id),
         }
     }
+}
+
+/// Escape a string for safe embedding inside a JavaScript double-quoted
+/// string literal.
+///
+/// [R23-01] The previous inline escaper only handled `\` and `"`. It missed
+/// JS line terminators (`\n`, `\r`, U+2028, U+2029) — a raw line terminator
+/// inside a `"..."` literal terminates the literal, which both breaks the
+/// `call_method` eval expression and, on the object-key path, lets an attacker
+/// inject code. Control characters are escaped too. Backslash is escaped first
+/// so the escape sequences this function emits are not themselves re-escaped.
+pub(crate) fn escape_js_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Reference to a runtime for releasing handles
