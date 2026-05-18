@@ -144,6 +144,12 @@ impl CompositeProof {
     }
 
     /// Check whether a proof is structurally valid (non-empty computation).
+    ///
+    /// [R18-02 FIX] Mock proofs carry no cryptographic material — every field
+    /// is attacker-chosen. Previously `verify_composition` accepted a composite
+    /// built entirely from forged Mock proofs (the composition_hash is
+    /// recomputed by the attacker via `compose()`). A production verifier MUST
+    /// reject Mock proofs; this gate mirrors `Verified::is_verified()`.
     fn is_structurally_valid(proof: &VerifiedProof) -> bool {
         match proof {
             VerifiedProof::HashIvc {
@@ -151,7 +157,7 @@ impl CompositeProof {
                 checkpoints,
                 ..
             } => *step_count > 0 && checkpoints.len() as u64 == *step_count,
-            VerifiedProof::Mock { .. } => true,
+            VerifiedProof::Mock { .. } => cfg!(any(test, feature = "mock")),
         }
     }
 

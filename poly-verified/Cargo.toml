@@ -12,8 +12,14 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# `mock` is OFF by default — production verifiers (verify_disclosure,
+# verify_composition, Verified::is_verified) reject trivially-forgeable
+# Mock proofs unless this feature is enabled. Enable it only for tests.
 [features]
 mock = []
 
 [dev-dependencies]
 hex = "0.4"
+# Self dev-dependency so the crate's own integration tests (tests/*.rs) build
+# the library with the `mock` feature — mirrors poly-chain's pattern.
+poly-verified = { path = ".", features = ["mock"] }

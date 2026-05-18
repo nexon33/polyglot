@@ -351,6 +351,20 @@ pub fn verify_disclosure(disclosure: &Disclosure) -> bool {
             }
         }
         VerifiedProof::Mock { output_hash, .. } => {
+            // [R18-01 FIX] A Mock proof carries no cryptographic material —
+            // input_hash, output_hash and privacy_mode are all attacker-chosen
+            // plaintext. Accepting one here lets an attacker fabricate a
+            // Disclosure of arbitrary inference-output tokens, attach a
+            // VerifiedProof::Mock whose output_hash they set to
+            // hash_combine(tokens_hash(fake), fake_root), and have
+            // verify_disclosure return true on the victim's machine.
+            //
+            // Mock proofs are a test-only artifact. This gate mirrors
+            // `Verified::is_verified()`, which already rejects Mock proofs
+            // outside test/mock builds. A production verifier MUST reject them.
+            if !cfg!(any(test, feature = "mock")) {
+                return false;
+            }
             // [V14-02 FIX] Same binding check as HashIvc: the combined
             // hash_combine(output_binding, output_root) must match output_hash.
             let bound_output = hash_combine(&disclosure.output_binding, &disclosure.output_root);

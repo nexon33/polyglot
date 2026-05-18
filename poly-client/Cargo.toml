@@ -5,7 +5,12 @@ edition = "2021"
 description = "Thin client SDK for Poly Network private verified inference"
 
 [dependencies]
-poly-verified = { path = "../poly-verified", features = ["mock"] }
+# NOTE: the `mock` feature is intentionally NOT enabled here. Enabling it on a
+# regular dependency would, via Cargo feature unification, turn on Mock-proof
+# acceptance (Verified::is_verified, verify_disclosure, verify_composition) in
+# every downstream production binary — including the inference server. Mock
+# proofs are trivially forgeable, so `mock` belongs in [dev-dependencies] only.
+poly-verified = { path = "../poly-verified" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -20,3 +25,8 @@ cudarc = { version = "0.12", optional = true, features = ["cuda-12060"] }
 default = []
 ckks = ["rand", "bincode", "zstd", "hmac", "hkdf"]
 cuda = ["ckks", "cudarc"]
+
+[dev-dependencies]
+# Tests may use Mock proofs; the `mock` feature is scoped to test builds only
+# so it never leaks into downstream production binaries.
+poly-verified = { path = "../poly-verified", features = ["mock"] }

@@ -44,10 +44,19 @@ impl<T> Verified<T> {
     /// to create `Verified<T>` values.
     #[doc(hidden)]
     pub fn __macro_new(value: T, proof: VerifiedProof) -> Self {
-        // In production builds, Mock variant doesn't exist (gated by cfg).
-        // In test/mock builds, reject Mock proofs via runtime check when
-        // the "mock" feature is enabled but we're not in a test context.
-        #[cfg(all(feature = "mock", not(test)))]
+        // [R18-03 FIX] Reject Mock proofs in production builds.
+        //
+        // A production build is one where the `mock` feature is OFF. The
+        // previous guard fired on `all(feature = "mock", not(test))`, which
+        // (a) never protected production at all — with `mock` off it was a
+        // no-op — and (b) wrongly panicked in *integration* test crates,
+        // which compile the library with `not(test)` even though they are a
+        // legitimate test context.
+        //
+        // The correct production signal is the absence of the `mock` feature.
+        // `not(test)` still excludes the crate's own unit tests, which need to
+        // exercise Mock proofs without enabling the feature.
+        #[cfg(all(not(feature = "mock"), not(test)))]
         if matches!(&proof, VerifiedProof::Mock { .. }) {
             panic!("Mock proofs are not allowed in production builds");
         }

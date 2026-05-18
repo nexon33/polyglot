@@ -22,6 +22,10 @@ fn mock_proof() -> VerifiedProof {
     }
 }
 
+/// A hand-rolled HashIvc proof with bogus `chain_tip`/`merkle_root`. It is
+/// structurally a HashIvc proof but cryptographically invalid — `HashIvc::verify`
+/// returns `Ok(false)` for it. Used only as a stored metadata field
+/// (`execution_proof`), never as a transaction's verification `proof`.
 fn hash_ivc_proof() -> VerifiedProof {
     VerifiedProof::HashIvc {
         chain_tip: [0x01; 32],
@@ -34,6 +38,29 @@ fn hash_ivc_proof() -> VerifiedProof {
         input_hash: [0u8; 32],
         output_hash: [0u8; 32],
     }
+}
+
+/// Build a genuine, cryptographically-valid HashIvc proof bound to the given
+/// I/O hashes — the proof a real prover would produce. `HashIvc::verify`
+/// returns `Ok(true)` for it when checked against the same I/O hashes.
+fn genuine_hash_ivc_proof(input_hash: [u8; 32], output_hash: [u8; 32]) -> VerifiedProof {
+    use poly_verified::ivc::hash_ivc::HashIvc;
+    use poly_verified::ivc::IvcBackend;
+    use poly_verified::types::StepWitness;
+    let ivc = HashIvc;
+    let mut acc = ivc.init(&[0x03; 32], PrivacyMode::Transparent);
+    ivc.fold_step(
+        &mut acc,
+        &StepWitness {
+            state_before: input_hash,
+            state_after: output_hash,
+            step_inputs: input_hash,
+        },
+    )
+    .unwrap();
+    acc.input_hash = input_hash;
+    acc.output_hash = output_hash;
+    ivc.finalize(acc).unwrap()
 }
 
 fn setup_wallets() -> (GlobalState, AccountId, AccountId) {
@@ -446,18 +473,43 @@ fn swap_with_disclosure_and_hash_ivc_proof() {
     let (state, alice, bob) = setup_wallets();
     let mut swap = make_swap(alice, bob, 5000, 100, 0);
 
-    // Attach disclosure root and execution proof (the Phase 4 integration)
+    // Attach disclosure root and execution proof (the Phase 4 integration).
+    // `execution_proof` is a stored metadata field, not verified by validation.
     swap.disclosure_root = Some([0xDD; 32]);
     swap.execution_proof = Some(hash_ivc_proof());
-    swap.proof = hash_ivc_proof(); // also use HashIvc for the swap proof
+
+    // The transaction's verification `proof` must be a genuine HashIvc proof
+    // bound to the I/O hashes that `validate_atomic_swap_init` recomputes.
+    let swap_input = hash_with_domain(
+        DOMAIN_SWAP,
+        &[
+            swap.responder.as_slice(),
+            &swap.amount.to_le_bytes(),
+            &swap.nonce.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    let swap_output = hash_with_domain(
+        DOMAIN_SWAP,
+        &[swap.swap_id.as_slice(), &swap.hash_lock, &swap.timeout.to_le_bytes()].concat(),
+    );
+    swap.proof = genuine_hash_ivc_proof(swap_input, swap_output);
 
     let tx = Transaction::AtomicSwapInit(swap.clone());
     let s1 = validate_transaction(&tx, &state, 1000, 50).unwrap();
     assert!(s1.get_swap(&swap.swap_id).is_some());
 
-    // Claim still works
+    // Claim still works — also with a genuine HashIvc proof.
     let mut claim = make_claim(&swap);
-    claim.proof = hash_ivc_proof();
+    let claim_input = hash_with_domain(
+        DOMAIN_SWAP,
+        &[claim.swap_id.as_slice(), claim.claimer.as_slice(), &claim.secret].concat(),
+    );
+    let claim_output = hash_with_domain(
+        DOMAIN_SWAP,
+        &[claim.swap_id.as_slice(), &claim.original_hash_lock].concat(),
+    );
+    claim.proof = genuine_hash_ivc_proof(claim_input, claim_output);
     let tx_claim = Transaction::AtomicSwapClaim(claim);
     let s2 = validate_transaction(&tx_claim, &s1, 1000, 75).unwrap();
     assert!(s2.get_swap(&swap.swap_id).is_none());

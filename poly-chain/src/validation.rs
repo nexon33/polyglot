@@ -1,5 +1,4 @@
 use poly_verified::ivc::hash_ivc::HashIvc;
-use poly_verified::ivc::mock_ivc::MockIvc;
 use poly_verified::ivc::IvcBackend;
 use poly_verified::types::{Hash, VerifiedProof, ZERO_HASH};
 
@@ -23,9 +22,13 @@ pub fn verify_proof(proof: &VerifiedProof, input_hash: &Hash, output_hash: &Hash
         VerifiedProof::HashIvc { .. } => HashIvc
             .verify(proof, input_hash, output_hash)
             .map_err(|e| ChainError::InvalidProof(format!("{e}"))),
-        VerifiedProof::Mock { .. } => MockIvc
-            .verify(proof, input_hash, output_hash)
-            .map_err(|e| ChainError::InvalidProof(format!("{e}"))),
+        // [R18-04 FIX] Mock proofs carry no cryptographic guarantee — every
+        // field is attacker-chosen. The previous code routed them through
+        // `MockIvc::verify`, which returns `Ok(true)` unconditionally, so a
+        // forged Mock proof passed transaction validation in production.
+        // Mock proofs now verify as `true` only in test/mock builds, mirroring
+        // `verify_proof_if_not_mock` and `poly_verified`'s `is_verified()`.
+        VerifiedProof::Mock { .. } => Ok(cfg!(any(test, feature = "mock"))),
     }
 }
 
@@ -412,7 +415,11 @@ fn validate_cash_transfer(
         ]
         .concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // 3. Compute new sender state hash from the transfer
     //    In the verify-only model, we trust the proof and just update commitments.
@@ -524,7 +531,11 @@ fn validate_wallet_sync(
         DOMAIN_WALLET_STATE,
         &[tx.account_id.as_slice(), &tx.new_state_hash].concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // 3. Update the wallet state commitment
     new_state.set_wallet(tx.account_id, tx.new_state_hash);
@@ -614,7 +625,11 @@ fn validate_identity_register(
         DOMAIN_IDENTITY,
         &[tx.account_id.as_slice(), &[tx.tier as u8], &tx.jurisdiction.to_le_bytes()].concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // Store identity record hash
     let record = IdentityRecord {
@@ -695,7 +710,11 @@ fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp)
         DOMAIN_WALLET_STATE,
         &[tx.account_id.as_slice(), &tx.state_hash].concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // 3. Store backup hash
     new_state.set_backup(tx.account_id, tx.state_hash);
@@ -750,7 +769,11 @@ fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timest
         DOMAIN_WALLET_STATE,
         &[tx.account_id.as_slice(), &tx.backup_hash].concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // R11: Always restore the wallet to the stored backup hash, NOT to
     // tx.backup_hash.  Previously the wallet was set to tx.backup_hash,
@@ -845,7 +868,11 @@ fn validate_fraud_proof(tx: &FraudProofTx, state: &GlobalState) -> Result<Global
         ]
         .concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // R10: The fraudulent account must actually have a wallet to burn.
     // Without this check, an attacker can submit fraud evidence against non-existent
@@ -904,7 +931,11 @@ fn validate_stp_action(
     let action_bytes = serde_json::to_vec(&tx.action)
         .map_err(|e| ChainError::InvalidEncoding(format!("STP action serialization: {e}")))?;
     let output_hash = hash_with_domain(DOMAIN_STP, &action_bytes);
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     match &tx.action {
         STPAction::RegisterContract(contract) => {
@@ -1176,7 +1207,11 @@ fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState, now: Time
         DOMAIN_WALLET_STATE,
         &[tx.account_id.as_slice(), &tx.app_id, &tx.new_state_hash].concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // 3. Update app state
     // R12: Use account-scoped key: H(account_id || app_id). Previously the
@@ -1287,7 +1322,11 @@ fn validate_atomic_swap_init(
         DOMAIN_SWAP,
         &[tx.swap_id.as_slice(), &tx.hash_lock, &tx.timeout.to_le_bytes()].concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // 6. Store swap state (Active) in the swaps SMT
     let state_hash = swap_state_hash(tx, SwapStatus::Active);
@@ -1374,7 +1413,11 @@ fn validate_atomic_swap_claim(
         DOMAIN_SWAP,
         &[tx.swap_id.as_slice(), &tx.original_hash_lock].concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // 5. Remove swap (claimed — no longer active)
     new_state.remove_swap(&tx.swap_id);
@@ -1458,7 +1501,11 @@ fn validate_atomic_swap_refund(
         DOMAIN_SWAP,
         &[tx.swap_id.as_slice(), &tx.original_amount.to_le_bytes()].concat(),
     );
-    verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)?;
+    if !verify_proof_if_not_mock(&tx.proof, &input_hash, &output_hash)? {
+        return Err(ChainError::InvalidProof(
+            "transaction proof failed verification".into(),
+        ));
+    }
 
     // 5. Remove swap (refunded — no longer active)
     new_state.remove_swap(&tx.swap_id);
