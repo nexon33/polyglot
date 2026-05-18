@@ -123,6 +123,27 @@ pub(crate) fn escape_js_string(s: &str) -> String {
     out
 }
 
+/// Whether `method` is a safe JavaScript member-access path: a non-empty
+/// sequence of dot-separated identifiers (`foo`, `obj.method`, `a.b.c`).
+///
+/// [R28-01] `ForeignHandle::call_method` interpolates `method` into the eval
+/// expression `({method})(...)`. R23 escaped the argument values but the
+/// method name was still raw — a runtime-derived method string such as
+/// `globalThis.x=1)//` would break out and inject arbitrary JS. This rejects
+/// anything that is not a plain identifier path (parentheses, quotes,
+/// operators, whitespace, etc.).
+pub fn is_safe_js_method_path(method: &str) -> bool {
+    !method.is_empty()
+        && method.split('.').all(|seg| {
+            let mut chars = seg.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+                _ => return false,
+            }
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        })
+}
+
 /// Reference to a runtime for releasing handles
 #[derive(Clone)]
 pub struct RuntimeRef {
@@ -194,6 +215,13 @@ impl ForeignHandle {
     /// For objects, evaluates: `obj.method(arg1, arg2, ...)`
     /// Arguments are serialized to JSON for safe cross-boundary passing.
     pub fn call_method(&self, method: &str, args: &[ForeignValue]) -> ForeignValue {
+        // [R28-01 FIX] Validate the method name before interpolating it into
+        // the `({method})(...)` eval expression. R23 escaped the argument
+        // values; the method name was still raw, so a runtime-derived method
+        // string could break out of the expression and inject arbitrary JS.
+        if !is_safe_js_method_path(method) {
+            return ForeignValue::Null;
+        }
         // Build the method call expression
         let args_str: Vec<String> = args.iter().map(|a| a.to_js_literal()).collect();
         let args_joined = args_str.join(", ");
