@@ -404,6 +404,36 @@ fn handle_infer<B: InferenceBackend>(
 
     match backend.infer(&infer_request) {
         Ok(response) => {
+            // R20-01: Post-generation text-level compliance backstop on /infer,
+            // mirroring /generate (http.rs ~556). Token-level n-gram checking is
+            // evadable by interleaving punctuation between word fragments; R7
+            // added check_output_text as the text-level backstop but only wired
+            // it into /generate and /generate/encrypted — /infer was missed,
+            // re-opening the exact evasion class. This scans the decoded
+            // completion when the output is a plaintext-visible MockCiphertext
+            // (a real FHE ciphertext cannot be scanned server-side).
+            if let Ok(out_ct) = serde_json::from_slice::<poly_client::encryption::MockCiphertext>(
+                &response.encrypted_output,
+            ) {
+                let prompt_len = serde_json::from_slice::<poly_client::encryption::MockCiphertext>(
+                    &infer_request.encrypted_input,
+                )
+                .map(|c| c.tokens.len())
+                .unwrap_or(0);
+                let safe_prompt_len = prompt_len.min(out_ct.tokens.len());
+                let completion = crate::model::decode(&out_ct.tokens[safe_prompt_len..]);
+                if let Err(term) = crate::compliance::check_output_text(&completion) {
+                    eprintln!(
+                        "R20-01: /infer post-generation text check caught harmful term: {:?}",
+                        term
+                    );
+                    return json_error(
+                        451,
+                        "generation contained harmful content and was blocked",
+                        json_header,
+                    );
+                }
+            }
             let response_body = serde_json::to_vec(&response).unwrap();
             let mut headers = vec![json_header];
             headers.extend(security_headers());
