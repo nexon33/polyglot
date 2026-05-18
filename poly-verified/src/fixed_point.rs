@@ -162,6 +162,15 @@ impl FixedPoint {
 
     /// Approximate e^x using Taylor series expansion.
     /// `terms` controls precision (more terms = more accurate).
+    ///
+    /// [R26-01] If an intermediate Taylor term overflows (|x| large), the
+    /// series is saturated *deterministically by the sign of x* rather than
+    /// returning the partial sum. The old behaviour returned whatever partial
+    /// sum had accumulated at the overflow point; for a negative x the
+    /// alternating series landed on an arbitrary mid-range positive value
+    /// (true e^x there is ~0), letting an attacker steer a verified
+    /// softmax/sigmoid to a wrong-but-plausible result. e^x grows unboundedly
+    /// for x > 0 (saturate high) and decays to 0 for x < 0.
     pub fn exp_approx(self, terms: u32) -> Self {
         let mut result = Self::ONE;
         let mut term = Self::ONE;
@@ -170,14 +179,24 @@ impl FixedPoint {
             term = match term.checked_mul(self) {
                 Some(t) => match t.checked_div(Self::from_int(i as i64)) {
                     Some(d) => d,
-                    None => break,
+                    None => return self.exp_overflow_saturation(),
                 },
-                None => break,
+                None => return self.exp_overflow_saturation(),
             };
             result = result.saturating_add(term);
         }
 
         result
+    }
+
+    /// Deterministic saturation target for `exp_approx` when the Taylor series
+    /// overflows: e^x grows unboundedly for x > 0 and decays to 0 for x < 0.
+    fn exp_overflow_saturation(self) -> Self {
+        if self.raw < 0 {
+            Self::ZERO
+        } else {
+            Self::from_raw(i128::MAX)
+        }
     }
 }
 
