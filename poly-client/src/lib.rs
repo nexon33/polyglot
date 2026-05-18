@@ -25,9 +25,9 @@ pub mod ckks;
 
 use std::ops::Range;
 
-use poly_verified::disclosure::Disclosure;
+use poly_verified::disclosure::{disclosure_output_hash, Disclosure};
 use poly_verified::error::Result;
-use poly_verified::types::VerifiedProof;
+use poly_verified::types::{hash_eq, VerifiedProof};
 use poly_verified::verified_type::Verified;
 
 use crate::encryption::EncryptionBackend;
@@ -140,9 +140,28 @@ impl VerifiedResponse {
         self.verified.proof()
     }
 
-    /// Structural validity check on the proof.
+    /// Check that this response carries a structurally-valid proof that is
+    /// actually bound to the tokens received.
+    ///
+    /// [R25-01 FIX] Previously this only forwarded to `Verified::is_verified()`,
+    /// a purely structural check (`step_count > 0`). `process_response` pairs
+    /// the decrypted tokens with whatever proof the server sent WITHOUT
+    /// verifying they correspond — so a malicious server could decrypt-to
+    /// attacker-chosen tokens while attaching a genuine proof minted for
+    /// entirely different tokens (proof reuse), and this still returned `true`,
+    /// presenting fabricated output as verified. The proof's committed
+    /// `output_hash` must equal the disclosure output hash of the tokens
+    /// actually received.
     pub fn is_verified(&self) -> bool {
-        self.verified.is_verified()
+        if !self.verified.is_verified() {
+            return false;
+        }
+        let expected = disclosure_output_hash(&self.token_ids);
+        let actual = match self.verified.proof() {
+            VerifiedProof::HashIvc { output_hash, .. } => output_hash,
+            VerifiedProof::Mock { output_hash, .. } => output_hash,
+        };
+        hash_eq(&expected, actual)
     }
 
     /// Create a selective disclosure revealing only the specified token positions.
