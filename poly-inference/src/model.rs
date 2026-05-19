@@ -220,6 +220,17 @@ pub fn load_tokenizer_for(model_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The vocabulary size of the currently-loaded tokenizer, or `None` if no
+/// tokenizer has been loaded.
+///
+/// Inference callers use this to reject token ids that are out of range
+/// before they reach the model's embedding lookup. The model's embedding
+/// matrix is sized to cover the full tokenizer vocabulary (it is typically
+/// padded *up* from it), so `id < vocab_size()` is a safe in-bounds bound.
+pub fn vocab_size() -> Option<usize> {
+    TOKENIZER.get().map(|t| t.get_vocab_size(true))
+}
+
 /// Load the default model (Qwen3-0.6B full precision).
 pub fn load_model(device: Device) -> Result<()> {
     load_model_by_name(DEFAULT_MODEL, device)

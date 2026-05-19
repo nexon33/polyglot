@@ -6,7 +6,7 @@
 //! - `MockInferenceBackend` — predictable output, real HashIvc proofs, no model weights.
 //! - `RealInferenceBackend` — actual model inference via Candle (Qwen3, LLaMA/Nanbeige).
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 
 use poly_client::encryption::MockCiphertext;
@@ -101,6 +101,16 @@ impl InferenceBackend for RealInferenceBackend {
         // 1. Decrypt input
         let input_ct: MockCiphertext = serde_json::from_slice(&request.encrypted_input)?;
         let input_tokens = input_ct.tokens;
+
+        // 1b. Reject token ids outside the model's vocabulary BEFORE inference.
+        // An out-of-range id indexes the embedding matrix out of bounds, which
+        // candle surfaces as an error the generation path `.unwrap()`s —
+        // crashing the server. These ids are untrusted (the /generate/encrypted
+        // endpoint decrypts attacker-supplied ciphertext into them).
+        let vocab = crate::model::vocab_size()
+            .ok_or_else(|| anyhow!("tokenizer not loaded"))?;
+        crate::inference::validate_token_ids(&input_tokens, vocab)
+            .map_err(|e| anyhow!(e))?;
 
         // 2. Run real verified inference based on mode
         let (output_tokens, proof) = match request.mode {
@@ -199,6 +209,14 @@ impl InferenceBackend for ComplianceInferenceBackend {
         // 1. Decrypt input
         let input_ct: MockCiphertext = serde_json::from_slice(&request.encrypted_input)?;
         let input_tokens = input_ct.tokens;
+
+        // 1b. Reject token ids outside the model's vocabulary BEFORE inference
+        // (see RealInferenceBackend::infer) — an out-of-range id would crash
+        // the server via an unwrapped candle embedding-lookup error.
+        let vocab = crate::model::vocab_size()
+            .ok_or_else(|| anyhow!("tokenizer not loaded"))?;
+        crate::inference::validate_token_ids(&input_tokens, vocab)
+            .map_err(|e| anyhow!(e))?;
 
         // 2. Run compliant generation (halts on policy violation)
         let (output_tokens, compliance_proof) = crate::inference::generate_compliant(

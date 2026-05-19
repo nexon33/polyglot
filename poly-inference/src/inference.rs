@@ -124,6 +124,28 @@ pub fn validate_temperature(temperature: u32) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Validate that every input token id is within the model's vocabulary range.
+///
+/// A token id `>= vocab_size` indexes the embedding matrix out of bounds when
+/// fed to `model.forward`. Candle surfaces that as an error, and the
+/// `generate_body!` path `.unwrap()`s candle results — so an out-of-range id
+/// would panic (crash) the inference server. The `/generate/encrypted`
+/// endpoint decrypts attacker-supplied ciphertext into token ids, so the ids
+/// reaching inference are untrusted and unbounded; the backend calls this to
+/// reject an out-of-range request cleanly before generation begins.
+///
+/// `vocab_size` should come from [`crate::model::vocab_size`].
+pub fn validate_token_ids(tokens: &[u32], vocab_size: usize) -> Result<(), String> {
+    for &t in tokens {
+        if t as usize >= vocab_size {
+            return Err(format!(
+                "input token id {t} is out of vocabulary range (vocab size {vocab_size})"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Unverified generation — same logic, no proof overhead.
 ///
 /// # Panics
