@@ -295,11 +295,16 @@ fn run_server(addr: &str, model_name: &str) {
     eprintln!("Listening on http://{}", bound);
     eprintln!("CKKS public key: {}...{}", &server.server_public_key_hex()[..16], &server.server_public_key_hex()[server.server_public_key_hex().len()-8..]);
     eprintln!();
+    eprintln!("Response signing key (Ed25519 verifying key):");
+    eprintln!("  {}", server.signing_public_key_hex());
+    eprintln!("  Clients should pin this with --server-key to authenticate encrypted");
+    eprintln!("  responses against an active MITM. It is regenerated on each restart.");
+    eprintln!();
     eprintln!("Endpoints:");
     eprintln!("  POST /generate            - Simple batch: prompt in, text + proof out");
     eprintln!("  POST /generate/encrypted  - Encrypted batch: CKKS tokens in, CKKS tokens out");
     eprintln!("  POST /infer               - Full protocol: encrypted input, proof, encrypted output");
-    eprintln!("  GET  /pubkey              - Server's CKKS public key (for encrypted mode)");
+    eprintln!("  GET  /pubkey              - Server's CKKS public key + Ed25519 signing key");
     eprintln!();
     eprintln!("Privacy modes for /generate:");
     eprintln!("  transparent     - (default) verifier sees input/output/code hashes");

@@ -19,6 +19,7 @@
 use std::io::Read;
 
 use anyhow::Result;
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
@@ -167,6 +168,12 @@ pub struct EncryptedGenerateResponse {
     /// JSON-compatible proof metadata (serialized inline via bincode).
     pub proof: ProofSummary,
     pub compliance: ComplianceSummary,
+    /// [R48] Ed25519 signature (64 bytes) by the server's signing key over a
+    /// domain-separated transcript of every other field — see
+    /// [`verify_encrypted_response_signature`]. Authenticates the response
+    /// against an active MITM that would otherwise rewrite it coherently.
+    #[serde(default)]
+    pub signature: Vec<u8>,
 }
 
 // ─── HTTP Server ─────────────────────────────────────────────────────────
@@ -180,19 +187,26 @@ pub struct HttpServer {
     server_pk: CkksPublicKey,
     /// Server's CKKS secret key (server decrypts input with this).
     server_sk: CkksSecretKey,
+    /// [R48] Server's Ed25519 signing key. Encrypted-inference responses are
+    /// signed with it so a client that has pinned the matching verifying key
+    /// (printed on startup, also served at `/pubkey`) can detect an active
+    /// MITM that rewrites the response.
+    signing_key: SigningKey,
 }
 
 impl HttpServer {
     /// Create a new HTTP server bound to the given address.
     ///
-    /// Generates a fresh CKKS key pair for encrypted inference.
+    /// Generates a fresh CKKS key pair for encrypted inference and a fresh
+    /// Ed25519 signing key for response authentication.
     /// Address format: "127.0.0.1:8080" or "0.0.0.0:3000".
     pub fn new(addr: &str) -> Result<Self> {
         let server =
             Server::http(addr).map_err(|e| anyhow::anyhow!("failed to bind {}: {}", addr, e))?;
         let ckks = CkksEncryption;
         let (pk, sk) = ckks.keygen();
-        Ok(Self { server, server_pk: pk, server_sk: sk })
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        Ok(Self { server, server_pk: pk, server_sk: sk, signing_key })
     }
 
     /// Get the server's CKKS public key (hex-encoded, for clients).
@@ -200,10 +214,26 @@ impl HttpServer {
         hex::encode(serde_json::to_vec(&self.server_pk).unwrap())
     }
 
+    /// [R48] Get the server's Ed25519 verifying key (hex-encoded, 32 bytes).
+    ///
+    /// Clients pin this value (out-of-band) to authenticate encrypted-
+    /// inference responses. The operator should publish it from the line the
+    /// server prints on startup — fetching it from `/pubkey` over the same
+    /// channel only protects against a later or passive attacker.
+    pub fn signing_public_key_hex(&self) -> String {
+        hex::encode(self.signing_key.verifying_key().to_bytes())
+    }
+
     /// Serve requests indefinitely (all endpoints).
     pub fn serve<B: InferenceBackend>(&self, backend: &B) {
         for mut request in self.server.incoming_requests() {
-            let response = handle_request(&mut request, backend, &self.server_pk, &self.server_sk);
+            let response = handle_request(
+                &mut request,
+                backend,
+                &self.server_pk,
+                &self.server_sk,
+                &self.signing_key,
+            );
             let _ = request.respond(response);
         }
     }
@@ -214,7 +244,13 @@ impl HttpServer {
             .server
             .recv()
             .map_err(|e| anyhow::anyhow!("recv failed: {}", e))?;
-        let response = handle_request(&mut request, backend, &self.server_pk, &self.server_sk);
+        let response = handle_request(
+            &mut request,
+            backend,
+            &self.server_pk,
+            &self.server_sk,
+            &self.signing_key,
+        );
         request
             .respond(response)
             .map_err(|e| anyhow::anyhow!("respond failed: {}", e))?;
@@ -234,6 +270,7 @@ fn handle_request<B: InferenceBackend>(
     backend: &B,
     server_pk: &CkksPublicKey,
     server_sk: &CkksSecretKey,
+    signing_key: &SigningKey,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     let json_header =
         Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
@@ -269,14 +306,22 @@ fn handle_request<B: InferenceBackend>(
         return json_error(400, "invalid request path", json_header);
     }
 
-    // GET /pubkey returns the server's CKKS public key as JSON with hex-encoded bytes
+    // GET /pubkey returns the server's public keys as JSON with hex-encoded bytes:
+    // - `public_key`: the CKKS encryption key (clients encrypt input with this)
+    // - `signing_key`: the Ed25519 verifying key (clients authenticate responses
+    //   with this; see [R48] — pin it out-of-band, this endpoint is only TOFU)
     if url_path == "/pubkey" {
         if request.method() != &Method::Get {
             return json_error(405, "method not allowed (use GET)", json_header);
         }
         let pk_bytes = serde_json::to_vec(server_pk).unwrap_or_default();
         let pk_hex = hex::encode(&pk_bytes);
-        let body = serde_json::json!({ "public_key": pk_hex }).to_string();
+        let signing_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let body = serde_json::json!({
+            "public_key": pk_hex,
+            "signing_key": signing_hex,
+        })
+        .to_string();
         let mut headers = vec![json_header];
         headers.extend(security_headers());
         return Response::new(
@@ -328,7 +373,7 @@ fn handle_request<B: InferenceBackend>(
                     json_header,
                 );
             }
-            handle_generate_encrypted(request, backend, server_sk, json_header)
+            handle_generate_encrypted(request, backend, server_sk, signing_key, json_header)
         }
         _ => json_error(404, "not found", json_header),
     }
@@ -667,6 +712,7 @@ fn handle_generate_encrypted<B: InferenceBackend>(
     request: &mut tiny_http::Request,
     backend: &B,
     server_sk: &CkksSecretKey,
+    signing_key: &SigningKey,
     json_header: Header,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     use poly_client::ckks::compress;
@@ -902,7 +948,7 @@ fn handle_generate_encrypted<B: InferenceBackend>(
         _ => (String::new(), String::new(), 0),
     };
 
-    let resp = EncryptedGenerateResponse {
+    let mut resp = EncryptedGenerateResponse {
         encrypted_output,
         generated_tokens,
         total_tokens: output_tokens.len(),
@@ -918,7 +964,16 @@ fn handle_generate_encrypted<B: InferenceBackend>(
             ivc_merkle_root: comp_root,
             ivc_steps: comp_steps,
         },
+        signature: Vec::new(),
     };
+
+    // [R48] Sign the response. The signature covers a domain-separated
+    // transcript of every other field (see `encrypted_response_transcript`),
+    // so a MITM cannot rewrite `encrypted_output`, the proof, or the
+    // compliance summary without invalidating it. `signature` itself is
+    // excluded from the transcript and filled in afterwards.
+    let transcript = encrypted_response_transcript(&resp);
+    resp.signature = signing_key.sign(&transcript).to_bytes().to_vec();
 
     // Entire response is PFHE-compressed binary
     let binary_header =
@@ -1048,6 +1103,62 @@ pub fn verify_proof_io_binding(
         return Err("proof output hash does not match the decrypted output");
     }
     Ok(())
+}
+
+/// [R48] Build the domain-separated signing transcript for an encrypted
+/// inference response.
+///
+/// The transcript covers every field of [`EncryptedGenerateResponse`] *except*
+/// `signature` itself. Variable-length fields are length-prefixed so distinct
+/// responses can never produce the same transcript. `ProofSummary` and
+/// `ComplianceSummary` are plain structs of scalars/strings, so their
+/// `serde_json` encoding is deterministic (fixed field order, no maps) — the
+/// server and a verifying client compute byte-identical transcripts.
+fn encrypted_response_transcript(resp: &EncryptedGenerateResponse) -> Vec<u8> {
+    fn put_field(t: &mut Vec<u8>, bytes: &[u8]) {
+        t.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        t.extend_from_slice(bytes);
+    }
+    let mut t = Vec::new();
+    t.extend_from_slice(b"poly-inference/encrypted-response/v1");
+    put_field(&mut t, &resp.encrypted_output);
+    t.extend_from_slice(&(resp.generated_tokens as u64).to_le_bytes());
+    t.extend_from_slice(&(resp.total_tokens as u64).to_le_bytes());
+    put_field(&mut t, &serde_json::to_vec(&resp.proof).unwrap_or_default());
+    put_field(&mut t, &serde_json::to_vec(&resp.compliance).unwrap_or_default());
+    t
+}
+
+/// [R48] Verify the server's Ed25519 signature on an encrypted inference
+/// response against a verifying key the client trusts.
+///
+/// `verifying_key` is the 32-byte Ed25519 public key the server printed on
+/// startup. For this check to defend against an active MITM the client must
+/// obtain that key out-of-band (e.g. a pinned `--server-key`); a key fetched
+/// from `/pubkey` over the same channel only detects a later or passive
+/// attacker, since a MITM present from the start substitutes both.
+///
+/// Returns `Ok(())` only if the signature covers exactly the response's
+/// current contents — any tampering with `encrypted_output`, the proof, or
+/// the compliance summary invalidates it. Uses `verify_strict` (non-malleable,
+/// cofactorless), consistent with the node-handshake signature checks.
+pub fn verify_encrypted_response_signature(
+    resp: &EncryptedGenerateResponse,
+    verifying_key: &[u8; 32],
+) -> Result<(), &'static str> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    let vk = VerifyingKey::from_bytes(verifying_key)
+        .map_err(|_| "server signing key is not a valid Ed25519 public key")?;
+    let sig_bytes: [u8; 64] = resp
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| "response signature has wrong length (expected 64 bytes)")?;
+    let sig = Signature::from_bytes(&sig_bytes);
+    let transcript = encrypted_response_transcript(resp);
+    vk.verify_strict(&transcript, &sig)
+        .map_err(|_| "response signature verification failed (response not authentic)")
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────

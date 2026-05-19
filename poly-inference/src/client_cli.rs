@@ -31,6 +31,8 @@ fn main() {
     let mut mode = "encrypted".to_string();
     let mut model_name = "0.6b".to_string();
     let mut prompt = String::new();
+    // [R48] Optional pinned Ed25519 verifying key (hex) for response auth.
+    let mut server_key: Option<String> = None;
 
     // Simple arg parsing
     let mut i = 1;
@@ -43,6 +45,10 @@ fn main() {
             "--server" | "-s" => {
                 i += 1;
                 server = args.get(i).cloned().unwrap_or(server);
+            }
+            "--server-key" => {
+                i += 1;
+                server_key = args.get(i).cloned();
             }
             "--max-tokens" | "-n" => {
                 i += 1;
@@ -83,7 +89,9 @@ fn main() {
     }
 
     match mode.as_str() {
-        "encrypted" => run_encrypted(&server, &prompt, max_tokens, temperature, seed, &model_name),
+        "encrypted" => {
+            run_encrypted(&server, &prompt, max_tokens, temperature, seed, &model_name, server_key)
+        }
         "transparent" | "private" | "private_inputs" => {
             run_plaintext(&server, &prompt, max_tokens, temperature, seed, &mode)
         }
@@ -100,6 +108,9 @@ fn print_usage() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -s, --server <URL>       Server address (default: http://127.0.0.1:3000)");
+    eprintln!("      --server-key <HEX>   Pinned Ed25519 verifying key (hex) for response");
+    eprintln!("                           authentication. Use the key the server prints on");
+    eprintln!("                           startup. Omitting it falls back to /pubkey (TOFU).");
     eprintln!("  -n, --max-tokens <N>     Max tokens to generate (default: 50)");
     eprintln!("  -t, --temperature <N>    Temperature x1000 (default: 700 = 0.7)");
     eprintln!("      --seed <N>           Random seed (default: 42)");
@@ -122,7 +133,15 @@ fn print_usage() {
 // Encrypted mode: CKKS end-to-end
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, seed: u64, model_name: &str) {
+fn run_encrypted(
+    server: &str,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: u32,
+    seed: u64,
+    model_name: &str,
+    server_key: Option<String>,
+) {
     let total_start = Instant::now();
 
     eprintln!();
@@ -146,18 +165,51 @@ fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, 
     let token_ids = model::tokenize(prompt).expect("tokenization failed");
     eprintln!("[2/7] Tokenized: {} tokens", token_ids.len());
 
-    // [3] Fetch server's CKKS public key (PFHE-compressed binary)
-    eprint!("[3/7] Fetching server public key...");
+    // [3] Fetch server's public keys: CKKS encryption key + Ed25519 signing key.
+    eprint!("[3/7] Fetching server public keys...");
     let t = Instant::now();
     use poly_client::ckks::compress;
     let mut resp = ureq::get(&format!("{}/pubkey", server))
         .call()
         .expect("GET /pubkey failed — is the server running?");
-    let mut pk_bytes = Vec::new();
-    resp.body_mut().as_reader().read_to_end(&mut pk_bytes).unwrap();
-    let server_pk: CkksPublicKey = compress::decompress(&pk_bytes)
-        .expect("decompress server public key");
-    eprintln!(" done ({:.0}ms, {} KB compressed)", t.elapsed().as_millis(), pk_bytes.len() / 1024);
+    let pubkey_body = resp
+        .body_mut()
+        .read_to_string()
+        .expect("read /pubkey response");
+    let pubkey_json: serde_json::Value =
+        serde_json::from_str(&pubkey_body).expect("parse /pubkey JSON");
+    let ckks_hex = pubkey_json["public_key"]
+        .as_str()
+        .expect("/pubkey response missing `public_key`");
+    let server_pk: CkksPublicKey = serde_json::from_slice(
+        &hex::decode(ckks_hex).expect("decode CKKS public key hex"),
+    )
+    .expect("parse CKKS public key");
+    let served_signing_key = pubkey_json["signing_key"].as_str().map(|s| s.to_string());
+    eprintln!(" done ({:.0}ms)", t.elapsed().as_millis());
+
+    // [R48] Resolve the Ed25519 verifying key that authenticates the response.
+    // A pinned --server-key is MITM-proof; falling back to the key /pubkey just
+    // served is trust-on-first-use over the same channel — it catches a later
+    // or passive attacker, but not a MITM present from the start (which would
+    // substitute both the signing key and the signed response).
+    let server_verifying_key: [u8; 32] = {
+        let key_hex = match &server_key {
+            Some(pinned) => pinned.clone(),
+            None => {
+                eprintln!("  WARNING: no --server-key pinned — trusting the signing key");
+                eprintln!("           served by /pubkey (trust-on-first-use only).");
+                served_signing_key
+                    .clone()
+                    .expect("/pubkey response did not include a `signing_key`")
+            }
+        };
+        let bytes = hex::decode(key_hex.trim()).expect("decode server signing key hex");
+        bytes
+            .as_slice()
+            .try_into()
+            .expect("server signing key must be exactly 32 bytes")
+    };
 
     // [4] Generate client key pair + encrypt prompt
     eprint!("[4/7] Encrypting prompt with CKKS...");
@@ -193,6 +245,18 @@ fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, 
 
     let resp_data: crate::http::EncryptedGenerateResponse =
         compress::decompress(&resp_bytes).expect("decompress response");
+
+    // [R48] Authenticate the response with the server's Ed25519 signature
+    // before trusting any of its contents (ciphertext, proof, compliance).
+    match http::verify_encrypted_response_signature(&resp_data, &server_verifying_key) {
+        Ok(()) => eprintln!("  Response signature: OK"),
+        Err(reason) => {
+            eprintln!();
+            eprintln!("  ERROR: {reason}.");
+            eprintln!("         The encrypted response is not authentic — discarding.");
+            std::process::exit(1);
+        }
+    }
 
     // [6] Decrypt response
     eprint!("[6/7] Decrypting response...");
