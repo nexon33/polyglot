@@ -206,6 +206,19 @@ pub fn generate_private_inputs(
 /// Returns `(output_tokens, compliance_proof)`. If a token is blocked,
 /// generation halts early and the proof covers all tokens up to (and
 /// including) the blocked one.
+///
+/// [R47] The server's n-gram gate is given a bounded suffix of the prompt as
+/// context, not just the completion. A blocked n-gram (e.g. the token sequence
+/// for `"pipe bomb"`) can straddle the prompt→completion boundary: an attacker
+/// crafts a prompt whose final tokens are the first half of a harmful term,
+/// then the model generates the remaining tokens. With completion-only history
+/// (`generated[prompt_len..]`), `check_token` never sees the prompt-side tokens
+/// of the n-gram, so the completing token is wrongly `Allowed` and the harmful
+/// term lands in the output of an "all-compliant"-attested response. Passing
+/// the last `NGRAM_BOUNDARY_CONTEXT` prompt tokens closes that gap. This does
+/// not over-block prompt-internal n-grams: `check_token` only flags an n-gram
+/// *completed by the token being checked*, and prompt tokens are never passed
+/// as that token — only generated tokens are.
 pub fn generate_compliant(
     input_ids: Vec<u32>,
     max_tokens: u32,
@@ -238,6 +251,12 @@ pub fn generate_compliant(
     let mut generated: Vec<u32> = input_ids.clone();
     let prompt_len = input_ids.len();
 
+    // [R47] Number of trailing prompt tokens fed to the server n-gram gate as
+    // boundary context. Must exceed the token length of the longest blocked
+    // n-gram (the harmful-term n-grams in `default_policy` are well under this).
+    const NGRAM_BOUNDARY_CONTEXT: usize = 64;
+    let ngram_ctx_start = prompt_len.saturating_sub(NGRAM_BOUNDARY_CONTEXT);
+
     // Prefill
     let input_tensor = Tensor::new(input_ids.as_slice(), device)
         .unwrap()
@@ -262,7 +281,7 @@ pub fn generate_compliant(
         let proof = compliance_acc.finalize().expect("compliance finalize");
         return (generated, proof);
     }
-    let sv = server_checker.check_token(next_token, &generated[prompt_len..]);
+    let sv = server_checker.check_token(next_token, &generated[ngram_ctx_start..]);
     if let TokenVerdict::Blocked(_) = &sv {
         let proof = compliance_acc.finalize().expect("compliance finalize");
         return (generated, proof);
@@ -291,7 +310,7 @@ pub fn generate_compliant(
         if let TokenVerdict::Blocked(_) = &verdict {
             break;
         }
-        let sv = server_checker.check_token(next_token, &generated[prompt_len..]);
+        let sv = server_checker.check_token(next_token, &generated[ngram_ctx_start..]);
         if let TokenVerdict::Blocked(_) = &sv {
             break;
         }
