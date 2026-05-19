@@ -6,6 +6,7 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use super::params::{N, Q};
 use super::poly::Poly;
 use super::sampling::{sample_gaussian, sample_ternary, sample_uniform};
 
@@ -16,6 +17,37 @@ pub struct CkksPublicKey {
     pub b: Poly,
     /// Uniform random polynomial
     pub a: Poly,
+}
+
+impl CkksPublicKey {
+    /// [R44-01] Reject degenerate / low-norm public keys.
+    ///
+    /// CKKS encryption masks the plaintext with the ephemeral products `a·u`
+    /// and `b·u` (`c0 = b·u + e1 + m`, `c1 = a·u + e2`). If `a` or `b` is the
+    /// zero polynomial — or, more generally, a low-norm one — that masking
+    /// term collapses and the "ciphertext" carries the plaintext essentially
+    /// in the clear (with `b ≈ 0`, `c0 ≈ m + e1`, which `decode` recovers
+    /// without any secret key).
+    ///
+    /// A genuine public key has `a` sampled uniformly over centered `Z_q` and
+    /// `b = -(a·s + e)`, so both polynomials have ~`N/2` coefficients of
+    /// magnitude above `Q/4`. This check requires at least `N/4` such
+    /// coefficients in each: for a real key the count is Binomial(N, 1/2),
+    /// mean `N/2` with std `≈ 32`, so the `N/4` floor sits ~32σ below the
+    /// mean — a real key never fails, while any zero or low-norm key (the
+    /// degenerate keys an attacker would substitute to strip encryption) is
+    /// rejected.
+    pub fn is_well_formed(&self) -> bool {
+        const HIGH_NORM: u64 = (Q as u64) / 4;
+        let min_high = N / 4;
+        let high_norm_count = |p: &Poly| {
+            p.coeffs
+                .iter()
+                .filter(|&&c| c.unsigned_abs() > HIGH_NORM)
+                .count()
+        };
+        high_norm_count(&self.a) >= min_high && high_norm_count(&self.b) >= min_high
+    }
 }
 
 /// CKKS secret decryption key.
@@ -77,7 +109,16 @@ pub fn secret_matches_public(pk: &CkksPublicKey, sk: &CkksSecretKey) -> bool {
     // produces coefficients orders of magnitude larger. 100_000 cleanly
     // separates the two cases.
     const ERROR_BOUND: u64 = 100_000;
-    residual.coeffs.iter().all(|&c| c.unsigned_abs() < ERROR_BOUND)
+    // [R44-01] An all-zero residual is NOT a match. A genuine keypair has
+    // residual = -e for a discrete Gaussian `e`, which is all-zero only with
+    // negligible probability (2^-N). A degenerate public key such as
+    // `(a, b) = (0, 0)` instead produces an exactly-zero residual against
+    // *any* secret key — without this guard such a key is misclassified as a
+    // self-encryption, causing `encrypt` to emit an `auth_tag` keyed by the
+    // wrong secret (a cross-party MAC the recipient cannot verify, breaking
+    // the R31 invariant).
+    residual.coeffs.iter().any(|&c| c != 0)
+        && residual.coeffs.iter().all(|&c| c.unsigned_abs() < ERROR_BOUND)
 }
 
 /// Derive a MAC key with a specific context string.

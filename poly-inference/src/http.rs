@@ -737,6 +737,21 @@ fn handle_generate_encrypted<B: InferenceBackend>(
         }
     };
 
+    // R44-01: Reject degenerate client public keys before re-encrypting the
+    // inference output. A zero or low-norm CKKS public key collapses the
+    // Ring-LWE masking — `ckks.encrypt` would then produce an "encrypted"
+    // output whose `c0 ≈ m + e1` carries the result tokens essentially in the
+    // clear, recoverable without any secret key. A network attacker who
+    // substitutes the `client_public_key` field with such a key silently
+    // strips confidentiality from the encrypted response (the victim still
+    // decrypts correctly and notices nothing). A degenerate key also trips a
+    // false positive in `secret_matches_public`, making the server emit an
+    // `auth_tag` keyed by its own secret. `is_well_formed` rejects both.
+    if !client_pk.is_well_formed() {
+        eprintln!("rejected degenerate client public key on /generate/encrypted");
+        return json_error(400, "invalid client public key", json_header);
+    }
+
     // Decrypt input token IDs using server's secret key.
     // Use decrypt_unchecked because the auth tag was created by the client
     // (using the client's MAC key), not the server's.
