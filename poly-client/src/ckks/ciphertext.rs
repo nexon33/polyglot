@@ -43,8 +43,14 @@ pub struct CkksCiphertext {
     /// Decryption divides by this scale to recover the plaintext.
     #[serde(default = "default_scale")]
     pub scale: i64,
-    /// SHA-256 authentication tag over ciphertext + metadata.
-    /// Detects any tampering with ciphertext coefficients, token_count, or scale.
+    /// HMAC-SHA256 authentication tag over ciphertext + metadata.
+    ///
+    /// [R31] Present only for *self-encryption* (when the encryptor's secret
+    /// key matches `key_id`'s public key). The tag is keyed by the secret key,
+    /// so only that keypair's holder can verify it — it detects tampering for
+    /// a party re-reading its own ciphertext. It is `None` for cross-party
+    /// ciphertexts (a sender cannot MAC for a different recipient); their
+    /// integrity is assured by the verified-inference proof, not this tag.
     #[serde(default)]
     pub auth_tag: Option<[u8; 32]>,
     /// SHA-256 hash of the public key used for encryption.
@@ -152,22 +158,38 @@ impl CkksCiphertext {
 /// Tokens are split into chunks of N, each encrypted independently.
 /// Empty input produces a ciphertext with zero chunks.
 ///
-/// The ciphertext includes authentication metadata: `auth_tag` for
-/// integrity verification, `key_id` for key binding, and a random
-/// `nonce` for replay protection.
+/// The ciphertext carries `key_id` (key binding) and a random `nonce`.
+///
+/// [R31] It also carries an `auth_tag` HMAC — but ONLY when this is a
+/// *self-encryption*, i.e. `sk` is the secret key for `pk`. The tag is keyed
+/// by `derive_mac_key(sk)`, so only the holder of `sk` can verify it. When a
+/// party encrypts *for another recipient* (e.g. a server re-encrypting an
+/// inference result under the client's public key with its own secret key),
+/// it cannot produce a tag that recipient can verify; emitting one keyed by
+/// the wrong secret previously made the recipient's `decrypt` MAC check
+/// **panic** on every such ciphertext. In the cross-party case `auth_tag` is
+/// therefore `None` — `decrypt` skips MAC verification, and integrity for
+/// inference outputs is instead assured by the verified-inference proof
+/// binding (`output_hash`).
 pub fn encrypt<R: Rng>(tokens: &[u32], pk: &CkksPublicKey, sk: &CkksSecretKey, rng: &mut R) -> CkksCiphertext {
-    let mac_key = super::keys::derive_mac_key(sk);
+    // Whether `sk` corresponds to `pk`. The MAC is only meaningful (verifiable
+    // by the recipient) for a self-encryption — see the doc comment above.
+    let self_encryption = super::keys::secret_matches_public(pk, sk);
     let key_id = compute_key_id(pk);
     let mut nonce = [0u8; 16];
     rng.fill(&mut nonce);
 
     if tokens.is_empty() {
-        let auth_tag = compute_auth_tag(&[], 0, DELTA, &nonce, &key_id, &mac_key);
+        let auth_tag = if self_encryption {
+            Some(compute_auth_tag(&[], 0, DELTA, &nonce, &key_id, &super::keys::derive_mac_key(sk)))
+        } else {
+            None
+        };
         return CkksCiphertext {
             chunks: vec![],
             token_count: 0,
             scale: DELTA,
-            auth_tag: Some(auth_tag),
+            auth_tag,
             key_id: Some(key_id),
             nonce: Some(nonce),
         };
@@ -194,13 +216,24 @@ pub fn encrypt<R: Rng>(tokens: &[u32], pk: &CkksPublicKey, sk: &CkksSecretKey, r
     }
 
     let token_count = tokens.len();
-    let auth_tag = compute_auth_tag(&chunks, token_count, DELTA, &nonce, &key_id, &mac_key);
+    let auth_tag = if self_encryption {
+        Some(compute_auth_tag(
+            &chunks,
+            token_count,
+            DELTA,
+            &nonce,
+            &key_id,
+            &super::keys::derive_mac_key(sk),
+        ))
+    } else {
+        None
+    };
 
     CkksCiphertext {
         chunks,
         token_count,
         scale: DELTA,
-        auth_tag: Some(auth_tag),
+        auth_tag,
         key_id: Some(key_id),
         nonce: Some(nonce),
     }

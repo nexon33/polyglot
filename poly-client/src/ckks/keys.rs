@@ -57,6 +57,29 @@ pub fn derive_mac_key(sk: &CkksSecretKey) -> [u8; 32] {
     derive_mac_key_with_context(sk, b"default")
 }
 
+/// Check whether `sk` is the secret key corresponding to `pk`.
+///
+/// For an RLWE keypair `pk.b = -(a·s + e)`, so `pk.b + pk.a·s = -e`, which has
+/// only small (Gaussian-error-sized) coefficients. A non-matching secret key
+/// instead yields large, uniform-looking coefficients.
+///
+/// [R31] `encrypt` uses this to decide whether it may emit a self-verifiable
+/// `auth_tag`. The tag is an HMAC keyed by `derive_mac_key(sk)`, so only the
+/// holder of `sk` can verify it — i.e. it is meaningful only for
+/// *self-encryption* (encrypting under one's own public key). A party
+/// encrypting *for another recipient* cannot produce a tag that recipient can
+/// verify, so `encrypt` emits `auth_tag: None` in that case rather than a
+/// bogus tag that would make the recipient's `decrypt` MAC check fail.
+pub fn secret_matches_public(pk: &CkksPublicKey, sk: &CkksSecretKey) -> bool {
+    // residual = b + a·s — equals -e (small) for the matching secret key.
+    let residual = pk.b.add(&pk.a.mul(&sk.s));
+    // The Gaussian error keeps |coeff| well under ~100; a mismatching key
+    // produces coefficients orders of magnitude larger. 100_000 cleanly
+    // separates the two cases.
+    const ERROR_BOUND: u64 = 100_000;
+    residual.coeffs.iter().all(|&c| c.unsigned_abs() < ERROR_BOUND)
+}
+
 /// Derive a MAC key with a specific context string.
 pub fn derive_mac_key_with_context(sk: &CkksSecretKey, context: &[u8]) -> [u8; 32] {
     use hkdf::Hkdf;
