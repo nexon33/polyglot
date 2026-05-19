@@ -123,17 +123,23 @@ pub fn verify_proof(proof: &MerkleProof) -> bool {
     hash_eq(&current, &proof.root)
 }
 
-/// Strict Merkle proof verification with leaf_index bounds checking.
+/// Strict Merkle proof verification with full `leaf_index` validation.
 ///
 /// [V15-13 FIX] In addition to the standard path reconstruction check,
 /// this validates that `leaf_index` is consistent with the tree depth
 /// implied by `siblings.len()`. A tree with `d` siblings has at most
 /// 2^d leaves, so `leaf_index` must be in `[0, 2^d)`.
 ///
-/// Without this check, an attacker can set `leaf_index` to any value
-/// and standard `verify_proof` will still pass because it only uses the
-/// sibling path for root reconstruction. This enables position spoofing
-/// when `leaf_index` is trusted by callers.
+/// [R32 FIX] The depth bound alone did NOT actually prevent position
+/// spoofing: `verify_proof` reconstructs the root purely from the sibling
+/// `is_left` flags and never consults `leaf_index`, so a genuine proof for
+/// position P could carry any in-range `leaf_index` Q and still pass. This
+/// function now also binds `leaf_index` to the path — at level `i` the
+/// sibling sits on the LEFT iff bit `i` of `leaf_index` is 1 (the node is a
+/// right child), exactly as `MerkleTree::generate_proof` constructs it. A
+/// proof whose `is_left` flags disagree with its claimed `leaf_index` is
+/// rejected, so callers that trust `leaf_index` for position semantics get
+/// the guarantee this function's contract promises.
 pub fn verify_proof_strict(proof: &MerkleProof) -> bool {
     let depth = proof.siblings.len();
     if depth == 0 {
@@ -147,6 +153,15 @@ pub fn verify_proof_strict(proof: &MerkleProof) -> bool {
         }
     }
     // depth >= 64: any u64 leaf_index is valid (tree can hold up to 2^64 leaves)
+
+    // [R32] Bind `leaf_index` to the sibling path. `siblings.len()` is capped
+    // at 64, so the shift `>> i` (i in 0..depth) is always in range.
+    for (i, node) in proof.siblings.iter().enumerate() {
+        let expect_left = (proof.leaf_index >> i) & 1 == 1;
+        if node.is_left != expect_left {
+            return false;
+        }
+    }
 
     verify_proof(proof)
 }
