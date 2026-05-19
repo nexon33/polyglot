@@ -292,6 +292,21 @@ fn frozen_key(account: &Hash) -> Hash {
     hash_with_domain(DOMAIN_STP, &[b"stp_frozen_v1".as_slice(), account.as_slice()].concat())
 }
 
+/// [R37] Reject the transaction if `account` is under an STP freeze.
+///
+/// `CheckDeadline` records a freeze as `frozen_key(account) -> investigation_id`
+/// in the STP records. `validate_cash_transfer` rejects frozen accounts (R30),
+/// but the atomic-swap path did not — so a frozen account could still move or
+/// receive MANA by routing value through `AtomicSwapInit` / `AtomicSwapClaim` /
+/// `AtomicSwapRefund` instead of a `CashTransfer`. A frozen account must not
+/// participate in a swap as either party.
+fn reject_if_frozen(state: &GlobalState, account: &Hash) -> Result<()> {
+    if state.get_stp_record(&frozen_key(account)).is_some() {
+        return Err(ChainError::AccountFrozen(hex_encode(&account[..4])));
+    }
+    Ok(())
+}
+
 /// The main verify-only validation pipeline.
 ///
 /// Validators call this for each transaction. They never execute computation —
@@ -1412,6 +1427,13 @@ fn validate_atomic_swap_init(
         .get_wallet(&tx.initiator)
         .ok_or_else(|| ChainError::AccountNotFound(hex_encode(&tx.initiator[..4])))?;
 
+    // [R37] Reject swaps involving a frozen account. A swap moves MANA between
+    // initiator and responder; without this an STP-frozen account could lock
+    // or receive funds through the swap path, bypassing the freeze that
+    // `validate_cash_transfer` enforces.
+    reject_if_frozen(state, &tx.initiator)?;
+    reject_if_frozen(state, &tx.responder)?;
+
     // 2. Verify swap_id is canonically derived: H(initiator || responder || nonce)
     let expected_swap_id = hash_with_domain(
         DOMAIN_SWAP,
@@ -1534,6 +1556,12 @@ fn validate_atomic_swap_claim(
         ));
     }
 
+    // [R37] Reject the claim if either swap party is under an STP freeze.
+    // The claimer receives the locked MANA; a frozen account must not be able
+    // to collect funds through the swap path.
+    reject_if_frozen(state, &tx.original_initiator)?;
+    reject_if_frozen(state, &tx.original_responder)?;
+
     // 3b. Claims must be submitted before the timeout
     if block_height >= tx.original_timeout {
         return Err(ChainError::SwapExpired);
@@ -1627,6 +1655,12 @@ fn validate_atomic_swap_refund(
             "refundee is not the swap responder".into(),
         ));
     }
+
+    // [R37] Reject the refund if either swap party is under an STP freeze.
+    // The refundee reclaims the locked MANA; a frozen account must not be able
+    // to recover funds through the swap path.
+    reject_if_frozen(state, &tx.original_initiator)?;
+    reject_if_frozen(state, &tx.original_responder)?;
 
     // 4. Timeout must have been reached
     if block_height < tx.original_timeout {
