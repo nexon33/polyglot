@@ -23,8 +23,18 @@ pub enum ForeignValue {
 impl ForeignValue {
     pub fn as_i32(&self) -> Option<i32> {
         match self {
-            ForeignValue::Int(i) => Some(*i as i32),
-            ForeignValue::Float(f) => Some(*f as i32),
+            // [R38-01] Range-check rather than truncate. `*i as i32` silently
+            // discarded the high bits of an out-of-range Int, so a foreign Int
+            // outside i32 range produced a wrong i32 that still passed
+            // `FromForeign for i32`.
+            ForeignValue::Int(i) => i32::try_from(*i).ok(),
+            ForeignValue::Float(f) => {
+                if f.is_finite() && *f >= i32::MIN as f64 && *f <= i32::MAX as f64 {
+                    Some(*f as i32)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -32,7 +42,15 @@ impl ForeignValue {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             ForeignValue::Int(i) => Some(*i),
-            ForeignValue::Float(f) => Some(*f as i64),
+            // [R38-01] Range-check the float→i64 conversion. A non-finite or
+            // out-of-range float must not silently saturate to i64::MIN/MAX.
+            ForeignValue::Float(f) => {
+                if f.is_finite() && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
+                    Some(*f as i64)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -60,7 +78,24 @@ impl ForeignValue {
     }
 
     pub fn as_usize(&self) -> Option<usize> {
-        self.as_i64().map(|i| i as usize)
+        // [R38-01 FIX] Reject negative and out-of-range values. This previously
+        // delegated to `as_i64` and cast `i as usize`, so a negative foreign
+        // Int — e.g. the ubiquitous `-1` error sentinel — wrapped to a
+        // gigantic `usize` (usize::MAX). A `usize` marshaled from a foreign
+        // call is typically used as a length, capacity, or index, so a wrapped
+        // value means an OOM-sized allocation or an out-of-bounds access
+        // instead of a clean `FromForeign` type error.
+        match self {
+            ForeignValue::Int(i) => usize::try_from(*i).ok(),
+            ForeignValue::Float(f) => {
+                if f.is_finite() && *f >= 0.0 && *f <= usize::MAX as f64 {
+                    Some(*f as usize)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Convert to JavaScript literal for expression building
