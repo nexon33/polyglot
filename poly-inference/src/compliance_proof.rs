@@ -196,6 +196,21 @@ impl ComplianceProof {
     pub fn verify(&self) -> Result<bool, String> {
         let backend = HashIvc;
 
+        // [R36-01 FIX] Require the IVC proof to be in Transparent privacy mode.
+        // `ComplianceAccumulator` always initializes the IVC in Transparent
+        // mode (the server sees the generated tokens regardless), so a genuine
+        // ComplianceProof is always Transparent. For a `Private` proof,
+        // `HashIvc::verify` SKIPS the output-hash comparison in check 1 below —
+        // so `final_state_hash`, `total_tokens` and `compliant_tokens` would no
+        // longer be bound to the proof, letting an attacker attach arbitrary
+        // compliance metadata (e.g. "all tokens compliant") to a valid IVC
+        // chain. A non-Transparent proof can never be server-issued; reject it.
+        if let VerifiedProof::HashIvc { privacy_mode, .. } = &self.ivc_proof {
+            if *privacy_mode != PrivacyMode::Transparent {
+                return Ok(false);
+            }
+        }
+
         // 1. Verify IVC proof with actual I/O binding.
         let input = ZERO_HASH;
         // Recompute output binding — must match what finalize() committed
