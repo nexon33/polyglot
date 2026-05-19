@@ -46,6 +46,14 @@ const MAX_PROMPT_LENGTH: usize = 100_000;
 /// can still overwhelm the model. 8192 tokens is a reasonable context window.
 const MAX_PROMPT_TOKENS: usize = 8192;
 
+/// R45: Maximum number of CKKS ciphertext chunks accepted on
+/// `/generate/encrypted`. Each chunk holds N token IDs, so a ciphertext for a
+/// `MAX_PROMPT_TOKENS`-token prompt needs at most this many chunks. The chunk
+/// count is otherwise attacker-controlled and bounds the per-chunk O(N²) work
+/// in `decrypt_unchecked` — see the rejection site for the DoS rationale.
+const MAX_CIPHERTEXT_CHUNKS: usize =
+    (MAX_PROMPT_TOKENS + poly_client::ckks::params::N - 1) / poly_client::ckks::params::N;
+
 // ─── Simple batch request/response types ─────────────────────────────────
 
 /// Simple generation request. Prompt, parameters, and optional privacy mode.
@@ -728,6 +736,31 @@ fn handle_generate_encrypted<B: InferenceBackend>(
             return json_error(400, "invalid encrypted input", json_header);
         }
     };
+
+    // R45-01: Bound the ciphertext chunk count before decryption.
+    // `decrypt_unchecked` performs an O(N²) negacyclic polynomial multiply
+    // (`c1 · s`) for *every* chunk in `input_ct.chunks`, regardless of the
+    // ciphertext's `token_count` — the per-chunk cost is paid even for chunks
+    // whose decoded tokens are discarded. The chunk count is attacker-
+    // controlled: low-entropy chunks (e.g. all-ones polynomials) compress to a
+    // tiny payload that passes every byte-size limit, yet decompress to a
+    // ciphertext with hundreds of chunks, each costing ~11M i128 multiplies.
+    // That is several seconds of CPU per request on the single-threaded HTTP
+    // server — an algorithmic-complexity DoS. A genuine ciphertext encodes at
+    // most MAX_PROMPT_TOKENS tokens (N per chunk), so anything beyond
+    // MAX_CIPHERTEXT_CHUNKS chunks cannot be a valid prompt and is rejected
+    // before any polynomial arithmetic runs.
+    if input_ct.chunks.len() > MAX_CIPHERTEXT_CHUNKS {
+        eprintln!(
+            "rejected oversized ciphertext on /generate/encrypted: {} chunks",
+            input_ct.chunks.len()
+        );
+        return json_error(
+            400,
+            "encrypted input rejected: too many ciphertext chunks",
+            json_header,
+        );
+    }
 
     let client_pk: CkksPublicKey = match compress::decompress(&req.client_public_key) {
         Ok(pk) => pk,
