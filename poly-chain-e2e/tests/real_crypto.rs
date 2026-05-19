@@ -21,8 +21,8 @@ fn funded() -> (Testnet, Keypair, Keypair) {
     let mut net = Testnet::new(1_000);
     let alice = Keypair::generate().unwrap();
     let bob = Keypair::generate().unwrap();
-    net.faucet(alice.account_id(), "alice", 50_000, 1_000);
-    net.faucet(bob.account_id(), "bob", 1_000, 1_000);
+    net.faucet(alice.account_id(), "alice", 50_000, 1_000).unwrap();
+    net.faucet(bob.account_id(), "bob", 1_000, 1_000).unwrap();
     (net, alice, bob)
 }
 
@@ -38,6 +38,7 @@ fn transfer_params(net: &Testnet, from: &Keypair, to: &Keypair, amount: u64) -> 
         sender_tier: Tier::Anonymous,
         sender_identity_hash: ZERO_HASH,
         recipient_identity_hash: ZERO_HASH,
+        chain_id: net.state.chain_id,
         rolling_24h_total_after: wallet.rolling_24h_total + amount,
         jurisdiction: 0,
     }

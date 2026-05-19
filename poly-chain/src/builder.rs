@@ -14,7 +14,7 @@ use crate::identity::Tier;
 use crate::keys::Keypair;
 use crate::primitives::*;
 use crate::transaction::{CashTransfer, Transaction};
-use crate::validation::cash_transfer_signing_message;
+use crate::validation::{cash_transfer_signing_message, chain_scoped};
 
 /// Everything needed to build a signed `CashTransfer`.
 ///
@@ -36,6 +36,9 @@ pub struct CashTransferParams {
     pub rolling_24h_total_after: Amount,
     /// ISO 3166-1 numeric country code.
     pub jurisdiction: u16,
+    /// The chain id of the testnet this transfer targets (cross-chain replay
+    /// protection). Read it from the node's `state.chain_id`.
+    pub chain_id: Hash,
 }
 
 /// The proof input hash bound by `validate_cash_transfer`.
@@ -133,7 +136,10 @@ pub fn build_cash_transfer(sender: &Keypair, p: &CashTransferParams) -> Result<T
         jurisdiction: p.jurisdiction,
     };
 
-    tx.signature = sender.sign(&cash_transfer_signing_message(&tx));
+    tx.signature = sender.sign(&chain_scoped(
+        &p.chain_id,
+        cash_transfer_signing_message(&tx),
+    ));
     Ok(Transaction::CashTransfer(tx))
 }
 
@@ -154,6 +160,7 @@ mod tests {
             sender_tier: Tier::Anonymous,
             sender_identity_hash: ZERO_HASH,
             recipient_identity_hash: ZERO_HASH,
+            chain_id: ZERO_HASH,
             rolling_24h_total_after: 1_000,
             jurisdiction: 0,
         }

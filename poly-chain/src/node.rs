@@ -39,6 +39,20 @@ pub struct BlockReport {
     pub rejected: Vec<(String, String)>,
 }
 
+/// A recorded faucet mint.
+///
+/// Faucet operations carry no transaction, so they are logged here instead.
+/// Replaying the allocations then the block history reconstructs the whole
+/// state from genesis — see [`Testnet::verify_integrity`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenesisAllocation {
+    /// Funded account id, hex-encoded.
+    pub account_id: String,
+    pub label: String,
+    pub amount: Amount,
+    pub timestamp: Timestamp,
+}
+
 /// The complete testnet: chain, state, mempool and off-chain ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Testnet {
@@ -46,18 +60,35 @@ pub struct Testnet {
     pub state: GlobalState,
     pub mempool: Vec<Transaction>,
     pub ledger: Vec<LedgerEntry>,
+    /// Recorded faucet mints, applied before any block when reconstructing
+    /// state from genesis. `#[serde(default)]` keeps older files loadable.
+    #[serde(default)]
+    pub genesis_allocations: Vec<GenesisAllocation>,
 }
 
 impl Testnet {
-    /// Create a fresh testnet with a genesis block at `now`.
+    /// Create a fresh testnet with a genesis block at `now` and a random,
+    /// network-unique chain id.
     pub fn new(now: Timestamp) -> Self {
-        let state = GlobalState::genesis();
+        let mut chain_id = [0u8; 32];
+        // A failure here would only weaken cross-chain replay protection, not
+        // correctness; the ZERO fallback is acceptable.
+        let _ = getrandom::getrandom(&mut chain_id);
+        Self::with_genesis(now, chain_id)
+    }
+
+    /// Construct a testnet with an explicit genesis timestamp and chain id.
+    /// Used by [`new`](Self::new) and by replay reconstruction.
+    fn with_genesis(now: Timestamp, chain_id: Hash) -> Self {
+        let mut state = GlobalState::genesis();
+        state.chain_id = chain_id;
         let genesis = Block::genesis(state.state_root(), now);
         Self {
             chain: vec![genesis],
             state,
             mempool: Vec::new(),
             ledger: Vec::new(),
+            genesis_allocations: Vec::new(),
         }
     }
 
@@ -113,9 +144,35 @@ impl Testnet {
 
     /// Admin / genesis op: credit testnet funds to an account.
     ///
-    /// Creates the off-chain wallet and its on-chain commitment on first use.
-    /// Faucet does not produce a block — it seeds genesis-style state.
-    pub fn faucet(&mut self, account: AccountId, label: &str, amount: Amount, now: Timestamp) {
+    /// Only permitted before the first block is mined, so the recorded
+    /// allocations plus the block history fully determine the state (the chain
+    /// stays reconstructible from genesis). Each mint is logged in
+    /// `genesis_allocations`.
+    pub fn faucet(
+        &mut self,
+        account: AccountId,
+        label: &str,
+        amount: Amount,
+        now: Timestamp,
+    ) -> Result<()> {
+        if self.chain.len() > 1 {
+            return Err(ChainError::InvalidEncoding(
+                "faucet is only allowed before the first block is mined".into(),
+            ));
+        }
+        self.genesis_allocations.push(GenesisAllocation {
+            account_id: hex_encode(&account),
+            label: label.to_string(),
+            amount,
+            timestamp: now,
+        });
+        self.apply_faucet(account, label, amount, now);
+        Ok(())
+    }
+
+    /// Apply a faucet mint to state + ledger, without recording it. Shared by
+    /// [`faucet`](Self::faucet) and replay reconstruction.
+    fn apply_faucet(&mut self, account: AccountId, label: &str, amount: Amount, now: Timestamp) {
         match self.ledger_index(&account) {
             Some(i) => {
                 self.ledger[i].wallet.balance =
@@ -160,6 +217,10 @@ impl Testnet {
     /// Each transaction is validated against the chain *and* against the
     /// off-chain ledger (balances the chain does not track). Accepted
     /// transactions are applied; rejected ones are reported and dropped.
+    ///
+    /// If no transaction is accepted, no block is appended (the returned
+    /// report has `height` unchanged) — empty blocks would otherwise be
+    /// unreplayable, since the chain stores only accepted transactions.
     pub fn produce_block(&mut self, now: Timestamp) -> Result<BlockReport> {
         if self.mempool.is_empty() {
             return Err(ChainError::InvalidEncoding(
@@ -182,6 +243,15 @@ impl Testnet {
                 Ok(()) => accepted.push(tx),
                 Err(e) => rejected.push((short, e.to_string())),
             }
+        }
+
+        if accepted.is_empty() {
+            // Nothing applied — do not append an (unreplayable) empty block.
+            return Ok(BlockReport {
+                height: self.height(),
+                accepted: 0,
+                rejected,
+            });
         }
 
         let block = Block::try_new(
@@ -357,7 +427,49 @@ impl Testnet {
                 });
             }
         }
+
+        // 5. Full from-genesis replay: the stored state must be exactly what
+        //    the recorded genesis allocations plus the block history produce.
+        //    This is what makes the chain independently verifiable — a forged
+        //    state that is internally self-consistent still fails here unless
+        //    it is the genuine result of the recorded history.
+        let rebuilt = self.rebuild()?;
+        if rebuilt.chain.len() != self.chain.len() {
+            return Err(ChainError::InvalidEncoding(format!(
+                "replay produced {} blocks, file has {}",
+                rebuilt.chain.len(),
+                self.chain.len()
+            )));
+        }
+        if rebuilt.state.state_root() != self.state.state_root() {
+            return Err(ChainError::StateHashMismatch {
+                expected: hex_encode(&rebuilt.state.state_root()),
+                actual: hex_encode(&self.state.state_root()),
+            });
+        }
         Ok(())
+    }
+
+    /// Reconstruct the testnet from scratch: replay the recorded genesis
+    /// allocations, then re-apply every recorded block's transactions. The
+    /// result is what the history *should* produce, independent of the stored
+    /// `state` / `ledger` fields.
+    fn rebuild(&self) -> Result<Testnet> {
+        let genesis = self.chain.first().ok_or_else(|| {
+            ChainError::InvalidEncoding("chain has no genesis block".into())
+        })?;
+        let mut fresh = Testnet::with_genesis(genesis.header.timestamp, self.state.chain_id);
+        for alloc in &self.genesis_allocations {
+            let id = decode_account(&alloc.account_id)?;
+            fresh.apply_faucet(id, &alloc.label, alloc.amount, alloc.timestamp);
+        }
+        for block in self.chain.iter().skip(1) {
+            for tx in &block.transactions {
+                fresh.submit(tx.clone())?;
+            }
+            fresh.produce_block(block.header.timestamp)?;
+        }
+        Ok(fresh)
     }
 }
 
@@ -388,6 +500,7 @@ mod tests {
             sender_tier: Tier::Anonymous,
             sender_identity_hash: ZERO_HASH,
             recipient_identity_hash: ZERO_HASH,
+            chain_id: node.state.chain_id,
             rolling_24h_total_after: wallet.rolling_24h_total + amount,
             jurisdiction: 0,
         }
@@ -404,7 +517,7 @@ mod tests {
     fn faucet_creates_account() {
         let mut net = Testnet::new(1_000);
         let kp = Keypair::generate().unwrap();
-        net.faucet(kp.account_id(), "alice", 50_000, 1_000);
+        net.faucet(kp.account_id(), "alice", 50_000, 1_000).unwrap();
         assert_eq!(net.balance(&kp.account_id()), Some(50_000));
         assert!(net.on_chain_pre(&kp.account_id()).is_some());
     }
@@ -413,8 +526,8 @@ mod tests {
     fn faucet_twice_accumulates() {
         let mut net = Testnet::new(1_000);
         let kp = Keypair::generate().unwrap();
-        net.faucet(kp.account_id(), "alice", 10_000, 1_000);
-        net.faucet(kp.account_id(), "alice", 5_000, 1_000);
+        net.faucet(kp.account_id(), "alice", 10_000, 1_000).unwrap();
+        net.faucet(kp.account_id(), "alice", 5_000, 1_000).unwrap();
         assert_eq!(net.balance(&kp.account_id()), Some(15_000));
     }
 
@@ -423,8 +536,8 @@ mod tests {
         let mut net = Testnet::new(1_000);
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap();
-        net.faucet(alice.account_id(), "alice", 50_000, 1_000);
-        net.faucet(bob.account_id(), "bob", 0, 1_000);
+        net.faucet(alice.account_id(), "alice", 50_000, 1_000).unwrap();
+        net.faucet(bob.account_id(), "bob", 0, 1_000).unwrap();
 
         let params = transfer_params(&net, &alice.account_id(), bob.account_id(), 10_000);
         let tx = build_cash_transfer(&alice, &params).unwrap();
@@ -447,9 +560,9 @@ mod tests {
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap();
         let carol = Keypair::generate().unwrap();
-        net.faucet(alice.account_id(), "alice", 50_000, 1_000);
-        net.faucet(bob.account_id(), "bob", 0, 1_000);
-        net.faucet(carol.account_id(), "carol", 9_000, 1_000);
+        net.faucet(alice.account_id(), "alice", 50_000, 1_000).unwrap();
+        net.faucet(bob.account_id(), "bob", 0, 1_000).unwrap();
+        net.faucet(carol.account_id(), "carol", 9_000, 1_000).unwrap();
 
         let carol_before = net.on_chain_pre(&carol.account_id()).unwrap();
 
@@ -480,11 +593,13 @@ mod tests {
         // Two participants performing the same operations must derive the
         // exact same state root — the basis for instant cheat detection.
         fn run() -> Testnet {
-            let mut net = Testnet::new(1_000);
+            // Same chain id: this models two participants on the SAME chain,
+            // not two independently-created (and thus distinct) testnets.
+            let mut net = Testnet::with_genesis(1_000, [42u8; 32]);
             let alice = Keypair::from_secret_bytes(&[7u8; 32]);
             let bob = Keypair::from_secret_bytes(&[9u8; 32]);
-            net.faucet(alice.account_id(), "alice", 50_000, 1_000);
-            net.faucet(bob.account_id(), "bob", 1_000, 1_000);
+            net.faucet(alice.account_id(), "alice", 50_000, 1_000).unwrap();
+            net.faucet(bob.account_id(), "bob", 1_000, 1_000).unwrap();
             let params = transfer_params(&net, &alice.account_id(), bob.account_id(), 4_000);
             let tx = build_cash_transfer(&alice, &params).unwrap();
             net.submit(tx).unwrap();
@@ -505,7 +620,7 @@ mod tests {
         // A participant who tampers with a balance produces a divergent root.
         let mut honest = Testnet::new(1_000);
         let alice = Keypair::from_secret_bytes(&[3u8; 32]);
-        honest.faucet(alice.account_id(), "alice", 10_000, 1_000);
+        honest.faucet(alice.account_id(), "alice", 10_000, 1_000).unwrap();
 
         let mut cheater = honest.clone();
         let idx = cheater.ledger_index(&alice.account_id()).unwrap();
@@ -521,8 +636,8 @@ mod tests {
         let mut net = Testnet::new(1_000);
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap();
-        net.faucet(alice.account_id(), "alice", 500, 1_000);
-        net.faucet(bob.account_id(), "bob", 0, 1_000);
+        net.faucet(alice.account_id(), "alice", 500, 1_000).unwrap();
+        net.faucet(bob.account_id(), "bob", 0, 1_000).unwrap();
 
         let params = transfer_params(&net, &alice.account_id(), bob.account_id(), 10_000);
         let tx = build_cash_transfer(&alice, &params).unwrap();
@@ -541,8 +656,8 @@ mod tests {
         let mut net = Testnet::new(1_000);
         let alice = Keypair::generate().unwrap();
         let bob = Keypair::generate().unwrap();
-        net.faucet(alice.account_id(), "alice", 50_000, 1_000);
-        net.faucet(bob.account_id(), "bob", 0, 1_000);
+        net.faucet(alice.account_id(), "alice", 50_000, 1_000).unwrap();
+        net.faucet(bob.account_id(), "bob", 0, 1_000).unwrap();
 
         for _ in 0..2 {
             let params = transfer_params(&net, &alice.account_id(), bob.account_id(), 5_000);
@@ -559,7 +674,7 @@ mod tests {
     fn save_load_roundtrip() {
         let mut net = Testnet::new(1_000);
         let alice = Keypair::generate().unwrap();
-        net.faucet(alice.account_id(), "alice", 7_777, 1_000);
+        net.faucet(alice.account_id(), "alice", 7_777, 1_000).unwrap();
 
         let dir = std::env::temp_dir().join(format!("pc-node-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

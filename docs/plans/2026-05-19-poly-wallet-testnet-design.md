@@ -117,11 +117,23 @@ A security pass (plus an independent audit) found and fixed:
 
 `poly-chain/tests/testnet_pentest.rs` holds 12 attack tests covering these.
 
-### Known design gaps deferred to the networked phase
+## Post-pentest follow-ups (#1, #2)
 
-- **Faucet is not on-chain** — it mutates state with no transaction record, so
-  the chain is not independently replayable from genesis. For a networked
-  testnet, faucet must become a recorded transaction or a genesis allocation.
-- **No chain/genesis id in signing messages** — a signed `CashTransfer` is valid
-  on any testnet with matching accounts (cross-chain replay). Networked phase
-  must bind a genesis hash into the signing message and proof input.
+- **#1 — `AccountId = SHA-256(public key)`.** Previously the account id had to be
+  the raw Ed25519 key. Every signed transaction (and `StateObservation`) now
+  carries the signer's `public_key`; the validator checks the signature *and*
+  that `SHA-256(public_key)` equals the account id.
+- **#2a — faucet recorded on-chain.** Faucet mints are logged in
+  `genesis_allocations` and only allowed before the first block. `verify_integrity`
+  now replays allocations + the full block history from genesis and checks the
+  result matches the stored state — the chain is independently verifiable.
+- **#2b — chain id bound into signatures.** `GlobalState` carries a random
+  `chain_id`; every transaction signature is taken over `chain_id || message`,
+  so a transaction cannot be replayed onto another testnet.
+
+### Deferred to the networked phase
+
+- Snapshot sync for bootstrapping nodes (replaying from genesis is fine for a
+  local testnet but not for a long-lived networked chain).
+- Tiered nodes (light client / full node / validator), gossip, K-of-N light
+  client queries, hardcoded bootstrap seeds.

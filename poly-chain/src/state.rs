@@ -264,6 +264,11 @@ pub struct GlobalState {
     pub stp: SparseMerkleTree,
     pub applications: SparseMerkleTree,
     pub swaps: SparseMerkleTree,
+    /// Unique per-network identifier. Bound into every transaction signature
+    /// so a signed transaction cannot be replayed onto a different chain.
+    /// `#[serde(default)]` keeps older serialized states (ZERO id) loadable.
+    #[serde(default)]
+    pub chain_id: Hash,
     /// Per-account nonce tracking: prevents transaction replay.
     ///
     /// R15: Uses custom serde to encode [u8; 32] keys as hex strings,
@@ -285,6 +290,7 @@ impl GlobalState {
             stp: SparseMerkleTree::new(),
             applications: SparseMerkleTree::new(),
             swaps: SparseMerkleTree::new(),
+            chain_id: ZERO_HASH,
             nonces: BTreeMap::new(),
         }
     }
@@ -297,7 +303,7 @@ impl GlobalState {
     /// state snapshot to forge a state with reset nonces, enabling transaction replays
     /// that bypass the nonce check (because the replayed nonce would match the forged state).
     pub fn state_root(&self) -> Hash {
-        let mut data = Vec::with_capacity(10 * 32);
+        let mut data = Vec::with_capacity(11 * 32);
         data.extend_from_slice(&self.wallets.root());
         data.extend_from_slice(&self.identities.root());
         // [R21-01] Commit the identity reverse-index into the state root so it
@@ -310,6 +316,7 @@ impl GlobalState {
         data.extend_from_slice(&self.applications.root());
         data.extend_from_slice(&self.swaps.root());
         data.extend_from_slice(&self.nonces_hash());
+        data.extend_from_slice(&self.chain_id);
         hash_with_domain(DOMAIN_BLOCK, &data)
     }
 

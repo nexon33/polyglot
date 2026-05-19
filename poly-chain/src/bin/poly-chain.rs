@@ -316,7 +316,7 @@ fn faucet(data_dir: &Path, to: &str, amount: u64) -> Result<()> {
     let mut net = load_node(data_dir)?;
     let account = resolve_account(data_dir, to)?;
     let label = wallet_label_for(data_dir, &account).unwrap_or_else(|| "external".to_string());
-    net.faucet(account, &label, amount, now());
+    net.faucet(account, &label, amount, now())?;
     net.save(&chain_path(data_dir))?;
     println!("faucet: credited {amount} to {}", hex_encode(&account));
     println!("  balance: {}", net.balance(&account).unwrap_or(0));
@@ -373,6 +373,7 @@ fn send(data_dir: &Path, from: &str, to: &str, amount: u64, fee: u64) -> Result<
         sender_tier: Tier::Anonymous,
         sender_identity_hash: ZERO_HASH,
         recipient_identity_hash: ZERO_HASH,
+        chain_id: net.state.chain_id,
         rolling_24h_total_after: sender_entry.wallet.rolling_24h_total.saturating_add(amount),
         jurisdiction: 0,
     };
@@ -391,7 +392,11 @@ fn mine(data_dir: &Path) -> Result<()> {
     let report = net.produce_block(now())?;
     net.save(&chain_path(data_dir))?;
 
-    println!("mined block {}", report.height);
+    if report.accepted == 0 {
+        println!("no block produced — every queued transaction was rejected");
+    } else {
+        println!("mined block {}", report.height);
+    }
     println!("  accepted: {}", report.accepted);
     if report.rejected.is_empty() {
         println!("  rejected: 0");

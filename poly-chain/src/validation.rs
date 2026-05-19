@@ -290,6 +290,19 @@ fn observation_signing_message(obs: &crate::fraud::StateObservation) -> Vec<u8> 
     obs.sign_message()
 }
 
+/// Prefix a signing message with the chain id.
+///
+/// Every transaction signature is taken over `chain_id || message`, so a
+/// transaction signed for one chain fails verification on any other — closing
+/// cross-chain (cross-testnet) signature replay. Public so wallet/builder code
+/// can produce a signature the validator accepts.
+pub fn chain_scoped(chain_id: &Hash, message: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + message.len());
+    out.extend_from_slice(chain_id);
+    out.extend_from_slice(&message);
+    out
+}
+
 /// R7: Derive a deterministic key for storing the investigation→target binding.
 /// This maps pool_id → a unique key in the STP SMT so that ProvideData can
 /// verify the submitter is the actual investigation target.
@@ -379,7 +392,7 @@ fn validate_cash_transfer(
     validate_timestamp(tx.timestamp, now)?;
 
     // 0d. Verify sender signature over the transaction
-    let signing_msg = cash_transfer_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, cash_transfer_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.from, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 1. Check sender wallet exists
@@ -598,7 +611,7 @@ fn validate_wallet_sync(
     }
 
     // 0b. Verify signature — only the account owner can sync their wallet
-    let signing_msg = wallet_sync_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, wallet_sync_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0c. Nonce validation
@@ -643,7 +656,7 @@ fn validate_identity_register(
     let mut new_state = state.clone();
 
     // 0. Verify signature — the account owner signs the registration
-    let signing_msg = identity_register_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, identity_register_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // Check for duplicate identity registration
@@ -792,7 +805,7 @@ fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp)
     }
 
     // 0. Verify signature — only the account owner can store backups
-    let signing_msg = backup_store_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, backup_store_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0b. Nonce validation
@@ -842,7 +855,7 @@ fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timest
     }
 
     // 0. Verify signature — only the account owner can restore backups
-    let signing_msg = backup_restore_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, backup_restore_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0b. Nonce validation
@@ -1025,7 +1038,7 @@ fn validate_stp_action(
     validate_timestamp(tx.timestamp, now)?;
 
     // 0b. Verify submitter signature
-    let signing_msg = stp_action_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, stp_action_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.submitter, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0c. Verify proof
@@ -1358,7 +1371,7 @@ fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState, now: Time
     }
 
     // 0b. Verify signature — only the account owner can update app state
-    let signing_msg = app_state_update_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, app_state_update_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0c. Nonce validation
@@ -1420,7 +1433,7 @@ fn validate_atomic_swap_init(
     validate_timestamp(tx.timestamp, now)?;
 
     // 0c. Verify responder signature (responder is locking funds)
-    let signing_msg = atomic_swap_init_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, atomic_swap_init_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.responder, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // R6: Use responder's nonce (they sign the tx, so they control replay).
@@ -1541,7 +1554,7 @@ fn validate_atomic_swap_claim(
     let mut new_state = state.clone();
 
     // 0. Verify claimer signature
-    let signing_msg = atomic_swap_claim_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, atomic_swap_claim_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.claimer, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 1. Swap must exist
@@ -1642,7 +1655,7 @@ fn validate_atomic_swap_refund(
     let mut new_state = state.clone();
 
     // 0. Verify refundee signature
-    let signing_msg = atomic_swap_refund_signing_message(tx);
+    let signing_msg = chain_scoped(&state.chain_id, atomic_swap_refund_signing_message(tx));
     verify_account_signature_if_not_mock(&tx.refundee, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 1. Swap must exist
