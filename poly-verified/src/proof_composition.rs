@@ -1,4 +1,6 @@
 use crate::crypto::hash::{hash_combine, hash_data};
+use crate::ivc::hash_ivc::HashIvc;
+use crate::ivc::IvcBackend;
 use crate::types::{hash_eq, Hash, PrivacyMode, VerifiedProof};
 
 /// A composite proof that encompasses multiple nested verified computations.
@@ -117,15 +119,20 @@ impl CompositeProof {
             return false;
         }
 
-        // [V7-05 FIX] Structural validation of all contained proofs.
-        // Without this, an attacker could wrap invalid proofs inside a
-        // CompositeProof and the composition hash would still verify,
-        // making the composite appear legitimate.
-        if !Self::is_structurally_valid(&self.outer_proof) {
+        // [V7-05 / V34-01 FIX] Fully verify every contained proof — structure
+        // AND cryptographic chain integrity. The R7-05 fix checked only that
+        // each proof was structurally well-formed (step_count > 0, checkpoint
+        // count matches). A HashIvc proof can satisfy that yet still be a
+        // forgery: a chain_tip / merkle_root that do not correspond to its
+        // checkpoints describes a computation that never happened.
+        // verify_contained_proof now rebuilds the chain and Merkle tree and
+        // confirms they match, so a forged proof can no longer be wrapped to
+        // make the whole composite appear legitimate.
+        if !Self::verify_contained_proof(&self.outer_proof) {
             return false;
         }
         for inner in &self.inner_proofs {
-            if !Self::is_structurally_valid(inner) {
+            if !Self::verify_contained_proof(inner) {
                 return false;
             }
         }
@@ -143,20 +150,35 @@ impl CompositeProof {
         hash_eq(&expected, &self.composition_hash)
     }
 
-    /// Check whether a proof is structurally valid (non-empty computation).
+    /// Fully verify a contained proof — structure *and* cryptographic integrity.
+    ///
+    /// [V34-01 FIX] Before R34 this performed only *structural* validation
+    /// (`step_count > 0` and `checkpoints.len() == step_count`). A HashIvc
+    /// proof whose step count and checkpoint count agreed but whose
+    /// `chain_tip` / `merkle_root` did not actually correspond to those
+    /// checkpoints — a forged proof of a computation that never ran — passed
+    /// unchecked, and `verify_composition` returned `true`, making the whole
+    /// composite "appear legitimate" (the exact outcome the R7-05 structural
+    /// check was meant to prevent).
+    ///
+    /// The fix runs the full `HashIvc::verify` path: it rebuilds the hash
+    /// chain and Merkle tree from the checkpoints and confirms they reproduce
+    /// the committed `chain_tip` and `merkle_root` (and the blinding
+    /// commitment, for private modes). A composite carries no independent
+    /// expected I/O for its nested proofs, so the proof's own `input_hash` /
+    /// `output_hash` are supplied as the expected values — the I/O comparison
+    /// is then a tautology while every tamper-evidence check runs in full.
     ///
     /// [R18-02 FIX] Mock proofs carry no cryptographic material — every field
-    /// is attacker-chosen. Previously `verify_composition` accepted a composite
-    /// built entirely from forged Mock proofs (the composition_hash is
-    /// recomputed by the attacker via `compose()`). A production verifier MUST
-    /// reject Mock proofs; this gate mirrors `Verified::is_verified()`.
-    fn is_structurally_valid(proof: &VerifiedProof) -> bool {
+    /// is attacker-chosen. A production verifier MUST reject them; this gate
+    /// mirrors `Verified::is_verified()`.
+    fn verify_contained_proof(proof: &VerifiedProof) -> bool {
         match proof {
             VerifiedProof::HashIvc {
-                step_count,
-                checkpoints,
+                input_hash,
+                output_hash,
                 ..
-            } => *step_count > 0 && checkpoints.len() as u64 == *step_count,
+            } => matches!(HashIvc.verify(proof, input_hash, output_hash), Ok(true)),
             VerifiedProof::Mock { .. } => cfg!(any(test, feature = "mock")),
         }
     }
