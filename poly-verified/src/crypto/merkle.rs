@@ -142,6 +142,17 @@ pub fn verify_proof(proof: &MerkleProof) -> bool {
 /// the guarantee this function's contract promises.
 pub fn verify_proof_strict(proof: &MerkleProof) -> bool {
     let depth = proof.siblings.len();
+    // [R41-01] Reject a structurally impossible proof up front. A Merkle tree
+    // never has more than 64 sibling levels — that would be a tree of more
+    // than 2^64 leaves. The leaf_index binding below shifts `leaf_index >> i`
+    // for `i` in `0..depth`; with `i >= 64` that is a shift overflow (a panic
+    // in debug builds, a wrong result in release). `MerkleProof::to_bytes`
+    // asserts this cap, but a proof reaching this verifier via serde
+    // deserialization or direct construction is not otherwise bounded — and a
+    // verification function must never panic on a malformed proof.
+    if depth > 64 {
+        return false;
+    }
     if depth == 0 {
         if proof.leaf_index != 0 {
             return false;
