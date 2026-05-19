@@ -92,6 +92,9 @@ pub enum ChainError {
 
     #[error("proof system error: {0}")]
     ProofSystem(#[from] poly_verified::error::ProofSystemError),
+
+    #[error("io error: {0}")]
+    Io(String),
 }
 
 pub type Result<T> = std::result::Result<T, ChainError>;

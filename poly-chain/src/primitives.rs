@@ -21,7 +21,10 @@ pub mod serde_byte64 {
     }
 }
 
-/// Account identifier — SHA-256 hash of the public key.
+/// Account identifier — the account's raw Ed25519 public key.
+///
+/// `validation::verify_signature` feeds `tx.from` straight into
+/// `VerifyingKey::from_bytes`, so an account id *is* its verifying key.
 pub type AccountId = Hash;
 
 /// Smallest currency unit (1 MANA = 10_000 units).
@@ -74,6 +77,26 @@ pub fn hash_short(h: &Hash) -> String {
 /// Full hex encoding of a byte slice.
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Atomically write `contents` to `path` via a unique temp file + rename.
+///
+/// A plain `std::fs::write` truncates the target first, so a crash mid-write
+/// leaves a corrupt/empty file. Writing to a temp file and renaming makes the
+/// update all-or-nothing.
+pub fn write_atomic(path: &std::path::Path, contents: &[u8]) -> crate::error::Result<()> {
+    use crate::error::ChainError;
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, contents)
+        .map_err(|e| ChainError::Io(format!("write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        ChainError::Io(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })
 }
 
 /// 24 hours in seconds.

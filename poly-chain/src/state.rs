@@ -1,5 +1,5 @@
 use poly_verified::types::{Hash, ZERO_HASH};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
 use crate::primitives::*;
@@ -105,7 +105,7 @@ mod serde_nonces {
 ///
 /// Stores only non-empty leaves. Empty leaves are implicitly ZERO_HASH.
 /// The tree is 32 levels deep (keyed on first 4 bytes of the key hash).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SparseMerkleTree {
     /// Non-empty leaf values: key → value_hash.
     ///
@@ -115,6 +115,33 @@ pub struct SparseMerkleTree {
     leaves: BTreeMap<Hash, Hash>,
     /// Cached root hash (recomputed on mutation).
     root: Hash,
+}
+
+// [T1 FIX] `root` is a *cache* of `leaves`. The derived `Deserialize` trusted
+// whatever `root` value appeared in the serialized form, so an attacker could
+// hand over a state file with forged `leaves` but an honest-looking `root` —
+// `state_root()` (which returns the cached value) would then report the honest
+// root while the leaves are forged, silently defeating cheat detection. This
+// manual impl ignores any wire-supplied `root` and recomputes it from `leaves`,
+// so the root is always a faithful commitment to the actual leaf set.
+impl<'de> Deserialize<'de> for SparseMerkleTree {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(with = "serde_hash_map")]
+            leaves: BTreeMap<Hash, Hash>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let mut smt = SparseMerkleTree {
+            leaves: raw.leaves,
+            root: ZERO_HASH,
+        };
+        smt.recompute_root();
+        Ok(smt)
+    }
 }
 
 impl SparseMerkleTree {

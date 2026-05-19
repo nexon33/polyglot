@@ -66,3 +66,6 @@ poly-vscode/bin/poly-lsp-*.exe
 
 # VS Code extension build artifacts
 *.vsix
+
+# poly-chain local testnet runtime data
+testnet-data/

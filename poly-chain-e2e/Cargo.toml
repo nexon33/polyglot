@@ -1,0 +1,15 @@
+[package]
+name = "poly-chain-e2e"
+version = "0.1.0"
+edition = "2021"
+description = "Real-crypto end-to-end tests for poly-chain (built WITHOUT the mock feature)"
+
+# This crate exists so poly-chain's integration tests can run against real
+# Ed25519 signature verification and real HashIvc proof verification.
+# poly-chain's own test target force-enables `poly-chain/mock` (via a self
+# dev-dependency), which skips all crypto. Here poly-chain is a plain
+# dependency, so `cargo test -p poly-chain-e2e` exercises the production paths.
+
+[dependencies]
+poly-chain = { path = "../poly-chain" }
+poly-verified = { path = "../poly-verified" }

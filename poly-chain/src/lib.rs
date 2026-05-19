@@ -14,11 +14,15 @@
 //! - **Validation**: Verify-only pipeline (proof → signature → state → fee)
 
 pub mod block;
+pub mod builder;
 pub mod compliance;
 pub mod error;
 pub mod fee;
 pub mod fraud;
 pub mod identity;
+pub mod keys;
+pub mod keystore;
+pub mod node;
 pub mod primitives;
 pub mod stp;
 pub mod state;

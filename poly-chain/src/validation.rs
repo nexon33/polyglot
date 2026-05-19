@@ -128,7 +128,10 @@ fn validate_nonce(state: &GlobalState, account_id: &AccountId, tx_nonce: Nonce) 
 // transaction fields EXCLUDING the signature field.
 // ---------------------------------------------------------------------------
 
-fn cash_transfer_signing_message(tx: &CashTransfer) -> Vec<u8> {
+/// Canonical byte representation of a `CashTransfer` excluding its signature.
+///
+/// Public so wallet/builder code can produce a signature the validator accepts.
+pub fn cash_transfer_signing_message(tx: &CashTransfer) -> Vec<u8> {
     let mut msg = Vec::new();
     msg.extend_from_slice(b"CashTransfer_v1");
     msg.extend_from_slice(&tx.from);
