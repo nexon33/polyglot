@@ -266,7 +266,13 @@ pub fn decrypt_unchecked(ct: &CkksCiphertext, sk: &CkksSecretKey) -> Vec<u32> {
         return vec![];
     }
 
-    let mut all_tokens = Vec::with_capacity(ct.token_count);
+    // [R40-01] Derive the pre-allocation from `chunks`, not the
+    // attacker-controlled `token_count`. A `CkksCiphertext` deserialized from
+    // an untrusted source can carry `token_count` near `usize::MAX`;
+    // `Vec::with_capacity` then aborts with a capacity overflow. Each chunk
+    // decodes at most N tokens, so `chunks.len() * N` is the real upper bound.
+    let capacity = ct.token_count.min(ct.chunks.len().saturating_mul(N));
+    let mut all_tokens = Vec::with_capacity(capacity);
     let mut remaining = ct.token_count;
 
     for (c0, c1) in &ct.chunks {

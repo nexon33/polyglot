@@ -10,9 +10,34 @@ use serde::{Deserialize, Serialize};
 use super::params::{DECOMP_BASE, N, NUM_DIGITS, Q};
 
 /// A polynomial in Z_q[X]/(X^N + 1). Always has exactly N coefficients.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Poly {
     pub coeffs: Vec<i64>,
+}
+
+/// [R40-01] `Poly` carries the invariant "always exactly N coefficients" — its
+/// arithmetic (`add`, `sub`, `mul`, `neg`, ...) indexes `coeffs[0..N]` directly
+/// and panics with an index-out-of-bounds on a shorter vector. A `#[derive]`d
+/// `Deserialize` did NOT enforce that: a `Poly` decoded from an untrusted
+/// `CkksCiphertext` or `CkksPublicKey` (e.g. via the `/generate/encrypted`
+/// inference endpoint) could carry a coefficient vector of any length, so a
+/// crafted payload crashed `decrypt` / `encrypt` with a panic (DoS).
+///
+/// The manual impl routes every deserialized `Poly` through `from_coeffs`,
+/// which pads/truncates to exactly N and centers each coefficient — restoring
+/// the invariant for any deserialized value.
+impl<'de> Deserialize<'de> for Poly {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawPoly {
+            coeffs: Vec<i64>,
+        }
+        let raw = RawPoly::deserialize(deserializer)?;
+        Ok(Poly::from_coeffs(raw.coeffs))
+    }
 }
 
 impl Poly {
