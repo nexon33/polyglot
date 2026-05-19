@@ -108,6 +108,7 @@ fn make_swap(
         nonce,
         timestamp: 1000,
         proof: mock_proof(),
+        public_key: [0u8; 32],
         signature: [0u8; 64],
     }
 }
@@ -128,6 +129,7 @@ fn make_claim(swap: &AtomicSwapInit) -> AtomicSwapClaim {
         original_hash_lock: swap.hash_lock,
         original_timeout: swap.timeout,
         proof: mock_proof(),
+        public_key: [0u8; 32],
         signature: [0u8; 64],
     }
 }
@@ -142,6 +144,7 @@ fn make_refund(swap: &AtomicSwapInit) -> AtomicSwapRefund {
         original_hash_lock: swap.hash_lock,
         original_timeout: swap.timeout,
         proof: mock_proof(),
+        public_key: [0u8; 32],
         signature: [0u8; 64],
     }
 }

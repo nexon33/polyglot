@@ -1,12 +1,13 @@
 //! Ed25519 wallet keypairs and account-id derivation.
 //!
-//! A poly-chain account is identified by its raw Ed25519 public key:
-//! `AccountId == public key`. The chain's signature verification
-//! (`validation::verify_signature`) feeds `tx.from` straight into
-//! `VerifyingKey::from_bytes`, so the account id and the verifying key must be
-//! the same 32 bytes.
+//! A poly-chain account is identified by `AccountId = SHA-256(public key)`.
+//! A transaction carries the signer's public key explicitly; the validator
+//! checks both that the signature is valid and that `SHA-256(public key)`
+//! equals the claimed account id. Hashing keeps addresses uniform and leaves
+//! the public key undisclosed until an account first transacts.
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 
 use crate::error::{ChainError, Result};
 use crate::primitives::AccountId;
@@ -43,9 +44,9 @@ impl Keypair {
         self.signing.verifying_key().to_bytes()
     }
 
-    /// The account id — for poly-chain this *is* the Ed25519 public key.
+    /// The account id: `SHA-256(public key)`.
     pub fn account_id(&self) -> AccountId {
-        self.public_bytes()
+        account_id_from_public(&self.public_bytes())
     }
 
     /// Sign a message, returning the raw 64-byte Ed25519 signature.
@@ -54,12 +55,14 @@ impl Keypair {
     }
 }
 
-/// The account id for a raw Ed25519 public key.
-///
-/// poly-chain identifies accounts *by* their public key, so this is the
-/// identity function — kept as a named helper for call-site clarity.
+/// Derive an account id from a raw Ed25519 public key: `SHA-256(public key)`.
 pub fn account_id_from_public(public_key: &[u8; 32]) -> AccountId {
-    *public_key
+    let mut hasher = Sha256::new();
+    hasher.update(public_key);
+    let digest = hasher.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&digest);
+    id
 }
 
 /// Verify a raw 64-byte Ed25519 signature against a public key and message.
@@ -96,10 +99,11 @@ mod tests {
     }
 
     #[test]
-    fn account_id_is_the_public_key() {
+    fn account_id_is_sha256_of_public_key() {
         let kp = Keypair::generate().unwrap();
-        assert_eq!(kp.account_id(), kp.public_bytes());
         assert_eq!(kp.account_id(), account_id_from_public(&kp.public_bytes()));
+        // The account id is a hash, not the key itself.
+        assert_ne!(kp.account_id(), kp.public_bytes());
     }
 
     #[test]

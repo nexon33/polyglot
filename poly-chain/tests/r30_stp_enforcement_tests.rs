@@ -79,6 +79,7 @@ fn state_with_official(official: Hash) -> GlobalState {
         submitter: official,
         timestamp: TRIGGER_AT,
         proof: mock_proof(),
+        public_key: [0u8; 32],
         signature: [0u8; 64],
     });
     validate_transaction(&tx, &state, TRIGGER_AT, 0).unwrap()
@@ -90,6 +91,7 @@ fn stp_tx(action: STPAction, submitter: Hash, timestamp: u64) -> Transaction {
         submitter,
         timestamp,
         proof: mock_proof(),
+        public_key: [0u8; 32],
         signature: [0u8; 64],
     })
 }
@@ -181,6 +183,7 @@ fn r30_frozen_account_cannot_transfer() {
         timestamp: now,
         state_pre: state.get_wallet(&official).unwrap(),
         proof: mock_proof(),
+        public_key: [0u8; 32],
         signature: [0u8; 64],
         sender_tier: Tier::PublicOfficial,
         sender_identity_hash: [0xDD; 32],

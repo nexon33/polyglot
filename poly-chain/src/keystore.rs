@@ -17,8 +17,7 @@ use crate::primitives::{hex_encode, write_atomic, AccountId};
 pub struct Keyfile {
     /// Human-readable wallet name.
     pub label: String,
-    /// The account id, hex. For poly-chain this *is* the Ed25519 public key,
-    /// so it equals `public_key` below — kept under the canonical field name.
+    /// The account id (`SHA-256(public key)`), hex.
     pub account_id: String,
     /// Ed25519 public key, hex.
     pub public_key: String,

@@ -82,6 +82,9 @@ pub struct CashTransfer {
     /// Expected sender wallet state hash before this transfer.
     pub state_pre: Hash,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
     // -- Compliance fields (attested by the client's ZK proof) --
@@ -112,6 +115,9 @@ pub struct WalletSync {
     pub nonce: Nonce,
     pub timestamp: Timestamp,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
 }
@@ -129,6 +135,9 @@ pub struct IdentityRegister {
     pub is_public_official: bool,
     pub office: Option<String>,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
 }
@@ -144,6 +153,9 @@ pub struct BackupStore {
     pub state_hash: Hash,
     pub nonce: Nonce,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
 }
@@ -158,6 +170,9 @@ pub struct BackupRestore {
     pub backup_hash: Hash,
     pub nonce: Nonce,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
 }
@@ -203,6 +218,9 @@ pub struct STPActionTx {
     pub submitter: AccountId,
     pub timestamp: Timestamp,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
 }
@@ -229,6 +247,9 @@ pub struct AppStateUpdate {
     pub nonce: Nonce,
     pub timestamp: Timestamp,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
 }
@@ -306,6 +327,9 @@ pub struct AtomicSwapInit {
     pub nonce: Nonce,
     pub timestamp: Timestamp,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
 }
@@ -333,6 +357,9 @@ pub struct AtomicSwapClaim {
     /// The original timeout block height.
     pub original_timeout: BlockHeight,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
 }
@@ -358,6 +385,9 @@ pub struct AtomicSwapRefund {
     /// The original timeout block height.
     pub original_timeout: BlockHeight,
     pub proof: VerifiedProof,
+    /// The signer's Ed25519 public key. `SHA-256(public_key)` must equal the
+    /// account id that authorizes this transaction.
+    pub public_key: [u8; 32],
     #[serde(with = "crate::primitives::serde_byte64")]
     pub signature: [u8; 64],
 }
@@ -387,6 +417,7 @@ mod tests {
                 timestamp: 0,
                 state_pre: ZERO_HASH,
                 proof: mock_proof(),
+                public_key: [0u8; 32],
                 signature: [0u8; 64],
                 sender_tier: Tier::Identified,
                 sender_identity_hash: [0xAA; 32],
@@ -404,6 +435,7 @@ mod tests {
                 is_public_official: false,
                 office: None,
                 proof: mock_proof(),
+                public_key: [0u8; 32],
                 signature: [0u8; 64],
             }),
         ];
@@ -423,6 +455,7 @@ mod tests {
             timestamp: 0,
             state_pre: ZERO_HASH,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -449,6 +482,7 @@ mod tests {
             timestamp: 0,
             state_pre: ZERO_HASH,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -468,6 +502,7 @@ mod tests {
                     observed_key: [1u8; 32],
                     observed_state_hash: [3u8; 32],
                     observed_nonce: 5,
+                    observer_public_key: [0u8; 32],
                     observer_signature: [0u8; 64],
                 },
                 observation_b: crate::fraud::StateObservation {
@@ -475,6 +510,7 @@ mod tests {
                     observed_key: [1u8; 32],
                     observed_state_hash: [5u8; 32],
                     observed_nonce: 5,
+                    observer_public_key: [0u8; 32],
                     observer_signature: [0u8; 64],
                 },
                 conflict_type: crate::fraud::ConflictType::DoubleSpend,

@@ -115,6 +115,7 @@ pub fn build_cash_transfer(sender: &Keypair, p: &CashTransferParams) -> Result<T
 
     let mut tx = CashTransfer {
         from,
+        public_key: sender.public_bytes(),
         to: p.to,
         amount: p.amount,
         fee: p.fee,

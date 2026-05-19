@@ -75,22 +75,33 @@ pub fn verify_signature(
         .map_err(|_| ChainError::InvalidSignature)
 }
 
-/// Verify a signature, but skip verification in test/mock builds.
+/// Verify a transaction signature and bind it to the claimed account.
 ///
-/// In test builds, transactions use `[0u8; 64]` placeholder signatures.
-/// This function allows those to pass without verification.
-fn verify_signature_if_not_mock(
-    public_key_bytes: &[u8; 32],
+/// `account` must equal `SHA-256(public_key)` and `signature` must be a valid
+/// Ed25519 signature of `message` under `public_key`. Binding the key to the
+/// account id is what makes `AccountId = SHA-256(public key)` sound: a forged
+/// `public_key` would not hash to the account the transaction claims to spend.
+///
+/// In test/mock builds the check is skipped — those transactions use
+/// placeholder keys and `[0u8; 64]` signatures.
+fn verify_account_signature_if_not_mock(
+    account: &AccountId,
+    public_key: &[u8; 32],
     message: &[u8],
     signature: &[u8; 64],
 ) -> Result<()> {
     #[cfg(any(test, feature = "mock"))]
     {
-        let _ = (public_key_bytes, message, signature);
+        let _ = (account, public_key, message, signature);
         return Ok(());
     }
     #[cfg(not(any(test, feature = "mock")))]
-    verify_signature(public_key_bytes, message, signature)
+    {
+        if crate::keys::account_id_from_public(public_key) != *account {
+            return Err(ChainError::InvalidSignature);
+        }
+        verify_signature(public_key, message, signature)
+    }
 }
 
 /// Validate that a timestamp is within acceptable drift of `now`.
@@ -369,7 +380,7 @@ fn validate_cash_transfer(
 
     // 0d. Verify sender signature over the transaction
     let signing_msg = cash_transfer_signing_message(tx);
-    verify_signature_if_not_mock(&tx.from, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.from, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 1. Check sender wallet exists
     let sender_state_hash = state
@@ -588,7 +599,7 @@ fn validate_wallet_sync(
 
     // 0b. Verify signature — only the account owner can sync their wallet
     let signing_msg = wallet_sync_signing_message(tx);
-    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0c. Nonce validation
     let next_nonce = validate_nonce(state, &tx.account_id, tx.nonce)?;
@@ -633,7 +644,7 @@ fn validate_identity_register(
 
     // 0. Verify signature — the account owner signs the registration
     let signing_msg = identity_register_signing_message(tx);
-    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // Check for duplicate identity registration
     if state.get_identity(&tx.account_id).is_some() {
@@ -782,7 +793,7 @@ fn validate_backup_store(tx: &BackupStore, state: &GlobalState, _now: Timestamp)
 
     // 0. Verify signature — only the account owner can store backups
     let signing_msg = backup_store_signing_message(tx);
-    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0b. Nonce validation
     let next_nonce = validate_nonce(state, &tx.account_id, tx.nonce)?;
@@ -832,7 +843,7 @@ fn validate_backup_restore(tx: &BackupRestore, state: &GlobalState, _now: Timest
 
     // 0. Verify signature — only the account owner can restore backups
     let signing_msg = backup_restore_signing_message(tx);
-    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0b. Nonce validation
     let next_nonce = validate_nonce(state, &tx.account_id, tx.nonce)?;
@@ -931,14 +942,16 @@ fn validate_fraud_proof(tx: &FraudProofTx, state: &GlobalState) -> Result<Global
 
     // 2. Verify observer signatures — prevents fabricated fraud evidence
     let obs_a_msg = observation_signing_message(&tx.evidence.observation_a);
-    verify_signature_if_not_mock(
+    verify_account_signature_if_not_mock(
         &tx.evidence.observation_a.observer,
+        &tx.evidence.observation_a.observer_public_key,
         &obs_a_msg,
         &tx.evidence.observation_a.observer_signature,
     )?;
     let obs_b_msg = observation_signing_message(&tx.evidence.observation_b);
-    verify_signature_if_not_mock(
+    verify_account_signature_if_not_mock(
         &tx.evidence.observation_b.observer,
+        &tx.evidence.observation_b.observer_public_key,
         &obs_b_msg,
         &tx.evidence.observation_b.observer_signature,
     )?;
@@ -1013,7 +1026,7 @@ fn validate_stp_action(
 
     // 0b. Verify submitter signature
     let signing_msg = stp_action_signing_message(tx);
-    verify_signature_if_not_mock(&tx.submitter, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.submitter, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0c. Verify proof
     let input_hash = hash_with_domain(
@@ -1346,7 +1359,7 @@ fn validate_app_state_update(tx: &AppStateUpdate, state: &GlobalState, now: Time
 
     // 0b. Verify signature — only the account owner can update app state
     let signing_msg = app_state_update_signing_message(tx);
-    verify_signature_if_not_mock(&tx.account_id, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.account_id, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 0c. Nonce validation
     let next_nonce = validate_nonce(state, &tx.account_id, tx.nonce)?;
@@ -1408,7 +1421,7 @@ fn validate_atomic_swap_init(
 
     // 0c. Verify responder signature (responder is locking funds)
     let signing_msg = atomic_swap_init_signing_message(tx);
-    verify_signature_if_not_mock(&tx.responder, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.responder, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // R6: Use responder's nonce (they sign the tx, so they control replay).
     // Previously used initiator's nonce, which allowed a nonce griefing attack:
@@ -1529,7 +1542,7 @@ fn validate_atomic_swap_claim(
 
     // 0. Verify claimer signature
     let signing_msg = atomic_swap_claim_signing_message(tx);
-    verify_signature_if_not_mock(&tx.claimer, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.claimer, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 1. Swap must exist
     let stored_hash = state
@@ -1630,7 +1643,7 @@ fn validate_atomic_swap_refund(
 
     // 0. Verify refundee signature
     let signing_msg = atomic_swap_refund_signing_message(tx);
-    verify_signature_if_not_mock(&tx.refundee, &signing_msg, &tx.signature)?;
+    verify_account_signature_if_not_mock(&tx.refundee, &tx.public_key, &signing_msg, &tx.signature)?;
 
     // 1. Swap must exist
     let stored_hash = state
@@ -1794,6 +1807,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_state_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -1822,6 +1836,7 @@ mod tests {
             timestamp: 1000,
             state_pre: [0xFF; 32], // wrong!
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -1849,6 +1864,7 @@ mod tests {
             timestamp: 1000,
             state_pre: ZERO_HASH,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -1875,6 +1891,7 @@ mod tests {
             is_public_official: false,
             office: None,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         });
 
@@ -1898,6 +1915,7 @@ mod tests {
             is_public_official: false,
             office: None,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         });
 
@@ -1917,6 +1935,7 @@ mod tests {
             is_public_official: false, // missing!
             office: None,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         });
 
@@ -1938,6 +1957,7 @@ mod tests {
                     observed_key: fraudster,
                     observed_state_hash: [0xAA; 32],
                     observed_nonce: 5,
+                    observer_public_key: [0u8; 32],
                     observer_signature: [0u8; 64],
                 },
                 observation_b: crate::fraud::StateObservation {
@@ -1945,6 +1965,7 @@ mod tests {
                     observed_key: fraudster,
                     observed_state_hash: [0xBB; 32], // different!
                     observed_nonce: 5,                // same nonce
+                    observer_public_key: [0u8; 32],
                     observer_signature: [0u8; 64],
                 },
                 conflict_type: crate::fraud::ConflictType::DoubleSpend,
@@ -1970,6 +1991,7 @@ mod tests {
             state_hash: [0xCC; 32],
             nonce: 0,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         });
 
@@ -2012,6 +2034,7 @@ mod tests {
             submitter: official,
             timestamp: 1000,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         });
 
@@ -2031,6 +2054,7 @@ mod tests {
             nonce: 0,
             timestamp: 1000,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         });
 
@@ -2071,6 +2095,7 @@ mod tests {
             nonce: 0,
             timestamp: 1000,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         }
     }
@@ -2087,6 +2112,7 @@ mod tests {
             original_hash_lock: swap.hash_lock,
             original_timeout: swap.timeout,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         }
     }
@@ -2102,6 +2128,7 @@ mod tests {
             original_hash_lock: swap.hash_lock,
             original_timeout: swap.timeout,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         }
     }
@@ -2318,6 +2345,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_state_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2347,6 +2375,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_state_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2376,6 +2405,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_state_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2407,6 +2437,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_state_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Anonymous,
             sender_identity_hash: [0xAA; 32],
@@ -2446,6 +2477,7 @@ mod tests {
                 timestamp: 1000 + i,
                 state_pre: sender_hash,
                 proof: mock_proof(),
+                public_key: [0u8; 32],
                 signature: [0u8; 64],
                 sender_tier: Tier::Identified,
                 sender_identity_hash: [0xAA; 32],
@@ -2478,6 +2510,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified, // LIE: actually Anonymous
             sender_identity_hash: [0xAA; 32],
@@ -2509,6 +2542,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2538,6 +2572,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2569,6 +2604,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2592,6 +2628,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash2,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2622,6 +2659,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2651,6 +2689,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Anonymous,
             sender_identity_hash: [0xAA; 32],
@@ -2680,6 +2719,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2791,6 +2831,7 @@ mod tests {
             nonce: 0,
             timestamp: 1000,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64], // no signature check!
         });
         let new_state = validate_transaction(&sync_tx, &state, 1000, 0).unwrap();
@@ -2821,6 +2862,7 @@ mod tests {
                     observed_key: victim,
                     observed_state_hash: [0x11; 32],
                     observed_nonce: 5,
+                    observer_public_key: [0u8; 32],
                     observer_signature: [0u8; 64], // not a real signature!
                 },
                 observation_b: StateObservation {
@@ -2828,6 +2870,7 @@ mod tests {
                     observed_key: victim,
                     observed_state_hash: [0x22; 32], // different state, same nonce
                     observed_nonce: 5,
+                    observer_public_key: [0u8; 32],
                     observer_signature: [0u8; 64], // not a real signature!
                 },
                 conflict_type: ConflictType::DoubleSpend,
@@ -2861,6 +2904,7 @@ mod tests {
                     observed_key: target_x,
                     observed_state_hash: [0xAA; 32],
                     observed_nonce: 5,
+                    observer_public_key: [0u8; 32],
                     observer_signature: [0u8; 64],
                 },
                 observation_b: StateObservation {
@@ -2868,6 +2912,7 @@ mod tests {
                     observed_key: target_x,
                     observed_state_hash: [0xBB; 32],
                     observed_nonce: 5,
+                    observer_public_key: [0u8; 32],
                     observer_signature: [0u8; 64],
                 },
                 conflict_type: ConflictType::DoubleSpend,
@@ -2895,6 +2940,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2942,6 +2988,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -2964,6 +3011,7 @@ mod tests {
             timestamp: 1001,
             state_pre: sender2_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xDD; 32],
@@ -3006,6 +3054,7 @@ mod tests {
             nonce: 0,
             timestamp: 1000,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
         });
         let result = validate_transaction(&init_tx, &state, 0, 1);
@@ -3033,6 +3082,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3065,6 +3115,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3098,6 +3149,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3132,6 +3184,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3166,6 +3219,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3201,6 +3255,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::PublicOfficial, // official!
             sender_identity_hash: [0xAA; 32],
@@ -3235,6 +3290,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified, // NOT an official
             sender_identity_hash: [0xAA; 32],
@@ -3268,6 +3324,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3299,6 +3356,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3330,6 +3388,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3358,6 +3417,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3389,6 +3449,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3420,6 +3481,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3453,6 +3515,7 @@ mod tests {
             timestamp: 1000,
             state_pre: sender_hash,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Anonymous,
             sender_identity_hash: [0xAA; 32],
@@ -3483,6 +3546,7 @@ mod tests {
             timestamp: 1000,
             state_pre: [0xFF; 32], // wrong pre-state!
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],
@@ -3514,6 +3578,7 @@ mod tests {
             timestamp: 1000,
             state_pre: ZERO_HASH,
             proof: mock_proof(),
+            public_key: [0u8; 32],
             signature: [0u8; 64],
             sender_tier: Tier::Identified,
             sender_identity_hash: [0xAA; 32],

@@ -34,6 +34,9 @@ pub struct StateObservation {
     pub observed_state_hash: Hash,
     /// The nonce they saw.
     pub observed_nonce: Nonce,
+    /// The observer's Ed25519 public key. `SHA-256(observer_public_key)` must
+    /// equal `observer`.
+    pub observer_public_key: [u8; 32],
     /// Ed25519 signature over (observed_key || state_hash || nonce).
     #[serde(with = "crate::primitives::serde_byte64")]
     pub observer_signature: [u8; 64],
@@ -104,6 +107,7 @@ mod tests {
             observed_key: key,
             observed_state_hash: state,
             observed_nonce: nonce,
+            observer_public_key: [0u8; 32],
             observer_signature: [0u8; 64], // placeholder
         }
     }
