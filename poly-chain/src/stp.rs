@@ -184,6 +184,48 @@ pub fn check_investigation_deadlines(
     }
 }
 
+/// Pack an investigation's mutable on-chain state — the trigger timestamp plus
+/// the current [`InvestigationStatus`] — into a single 32-byte SMT value.
+///
+/// Layout: `[pool_threshold_reached: 8 LE][status_tag: 1][status_ts: 8 LE]`
+/// `[zero-pad: 14][format_marker: 1]`. The trailing `0x01` marker guarantees
+/// the packed value is never all-zero (the SMT treats `ZERO_HASH` as a delete
+/// sentinel), so a freshly-triggered investigation cannot be silently dropped.
+pub fn pack_investigation_state(
+    pool_threshold_reached: Timestamp,
+    status: &InvestigationStatus,
+) -> Hash {
+    let mut buf = [0u8; 32];
+    buf[0..8].copy_from_slice(&pool_threshold_reached.to_le_bytes());
+    let (tag, ts): (u8, Timestamp) = match status {
+        InvestigationStatus::AwaitingData => (0x00, 0),
+        InvestigationStatus::DataProvided => (0x01, 0),
+        InvestigationStatus::AccountFrozen { frozen_at } => (0x02, *frozen_at),
+        InvestigationStatus::Slashed { slashed_at } => (0x03, *slashed_at),
+        InvestigationStatus::Cleared => (0x04, 0),
+    };
+    buf[8] = tag;
+    buf[9..17].copy_from_slice(&ts.to_le_bytes());
+    buf[31] = 0x01; // format marker — keeps the value out of the ZERO_HASH sentinel
+    buf
+}
+
+/// Unpack an investigation-state value produced by [`pack_investigation_state`].
+/// Returns `None` if the status tag is unrecognized.
+pub fn unpack_investigation_state(packed: &Hash) -> Option<(Timestamp, InvestigationStatus)> {
+    let pool_threshold_reached = Timestamp::from_le_bytes(packed[0..8].try_into().ok()?);
+    let ts = Timestamp::from_le_bytes(packed[9..17].try_into().ok()?);
+    let status = match packed[8] {
+        0x00 => InvestigationStatus::AwaitingData,
+        0x01 => InvestigationStatus::DataProvided,
+        0x02 => InvestigationStatus::AccountFrozen { frozen_at: ts },
+        0x03 => InvestigationStatus::Slashed { slashed_at: ts },
+        0x04 => InvestigationStatus::Cleared,
+        _ => return None,
+    };
+    Some((pool_threshold_reached, status))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,7 +8,10 @@ use crate::fee::FeeSchedule;
 use crate::fraud::detect_conflict;
 use crate::identity::{IdentityRecord, Tier};
 use crate::primitives::*;
-use crate::stp::InvestigationRecord;
+use crate::stp::{
+    check_investigation_deadlines, pack_investigation_state, unpack_investigation_state,
+    InvestigationAction, InvestigationRecord, InvestigationStatus,
+};
 use crate::state::GlobalState;
 use crate::transaction::*;
 use crate::wallet::WalletState;
@@ -272,6 +275,15 @@ fn inv_target_key(pool_id: &Hash) -> Hash {
     hash_with_domain(DOMAIN_STP, &[b"inv_target_v1".as_slice(), pool_id.as_slice()].concat())
 }
 
+/// [R30] Derive the STP-SMT key under which an account's freeze marker is
+/// stored. `CheckDeadline` writes `frozen_key(account) -> investigation_id`
+/// when it freezes an account for missing a compliance deadline;
+/// value-movement validators (e.g. `validate_cash_transfer`) check for its
+/// presence to actually enforce the freeze.
+fn frozen_key(account: &Hash) -> Hash {
+    hash_with_domain(DOMAIN_STP, &[b"stp_frozen_v1".as_slice(), account.as_slice()].concat())
+}
+
 /// The main verify-only validation pipeline.
 ///
 /// Validators call this for each transaction. They never execute computation —
@@ -353,6 +365,19 @@ fn validate_cash_transfer(
 
     // 1c. Reject frozen recipient
     if tx.recipient_frozen {
+        return Err(ChainError::AccountFrozen(hex_encode(&tx.to[..4])));
+    }
+
+    // [R30] Enforce STP account freezes recorded ON-CHAIN. The checks above
+    // act on the self-attested `sender_frozen` / `recipient_frozen` flags;
+    // this additionally rejects any account that `CheckDeadline` froze for
+    // missing an STP compliance deadline, regardless of what the transaction
+    // claims. Without this, the STP freeze transition would have no effect on
+    // value movement.
+    if state.get_stp_record(&frozen_key(&tx.from)).is_some() {
+        return Err(ChainError::AccountFrozen(hex_encode(&tx.from[..4])));
+    }
+    if state.get_stp_record(&frozen_key(&tx.to)).is_some() {
         return Err(ChainError::AccountFrozen(hex_encode(&tx.to[..4])));
     }
 
@@ -1129,19 +1154,22 @@ fn validate_stp_action(
                 ));
             }
 
-            // Create investigation record
-            let investigation = InvestigationRecord::new(*pool_id, *target, now);
-            let inv_hash = investigation.investigation_hash();
-            new_state.set_stp_record(*pool_id, inv_hash);
+            // [R30] Store the investigation's mutable state under `pool_id`:
+            // the trigger timestamp plus the current status (AwaitingData).
+            // `CheckDeadline` reads this back to enforce the 72h compliance and
+            // 30d final deadlines and to record status transitions.
+            // (Previously `pool_id` stored a frozen InvestigationRecord *hash*
+            // that `CheckDeadline` had no way to act on — the R23 finding.)
+            new_state.set_stp_record(
+                *pool_id,
+                pack_investigation_state(now, &InvestigationStatus::AwaitingData),
+            );
 
-            // R7: Store a secondary binding: inv_target_key(pool_id) -> target.
-            // This allows ProvideData to verify the submitter is the actual target,
-            // not just any official with a contract. Without this binding, Official B
-            // could provide data for Official A's investigation, allowing A to escape
-            // accountability.
-            let target_key = inv_target_key(pool_id);
-            let target_binding = hash_with_domain(DOMAIN_STP, target.as_slice());
-            new_state.set_stp_record(target_key, target_binding);
+            // R7 / [R30]: Bind `inv_target_key(pool_id) -> target` (the raw
+            // target account id). `ProvideData` uses it to confirm the
+            // submitter is the actual investigation target; `CheckDeadline`
+            // uses it to freeze the correct account.
+            new_state.set_stp_record(inv_target_key(pool_id), *target);
         }
 
         STPAction::ProvideData {
@@ -1164,15 +1192,14 @@ fn validate_stp_action(
                 ChainError::STPError("investigation not found".into())
             })?;
 
-            // R7: Verify submitter is the actual investigation target (not just any official).
-            // Without this fix, Official B (who also has a contract) could provide data
-            // for Official A's investigation, allowing A to escape accountability.
-            let target_key = inv_target_key(investigation_id);
-            let stored_target_binding = state.get_stp_record(&target_key).ok_or_else(|| {
-                ChainError::STPError("investigation target binding not found".into())
-            })?;
-            let submitter_binding = hash_with_domain(DOMAIN_STP, tx.submitter.as_slice());
-            if stored_target_binding != submitter_binding {
+            // R7 / [R30]: Verify the submitter is the actual investigation
+            // target (not just any official). `inv_target_key` now stores the
+            // raw target account id, so this is a direct comparison.
+            let stored_target =
+                state.get_stp_record(&inv_target_key(investigation_id)).ok_or_else(|| {
+                    ChainError::STPError("investigation target binding not found".into())
+                })?;
+            if stored_target != tx.submitter {
                 return Err(ChainError::UnauthorizedSTPAction(
                     "only the investigation target can provide data for their investigation".into(),
                 ));
@@ -1192,15 +1219,80 @@ fn validate_stp_action(
         }
 
         STPAction::CheckDeadline { investigation_id } => {
-            // This is the enforcement mechanism — anyone can submit this.
-            // Load the investigation record and check deadlines.
-            // For Phase 1, the actual InvestigationRecord would be stored/loaded
-            // from the STP subtree. Here we demonstrate the logic flow.
-            let _ = state.get_stp_record(investigation_id).ok_or_else(|| {
+            // [R30 FIX] Enforcement mechanism — anyone may submit this. It
+            // reads the investigation's on-chain state, checks the 72h
+            // compliance and 30d final deadlines, and applies the resulting
+            // freeze / slash status transition. Previously this handler only
+            // checked that the investigation existed and then did nothing —
+            // a non-cooperating official faced no consequence (the R23
+            // finding: "CheckDeadline is a no-op").
+
+            // 1. Load and decode the investigation's mutable state.
+            let packed = state.get_stp_record(investigation_id).ok_or_else(|| {
                 ChainError::STPError("investigation not found".into())
             })?;
-            // The actual freeze/slash logic would be applied here based on
-            // check_investigation_deadlines() result.
+            let (pool_threshold_reached, status) = unpack_investigation_state(&packed)
+                .ok_or_else(|| ChainError::STPError("investigation state is corrupt".into()))?;
+
+            // 2. Load the investigation target (the account that may be frozen).
+            let target =
+                state.get_stp_record(&inv_target_key(investigation_id)).ok_or_else(|| {
+                    ChainError::STPError("investigation target binding not found".into())
+                })?;
+
+            // 3. Reconstruct the record so the deadline logic can run.
+            let mut record =
+                InvestigationRecord::new(*investigation_id, target, pool_threshold_reached);
+            record.status = status.clone();
+
+            // 4. If the official provided data while still AwaitingData, the
+            //    investigation is resolved cooperatively — clear it, no freeze.
+            let data_key = hash_with_domain(
+                DOMAIN_STP,
+                &[b"stp_data_v1".as_slice(), investigation_id.as_slice()].concat(),
+            );
+            if status == InvestigationStatus::AwaitingData
+                && state.get_stp_record(&data_key).is_some()
+            {
+                new_state.set_stp_record(
+                    *investigation_id,
+                    pack_investigation_state(pool_threshold_reached, &InvestigationStatus::Cleared),
+                );
+                return Ok(new_state);
+            }
+
+            // 5. Apply the deadline action.
+            match check_investigation_deadlines(&record, now) {
+                InvestigationAction::FreezeAccount => {
+                    new_state.set_stp_record(
+                        *investigation_id,
+                        pack_investigation_state(
+                            pool_threshold_reached,
+                            &InvestigationStatus::AccountFrozen { frozen_at: now },
+                        ),
+                    );
+                    // Record the freeze on-chain so value-movement validators
+                    // reject the frozen account. The value stored is the
+                    // investigation id, recording why the account was frozen.
+                    new_state.set_stp_record(frozen_key(&target), *investigation_id);
+                }
+                InvestigationAction::ExecuteSlash => {
+                    new_state.set_stp_record(
+                        *investigation_id,
+                        pack_investigation_state(
+                            pool_threshold_reached,
+                            &InvestigationStatus::Slashed { slashed_at: now },
+                        ),
+                    );
+                    // The account stays frozen — `frozen_key` was set at the
+                    // earlier FreezeAccount transition and is left in place.
+                }
+                InvestigationAction::NoAction => {
+                    return Err(ChainError::STPError(
+                        "no deadline action due for this investigation".into(),
+                    ));
+                }
+            }
         }
     }
 
