@@ -200,6 +200,23 @@ fn run_encrypted(server: &str, prompt: &str, max_tokens: u32, temperature: u32, 
     let output_ct: CkksCiphertext = compress::decompress(&resp_data.encrypted_output)
         .expect("decompress output ciphertext");
     let output_tokens = ckks.decrypt(&output_ct, &client_sk);
+
+    // [R46] Bind the decrypted output to the server's execution proof before
+    // trusting it. Without this the CLI would print the server's self-reported
+    // `proof.verified` flag next to output it never checked the proof was
+    // actually built for — a tampered or mismatched `encrypted_output` would
+    // be displayed as a verified result.
+    if let Err(reason) =
+        http::verify_proof_io_binding(&token_ids, &output_tokens, &resp_data.proof)
+    {
+        eprintln!();
+        eprintln!("  ERROR: {reason}.");
+        eprintln!("         The encrypted response is not consistent with its");
+        eprintln!("         execution proof — it may be corrupt or tampered with.");
+        eprintln!("         Refusing to display an unverified result.");
+        std::process::exit(1);
+    }
+
     let text = model::decode(&output_tokens);
     let completion = model::decode(&output_tokens[token_ids.len()..]);
     eprintln!(" done ({:.0}ms)", t.elapsed().as_millis());

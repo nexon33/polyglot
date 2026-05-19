@@ -246,15 +246,36 @@ pub fn encrypt<R: Rng>(tokens: &[u32], pk: &CkksPublicKey, sk: &CkksSecretKey, r
 /// If the ciphertext has an authentication tag, the MAC is verified
 /// automatically using the mac_key derived from the secret key. Tampered
 /// ciphertexts cause a panic. Use `decrypt_unchecked` to bypass this.
+///
+/// [R46] The MAC check is enforced *fail-closed*. `encrypt` only ever emits
+/// `auth_tag` together with `nonce` and `key_id` (for a self-encryption — see
+/// the `encrypt` doc comment); a legitimate ciphertext therefore has either
+/// all three authentication fields present or `auth_tag` absent. A ciphertext
+/// with `auth_tag` present but `nonce` or `key_id` missing is malformed: an
+/// earlier version skipped the MAC check entirely in that case, so an attacker
+/// could *strip the nonce* from an authenticated ciphertext to downgrade it to
+/// an unverified decrypt. Such a ciphertext is now rejected as tampering.
 pub fn decrypt(ct: &CkksCiphertext, sk: &CkksSecretKey) -> Vec<u32> {
-    // Enforce MAC verification if auth_tag is present
-    if let (Some(auth_tag), Some(nonce), Some(key_id)) = (ct.auth_tag, ct.nonce, ct.key_id) {
-        let mac_key = super::keys::derive_mac_key(sk);
-        let expected_tag = compute_auth_tag(&ct.chunks, ct.token_count, ct.scale, &nonce, &key_id, &mac_key);
-        assert!(
-            constant_time_eq(&auth_tag, &expected_tag),
-            "ciphertext integrity check failed: auth_tag mismatch (possible tampering)"
-        );
+    match (ct.auth_tag, ct.nonce, ct.key_id) {
+        // Authenticated ciphertext: all three fields present — verify the MAC.
+        (Some(auth_tag), Some(nonce), Some(key_id)) => {
+            let mac_key = super::keys::derive_mac_key(sk);
+            let expected_tag =
+                compute_auth_tag(&ct.chunks, ct.token_count, ct.scale, &nonce, &key_id, &mac_key);
+            assert!(
+                constant_time_eq(&auth_tag, &expected_tag),
+                "ciphertext integrity check failed: auth_tag mismatch (possible tampering)"
+            );
+        }
+        // Unauthenticated ciphertext: no tag at all. This is the legitimate
+        // cross-party case (e.g. an inference output whose producer could not
+        // MAC for this recipient); there is nothing to verify.
+        (None, _, _) => {}
+        // `auth_tag` present but `nonce`/`key_id` stripped — a downgrade
+        // attempt. `encrypt` never produces this combination.
+        _ => panic!(
+            "ciphertext integrity check failed: authentication metadata incomplete (possible tampering)"
+        ),
     }
 
     decrypt_unchecked(ct, sk)

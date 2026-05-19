@@ -1001,6 +1001,55 @@ fn proof_to_summary(
     }
 }
 
+/// [R46] Verify that a response's proof summary is bound to the actual
+/// decrypted I/O of an encrypted-inference exchange.
+///
+/// `EncryptedGenerateResponse` carries a [`ProofSummary`] whose `input_hash`
+/// and `output_hash` are computed server-side (in [`proof_to_summary`]) over
+/// the exact token sequences the execution proof attests to. A client that
+/// decrypts the response must not simply display the server's self-reported
+/// `proof.verified` flag — it must confirm the proof actually describes the
+/// output it just decrypted, and was built over the input it actually sent.
+///
+/// This recomputes both hashes locally:
+/// - `input_hash` from `input_tokens` (the caller's own prompt),
+/// - `output_hash` from the completion `output_tokens[prompt_len..]`,
+///
+/// using the same `hash_data` / little-endian encoding as `proof_to_summary`,
+/// and rejects the response on any mismatch. A mismatch means the encrypted
+/// ciphertext and the proof describe different data — corruption, a buggy
+/// server, or tampering — and the decrypted output must not be trusted.
+///
+/// Note: the `HashIvc` proof is publicly recomputable, so this binding check
+/// is a *consistency* guarantee, not authentication against an active MITM
+/// that coherently rewrites the whole response; that would require a signed
+/// response, which the wire format does not yet provide.
+pub fn verify_proof_io_binding(
+    input_tokens: &[u32],
+    output_tokens: &[u32],
+    proof: &ProofSummary,
+) -> Result<(), &'static str> {
+    use poly_verified::crypto::hash::hash_data;
+
+    let input_bytes: Vec<u8> = input_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+    // The server hashes the completion only — output tokens past the prompt.
+    // `min` mirrors the server's `safe_enc_prompt_len` for the degenerate case
+    // where the server returned fewer tokens than the prompt.
+    let prompt_len = input_tokens.len().min(output_tokens.len());
+    let completion_bytes: Vec<u8> = output_tokens[prompt_len..]
+        .iter()
+        .flat_map(|t| t.to_le_bytes())
+        .collect();
+
+    if hex::encode(hash_data(&input_bytes)) != proof.input_hash {
+        return Err("proof input hash does not match the prompt that was sent");
+    }
+    if hex::encode(hash_data(&completion_bytes)) != proof.output_hash {
+        return Err("proof output hash does not match the decrypted output");
+    }
+    Ok(())
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
 /// Maximum request body size: 1 MB.
