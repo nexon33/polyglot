@@ -72,10 +72,27 @@ impl JsRuntime {
         if let Some(arr) = json.as_array() {
             let mut values = Vec::with_capacity(arr.len());
             for item in arr {
+                // [R39-01] Range-check the narrowing to i32 instead of
+                // truncating / saturating with `as` — an array element
+                // outside i32 range must produce a conversion error, not a
+                // silently-wrong value.
                 if let Some(n) = item.as_i64() {
-                    values.push(n as i32);
+                    match i32::try_from(n) {
+                        Ok(v) => values.push(v),
+                        Err(_) => {
+                            return Err(PolyglotError::TypeConversion(format!(
+                                "Array integer {n} is out of i32 range"
+                            )))
+                        }
+                    }
                 } else if let Some(n) = item.as_f64() {
-                    values.push(n as i32);
+                    if n.is_finite() && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+                        values.push(n as i32);
+                    } else {
+                        return Err(PolyglotError::TypeConversion(format!(
+                            "Array float {n} is out of i32 range"
+                        )));
+                    }
                 } else {
                     return Err(PolyglotError::TypeConversion(
                         "Array item not a number".to_string(),

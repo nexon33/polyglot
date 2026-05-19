@@ -44,14 +44,16 @@ impl PyRuntime {
             let result = vm.run_code_obj(code_obj, scope)
                 .map_err(|e| PolyglotError::Python(format!("Python error: {:?}", e)))?;
 
-            // Try to get as integer
-            let int_result = result.clone().try_into_value::<i64>(vm)
-                .map(|v| v as i32)
-                .or_else(|_| {
-                    result.try_into_value::<i32>(vm)
-                })
-                .map_err(|_| PolyglotError::TypeConversion(
-                    "Cannot convert Python result to i32".to_string()
+            // Try to get as integer.
+            // [R39-01] Range-check the i64 → i32 narrowing. `v as i32`
+            // silently truncated the high bits, so a Python integer outside
+            // i32 range (e.g. `2**40`) yielded a wrong i32 instead of a clean
+            // conversion error.
+            let int_result = result.clone().try_into_value::<i64>(vm).ok()
+                .and_then(|v| i32::try_from(v).ok())
+                .or_else(|| result.try_into_value::<i32>(vm).ok())
+                .ok_or_else(|| PolyglotError::TypeConversion(
+                    "Cannot convert Python result to i32 (not an integer, or out of i32 range)".to_string()
                 ))?;
 
             Ok(int_result)
@@ -114,7 +116,18 @@ impl PyRuntime {
                     "Cannot convert to list of integers".to_string()
                 ))?;
 
-            Ok(list.into_iter().map(|v| v as i32).collect())
+            // [R39-01] Range-check each element instead of truncating with
+            // `as` — a Python list element outside i32 range must produce a
+            // conversion error, not a silently-wrong value.
+            list.into_iter()
+                .map(|v| {
+                    i32::try_from(v).map_err(|_| {
+                        PolyglotError::TypeConversion(format!(
+                            "Python list element {v} is out of i32 range"
+                        ))
+                    })
+                })
+                .collect()
         })
     }
 
@@ -152,11 +165,13 @@ impl PyRuntime {
             let result = vm.run_code_obj(eval_obj, scope)
                 .map_err(|e| PolyglotError::Python(format!("Eval error: {:?}", e)))?;
 
-            let int_result = result.clone().try_into_value::<i64>(vm)
-                .map(|v| v as i32)
-                .or_else(|_| result.try_into_value::<i32>(vm))
-                .map_err(|_| PolyglotError::TypeConversion(
-                    "Cannot convert Python result to i32".to_string()
+            // [R39-01] Range-check the i64 → i32 narrowing instead of
+            // truncating with `as`.
+            let int_result = result.clone().try_into_value::<i64>(vm).ok()
+                .and_then(|v| i32::try_from(v).ok())
+                .or_else(|| result.try_into_value::<i32>(vm).ok())
+                .ok_or_else(|| PolyglotError::TypeConversion(
+                    "Cannot convert Python result to i32 (not an integer, or out of i32 range)".to_string()
                 ))?;
 
             Ok(int_result)
@@ -216,7 +231,18 @@ impl PyRuntime {
                     "Cannot convert to list of integers".to_string()
                 ))?;
 
-            Ok(list.into_iter().map(|v| v as i32).collect())
+            // [R39-01] Range-check each element instead of truncating with
+            // `as` — a Python list element outside i32 range must produce a
+            // conversion error, not a silently-wrong value.
+            list.into_iter()
+                .map(|v| {
+                    i32::try_from(v).map_err(|_| {
+                        PolyglotError::TypeConversion(format!(
+                            "Python list element {v} is out of i32 range"
+                        ))
+                    })
+                })
+                .collect()
         })
     }
 }
