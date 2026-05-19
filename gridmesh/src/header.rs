@@ -53,6 +53,16 @@ impl TensorHeader {
 
             let new_state = state.checked_add(1).ok_or(BorrowError::TooManyBorrows)?;
 
+            // [R42-01] `EXCLUSIVE_BORROW` (u32::MAX) is the exclusive-borrow
+            // sentinel; a shared-borrow count must never reach it. `checked_add`
+            // only catches incrementing *past* u32::MAX, so a shared count of
+            // u32::MAX-1 would otherwise step into the sentinel — making
+            // u32::MAX shared borrows indistinguishable from an exclusive
+            // borrow and tripping the `debug_assert` in `unborrow`.
+            if new_state >= Self::EXCLUSIVE_BORROW {
+                return Err(BorrowError::TooManyBorrows);
+            }
+
             if self
                 .borrow_state
                 .compare_exchange(state, new_state, Ordering::SeqCst, Ordering::SeqCst)
