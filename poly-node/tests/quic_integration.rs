@@ -53,12 +53,26 @@ async fn do_handshake(conn: &quinn::Connection) {
     let hello_payload = handshake::encode_hello(&hello).unwrap();
     let hello_frame = Frame::new(MessageType::Hello, hello_payload);
     send.write_all(&hello_frame.encode()).await.unwrap();
+    // [R33] Send the connection-binding frame after the Hello.
+    send.write_all(&binding_frame(conn, &client_identity).encode())
+        .await
+        .unwrap();
     send.finish().unwrap();
     let data = recv.read_to_end(64 * 1024).await.unwrap();
     let (ack_frame, _) = Frame::decode(&data).unwrap();
     assert_eq!(ack_frame.msg_type, MessageType::HelloAck);
     let ack: handshake::HelloAck = bincode::deserialize(&ack_frame.payload).unwrap();
     assert!(ack.accepted, "handshake must be accepted");
+}
+
+/// [R33] Build the HelloBinding frame for `conn` signed by `identity`.
+fn binding_frame(conn: &quinn::Connection, identity: &NodeIdentity) -> Frame {
+    let exporter = poly_node::node::connection_exporter(conn).unwrap();
+    let msg = poly_node::protocol::wire::compute_handshake_binding_message(
+        &exporter,
+        &identity.public_key_bytes(),
+    );
+    Frame::new(MessageType::HelloBinding, identity.sign(&msg).to_vec())
 }
 
 /// Helper: create a mock InferRequest.
@@ -158,6 +172,10 @@ async fn hello_handshake_over_quic() {
     let hello_payload = handshake::encode_hello(&hello).unwrap();
     let hello_frame = Frame::new(MessageType::Hello, hello_payload);
     send.write_all(&hello_frame.encode()).await.unwrap();
+    // [R33] Send the connection-binding frame after the Hello.
+    send.write_all(&binding_frame(&conn, &client_identity).encode())
+        .await
+        .unwrap();
     send.finish().unwrap();
 
     let data = recv.read_to_end(64 * 1024).await.unwrap();

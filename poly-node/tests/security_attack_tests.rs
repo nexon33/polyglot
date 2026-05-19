@@ -72,6 +72,18 @@ async fn do_handshake(conn: &quinn::Connection) {
     let hello_payload = handshake::encode_hello(&hello).unwrap();
     let hello_frame = Frame::new(MessageType::Hello, hello_payload);
     send.write_all(&hello_frame.encode()).await.unwrap();
+    // [R33] Bind the handshake to this connection: a HelloBinding frame
+    // (signature over the QUIC keying-material exporter) follows the Hello.
+    let __exporter = poly_node::node::connection_exporter(conn).unwrap();
+    let __binding_msg = poly_node::protocol::wire::compute_handshake_binding_message(
+        &__exporter,
+        &client_identity.public_key_bytes(),
+    );
+    let __binding_frame = Frame::new(
+        MessageType::HelloBinding,
+        client_identity.sign(&__binding_msg).to_vec(),
+    );
+    send.write_all(&__binding_frame.encode()).await.unwrap();
     send.finish().unwrap();
     let data = recv.read_to_end(64 * 1024).await.unwrap();
     let (ack_frame, _) = Frame::decode(&data).unwrap();
@@ -291,8 +303,8 @@ fn attack_frame_decode_length_exactly_at_boundary() {
 fn attack_frame_decode_every_invalid_type() {
     // Enumerate all 256 possible type bytes, verify only valid ones succeed
     let valid_types: Vec<u8> = vec![
-        0x01, 0x02, 0x10, 0x11, 0x12, 0x20, 0x21, 0x30, 0x31, 0x32, 0x33,
-        0x40, 0x41, 0x42, 0x43, 0x44, 0xFE,
+        0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x20, 0x21, 0x30, 0x31, 0x32,
+        0x33, 0x40, 0x41, 0x42, 0x43, 0x44, 0xFE,
     ];
     for byte in 0..=255u8 {
         let data = [byte, 0x00, 0x00, 0x00, 0x00]; // 0-length payload

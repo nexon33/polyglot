@@ -106,12 +106,36 @@ async fn do_handshake(conn: &quinn::Connection) {
     let hello_payload = handshake::encode_hello(&hello).unwrap();
     let hello_frame = Frame::new(MessageType::Hello, hello_payload);
     send.write_all(&hello_frame.encode()).await.unwrap();
+    // [R33] Bind the handshake to this connection: a HelloBinding frame
+    // (signature over the QUIC keying-material exporter) follows the Hello.
+    let __exporter = poly_node::node::connection_exporter(conn).unwrap();
+    let __binding_msg = poly_node::protocol::wire::compute_handshake_binding_message(
+        &__exporter,
+        &client_identity.public_key_bytes(),
+    );
+    let __binding_frame = Frame::new(
+        MessageType::HelloBinding,
+        client_identity.sign(&__binding_msg).to_vec(),
+    );
+    send.write_all(&__binding_frame.encode()).await.unwrap();
     send.finish().unwrap();
     let data = recv.read_to_end(64 * 1024).await.unwrap();
     let (ack_frame, _) = Frame::decode(&data).unwrap();
     assert_eq!(ack_frame.msg_type, MessageType::HelloAck);
     let ack: HelloAck = bincode::deserialize(&ack_frame.payload).unwrap();
     assert!(ack.accepted, "handshake must be accepted");
+}
+
+/// [R33] Build the connection-binding frame that must immediately follow a
+/// Hello frame on the handshake stream. The payload is an Ed25519 signature,
+/// by `identity`, over this QUIC connection's TLS keying-material exporter.
+fn binding_frame(conn: &quinn::Connection, identity: &NodeIdentity) -> Frame {
+    let exporter = poly_node::node::connection_exporter(conn).unwrap();
+    let msg = poly_node::protocol::wire::compute_handshake_binding_message(
+        &exporter,
+        &identity.public_key_bytes(),
+    );
+    Frame::new(MessageType::HelloBinding, identity.sign(&msg).to_vec())
 }
 
 // =============================================================================
@@ -532,9 +556,11 @@ async fn r13_regression_valid_encrypted_input_accepted() {
 // File: Documented audit finding -- no production fix in R13
 // =============================================================================
 
-/// R13-04a: Audit -- a captured Hello CAN be replayed within the timestamp window.
-/// This test documents the vulnerability by replaying the same serialized Hello
-/// on a second connection and verifying it is accepted (proving the gap exists).
+/// R13-04a / R33: a captured Hello can NOT be replayed onto another connection.
+/// Originally this test documented the replay gap (it asserted the replay was
+/// accepted). R33 added a connection binding: the HelloBinding frame is signed
+/// over the QUIC connection's TLS keying-material exporter, which differs per
+/// connection. Replaying conn1's Hello + binding onto conn2 is now rejected.
 #[tokio::test]
 async fn r13_audit_hello_replay_within_window() {
     let (addr, handle) = start_test_node().await;
@@ -547,11 +573,22 @@ async fn r13_audit_hello_replay_within_window() {
     let hello_payload = handshake::encode_hello(&hello).unwrap();
     let hello_frame_bytes = Frame::new(MessageType::Hello, hello_payload).encode();
 
-    // First connection: original Hello (should be accepted)
+    // First connection: original Hello + a binding signed over conn1's exporter.
     let endpoint1 = transport::create_client_endpoint().unwrap();
     let conn1 = endpoint1.connect(addr, "poly-node").unwrap().await.unwrap();
     let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
     send1.write_all(&hello_frame_bytes).await.unwrap();
+    let exporter1 = poly_node::node::connection_exporter(&conn1).unwrap();
+    let binding_msg1 = poly_node::protocol::wire::compute_handshake_binding_message(
+        &exporter1,
+        &identity.public_key_bytes(),
+    );
+    let binding_frame1_bytes = Frame::new(
+        MessageType::HelloBinding,
+        identity.sign(&binding_msg1).to_vec(),
+    )
+    .encode();
+    send1.write_all(&binding_frame1_bytes).await.unwrap();
     send1.finish().unwrap();
     let data1 = recv1.read_to_end(64 * 1024).await.unwrap();
     let (ack1, _) = Frame::decode(&data1).unwrap();
@@ -560,21 +597,23 @@ async fn r13_audit_hello_replay_within_window() {
     conn1.close(0u32.into(), b"done");
     endpoint1.wait_idle().await;
 
-    // Second connection: REPLAY the same Hello bytes (within timestamp window)
+    // Second connection: REPLAY conn1's Hello AND conn1's binding verbatim.
+    // R33: conn2 has a different exporter, so the replayed binding signature
+    // does not verify and the Hello is rejected.
     let endpoint2 = transport::create_client_endpoint().unwrap();
     let conn2 = endpoint2.connect(addr, "poly-node").unwrap().await.unwrap();
     let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
     send2.write_all(&hello_frame_bytes).await.unwrap();
+    send2.write_all(&binding_frame1_bytes).await.unwrap();
     send2.finish().unwrap();
     let data2 = recv2.read_to_end(64 * 1024).await.unwrap();
     let (ack2, _) = Frame::decode(&data2).unwrap();
     let ack2: HelloAck = bincode::deserialize(&ack2.payload).unwrap();
 
-    // AUDIT: This documents that the replayed Hello IS accepted (vulnerability exists)
-    // A proper fix would add a nonce/challenge-response to prevent replay
+    // R33 FIX: the replayed Hello+binding from another connection is rejected.
     assert!(
-        ack2.accepted,
-        "R13-04a AUDIT: Replayed Hello within timestamp window is accepted (no nonce defense)"
+        !ack2.accepted,
+        "R33: replayed Hello+binding from a different connection must be rejected"
     );
 
     conn2.close(0u32.into(), b"done");
@@ -716,6 +755,7 @@ async fn r13_regression_valid_public_key_accepted() {
     let payload = handshake::encode_hello(&hello).unwrap();
     let frame = Frame::new(MessageType::Hello, payload);
     send.write_all(&frame.encode()).await.unwrap();
+    send.write_all(&binding_frame(&conn, &identity).encode()).await.unwrap();
     send.finish().unwrap();
 
     let data = recv.read_to_end(64 * 1024).await.unwrap();
@@ -1067,6 +1107,7 @@ async fn r13_regression_distinct_addresses_accepted() {
     let payload = handshake::encode_hello(&hello).unwrap();
     let frame = Frame::new(MessageType::Hello, payload);
     send.write_all(&frame.encode()).await.unwrap();
+    send.write_all(&binding_frame(&conn, &identity).encode()).await.unwrap();
     send.finish().unwrap();
 
     let data = recv.read_to_end(64 * 1024).await.unwrap();
@@ -1101,6 +1142,7 @@ async fn r13_regression_empty_addresses_accepted() {
     let payload = handshake::encode_hello(&hello).unwrap();
     let frame = Frame::new(MessageType::Hello, payload);
     send.write_all(&frame.encode()).await.unwrap();
+    send.write_all(&binding_frame(&conn, &identity).encode()).await.unwrap();
     send.finish().unwrap();
 
     let data = recv.read_to_end(64 * 1024).await.unwrap();

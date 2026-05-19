@@ -16,6 +16,9 @@ pub enum MessageType {
     // Handshake
     Hello = 0x01,
     HelloAck = 0x02,
+    /// [R33] Connection-binding signature that accompanies a Hello on the
+    /// same stream — binds the handshake to a specific QUIC connection.
+    HelloBinding = 0x03,
     // Discovery (Phase 2)
     GetPeers = 0x10,
     Peers = 0x11,
@@ -43,6 +46,7 @@ impl MessageType {
         match b {
             0x01 => Some(Self::Hello),
             0x02 => Some(Self::HelloAck),
+            0x03 => Some(Self::HelloBinding),
             0x10 => Some(Self::GetPeers),
             0x11 => Some(Self::Peers),
             0x12 => Some(Self::Announce),
@@ -276,6 +280,33 @@ pub fn compute_nodeinfo_signing_message(info: &NodeInfo) -> Vec<u8> {
     msg.extend_from_slice(&info.public_key);
     msg.extend_from_slice(&info.timestamp.to_le_bytes());
     msg.extend_from_slice(&content_hash);
+    msg
+}
+
+/// [R33] Compute the signing message that binds a Hello handshake to a
+/// specific QUIC connection.
+///
+/// `connection_exporter` is the connection's exported TLS keying material
+/// (RFC 5705) — unique per connection and known to both endpoints. A node
+/// signs this message with its identity key and sends the signature as a
+/// `HelloBinding` frame on the handshake stream; the server verifies it
+/// against the exporter of the connection the Hello actually arrived on.
+///
+/// Before R33 the `NodeInfo` signature covered only static node identity
+/// fields, with no connection binding — so a `Hello` captured from one
+/// connection could be replayed verbatim on a fresh connection to
+/// impersonate the victim node. With this binding a replayed Hello carries a
+/// signature over a *different* connection's exporter and fails verification.
+pub fn compute_handshake_binding_message(
+    connection_exporter: &[u8; 32],
+    public_key: &[u8; 32],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(30 + 32 + 32);
+    // Domain-separation tag — unambiguously a handshake binding, never a
+    // NodeInfo or any other signed message.
+    msg.extend_from_slice(b"poly-node/handshake-binding/v1");
+    msg.extend_from_slice(public_key);
+    msg.extend_from_slice(connection_exporter);
     msg
 }
 

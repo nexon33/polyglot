@@ -430,6 +430,17 @@ impl PolyNode {
     }
 }
 
+/// [R33] Export 32 bytes of per-connection TLS keying material (RFC 5705).
+/// Unique per QUIC connection and identical on both endpoints — used to bind
+/// the Hello handshake to this specific connection (see
+/// `compute_handshake_binding_message`).
+pub fn connection_exporter(conn: &quinn::Connection) -> Result<[u8; 32]> {
+    let mut out = [0u8; 32];
+    conn.export_keying_material(&mut out, b"poly-node/handshake-binding/v1", b"")
+        .map_err(|_| anyhow::anyhow!("failed to export QUIC keying material"))?;
+    Ok(out)
+}
+
 async fn handle_connection(
     incoming: quinn::Incoming,
     backend: Arc<dyn InferenceBackend + Send + Sync>,
@@ -439,6 +450,10 @@ async fn handle_connection(
 ) -> Result<()> {
     let conn = incoming.await?;
     info!("Connection from {}", conn.remote_address());
+
+    // [R33] Per-connection keying material — binds each Hello to this
+    // connection so a captured Hello cannot be replayed on another.
+    let conn_exporter = connection_exporter(&conn)?;
 
     // Track whether this connection has completed a valid handshake.
     // Uses SeqCst ordering to prevent race between Hello handler storing
@@ -526,7 +541,8 @@ async fn handle_connection(
         let model = model_name.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_stream(send, recv, backend, infer_sem, info, hs, ha, model).await
+                handle_stream(send, recv, backend, infer_sem, info, hs, ha, model, conn_exporter)
+                    .await
             {
                 warn!("Stream error: {}", e);
             }
@@ -546,6 +562,9 @@ async fn handle_stream(
     handshake_done: Arc<std::sync::atomic::AtomicBool>,
     handshake_attempted: Arc<std::sync::atomic::AtomicBool>,
     model_name: Arc<String>,
+    // [R33] Per-connection keying material for verifying the Hello's
+    // connection binding (see the Hello arm below).
+    conn_exporter: [u8; 32],
 ) -> Result<()> {
     // Read entire request with timeout.
     // R17: Cap the read at the Hello size limit while the handshake is not yet
@@ -574,7 +593,11 @@ async fn handle_stream(
     // `data` before the frame is decoded) and could be used for protocol
     // confusion attacks where the trailing data resembles a second frame.
     let (frame, consumed) = Frame::decode(&data).map_err(|e| anyhow::anyhow!("{}", e))?;
-    if consumed != data.len() {
+    // R12: reject trailing data after the frame.
+    // [R33] Exception: a Hello is followed on the same stream by its
+    // HelloBinding frame, so trailing data after a Hello is expected and is
+    // validated in the Hello handler below.
+    if frame.msg_type != MessageType::Hello && consumed != data.len() {
         warn!(
             "Rejected frame with {} trailing bytes (frame consumed {}, total {})",
             data.len() - consumed,
@@ -939,6 +962,43 @@ async fn handle_stream(
                 }
             }
 
+            // [R33] Verify the Hello is cryptographically bound to THIS QUIC
+            // connection. A HelloBinding frame — an Ed25519 signature, by the
+            // same node identity, over this connection's exported keying
+            // material — must immediately follow the Hello on the stream. A
+            // Hello captured from another connection carries a binding signed
+            // over a different exporter and is rejected here, which defeats
+            // handshake replay / node impersonation.
+            if accepted {
+                let binding_valid = (|| {
+                    let (bframe, bconsumed) = Frame::decode(&data[consumed..]).ok()?;
+                    if bframe.msg_type != MessageType::HelloBinding
+                        || bconsumed != data.len() - consumed
+                        || bframe.payload.len() != 64
+                    {
+                        return None;
+                    }
+                    let mut sig = [0u8; 64];
+                    sig.copy_from_slice(&bframe.payload);
+                    let vk = ed25519_dalek::VerifyingKey::from_bytes(
+                        &hello.node_info.public_key,
+                    )
+                    .ok()?;
+                    let bmsg = crate::protocol::wire::compute_handshake_binding_message(
+                        &conn_exporter,
+                        &hello.node_info.public_key,
+                    );
+                    Some(crate::identity::verify_signature(&vk, &bmsg, &sig))
+                })()
+                .unwrap_or(false);
+                if !binding_valid {
+                    warn!(
+                        "Rejecting Hello: missing or invalid connection binding (replay?)"
+                    );
+                    accepted = false;
+                }
+            }
+
             if accepted {
                 handshake_done.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -1250,6 +1310,19 @@ pub async fn connect_and_infer(
         let hello_payload = handshake::encode_hello(&hello)?;
         let hello_frame = Frame::new(MessageType::Hello, hello_payload);
         hs_send.write_all(&hello_frame.encode()).await?;
+        // [R33] Bind this Hello to the current QUIC connection: sign the
+        // connection's exported keying material with the client identity and
+        // send it as a HelloBinding frame on the same stream. A replay of this
+        // Hello on a different connection fails the server's binding check
+        // because that connection's exporter differs.
+        let exporter = connection_exporter(&conn)?;
+        let binding_msg = crate::protocol::wire::compute_handshake_binding_message(
+            &exporter,
+            &client_identity.public_key_bytes(),
+        );
+        let binding_sig = client_identity.sign(&binding_msg);
+        let binding_frame = Frame::new(MessageType::HelloBinding, binding_sig.to_vec());
+        hs_send.write_all(&binding_frame.encode()).await?;
         hs_send.finish()?;
         let ack_data = hs_recv.read_to_end(64 * 1024).await?;
         let (ack_frame, ack_consumed) = Frame::decode(&ack_data).map_err(|e| anyhow::anyhow!("{}", e))?;

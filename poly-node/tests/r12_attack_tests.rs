@@ -89,12 +89,36 @@ async fn do_handshake(conn: &quinn::Connection) {
     let hello_payload = handshake::encode_hello(&hello).unwrap();
     let hello_frame = Frame::new(MessageType::Hello, hello_payload);
     send.write_all(&hello_frame.encode()).await.unwrap();
+    // [R33] Bind the handshake to this connection: a HelloBinding frame
+    // (signature over the QUIC keying-material exporter) follows the Hello.
+    let __exporter = poly_node::node::connection_exporter(conn).unwrap();
+    let __binding_msg = poly_node::protocol::wire::compute_handshake_binding_message(
+        &__exporter,
+        &client_identity.public_key_bytes(),
+    );
+    let __binding_frame = Frame::new(
+        MessageType::HelloBinding,
+        client_identity.sign(&__binding_msg).to_vec(),
+    );
+    send.write_all(&__binding_frame.encode()).await.unwrap();
     send.finish().unwrap();
     let data = recv.read_to_end(64 * 1024).await.unwrap();
     let (ack_frame, _) = Frame::decode(&data).unwrap();
     assert_eq!(ack_frame.msg_type, MessageType::HelloAck);
     let ack: HelloAck = bincode::deserialize(&ack_frame.payload).unwrap();
     assert!(ack.accepted, "handshake must be accepted");
+}
+
+/// [R33] Build the connection-binding frame that must immediately follow a
+/// Hello frame on the handshake stream. The payload is an Ed25519 signature,
+/// by `identity`, over this QUIC connection's TLS keying-material exporter.
+fn binding_frame(conn: &quinn::Connection, identity: &NodeIdentity) -> Frame {
+    let exporter = poly_node::node::connection_exporter(conn).unwrap();
+    let msg = poly_node::protocol::wire::compute_handshake_binding_message(
+        &exporter,
+        &identity.public_key_bytes(),
+    );
+    Frame::new(MessageType::HelloBinding, identity.sign(&msg).to_vec())
 }
 
 // =============================================================================
@@ -700,6 +724,7 @@ async fn r12_audit_server_reports_zero_load() {
     let payload = handshake::encode_hello(&hello).unwrap();
     let frame = Frame::new(MessageType::Hello, payload);
     send.write_all(&frame.encode()).await.unwrap();
+    send.write_all(&binding_frame(&conn, &identity).encode()).await.unwrap();
     send.finish().unwrap();
 
     let data = recv.read_to_end(64 * 1024).await.unwrap();

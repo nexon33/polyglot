@@ -78,6 +78,18 @@ async fn do_handshake(conn: &quinn::Connection) {
     let hello_payload = handshake::encode_hello(&hello).unwrap();
     let hello_frame = Frame::new(MessageType::Hello, hello_payload);
     send.write_all(&hello_frame.encode()).await.unwrap();
+    // [R33] Bind the handshake to this connection: a HelloBinding frame
+    // (signature over the QUIC keying-material exporter) follows the Hello.
+    let __exporter = poly_node::node::connection_exporter(conn).unwrap();
+    let __binding_msg = poly_node::protocol::wire::compute_handshake_binding_message(
+        &__exporter,
+        &client_identity.public_key_bytes(),
+    );
+    let __binding_frame = Frame::new(
+        MessageType::HelloBinding,
+        client_identity.sign(&__binding_msg).to_vec(),
+    );
+    send.write_all(&__binding_frame.encode()).await.unwrap();
     send.finish().unwrap();
     let data = recv.read_to_end(64 * 1024).await.unwrap();
     let (ack_frame, _) = Frame::decode(&data).unwrap();
