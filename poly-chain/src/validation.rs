@@ -53,17 +53,25 @@ fn verify_proof_if_not_mock(
 }
 
 /// Verify an Ed25519 signature over a message.
+///
+/// [R35-01 FIX] Uses `verify_strict`, not the cofactored `Verifier::verify`.
+/// The cofactored `verify` accepts signatures whose `R` component or public
+/// key `A` carries a small-order (torsion) part. On a blockchain that is a
+/// signature-malleability vector: a third party can mint a distinct 64-byte
+/// signature that still verifies for the same (key, message), producing a
+/// transaction that looks new but is a duplicate. `verify_strict` performs
+/// the strict, cofactorless check and rejects small-order `R`/`A`.
 pub fn verify_signature(
     public_key_bytes: &[u8; 32],
     message: &[u8],
     signature: &[u8; 64],
 ) -> Result<()> {
-    use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+    use ed25519_dalek::{Signature, VerifyingKey};
     let verifying_key = VerifyingKey::from_bytes(public_key_bytes)
         .map_err(|_| ChainError::InvalidSignature)?;
     let sig = Signature::from_bytes(signature);
     verifying_key
-        .verify(message, &sig)
+        .verify_strict(message, &sig)
         .map_err(|_| ChainError::InvalidSignature)
 }
 

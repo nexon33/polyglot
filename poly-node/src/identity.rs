@@ -3,7 +3,7 @@
 //! Each node has a persistent Ed25519 keypair. The NodeId is SHA-256(public_key),
 //! giving a compact 32-byte identifier that's hard to spoof.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
@@ -54,9 +54,15 @@ pub fn compute_node_id(vk: &VerifyingKey) -> NodeId {
 }
 
 /// Verify an Ed25519 signature against a verifying key.
+///
+/// [R35-01] Uses `verify_strict`, not the cofactored `Verifier::verify`.
+/// `verify` accepts signatures whose `R` component or public key `A` has a
+/// small-order (torsion) part, which permits signature malleability. Node
+/// handshake signatures (including the R33 connection binding) must be
+/// strongly non-malleable, so the strict, cofactorless check is used.
 pub fn verify_signature(vk: &VerifyingKey, data: &[u8], sig_bytes: &[u8; 64]) -> bool {
     let sig = Signature::from_bytes(sig_bytes);
-    vk.verify(data, &sig).is_ok()
+    vk.verify_strict(data, &sig).is_ok()
 }
 
 #[cfg(test)]

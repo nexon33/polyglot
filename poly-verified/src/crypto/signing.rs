@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 use crate::error::{ProofSystemError, Result};
 use crate::types::{hash_eq, CodeAttestation, Hash};
@@ -31,6 +31,15 @@ pub fn sign_attestation(
 }
 
 /// Verify a CodeAttestation's Ed25519 signature.
+///
+/// [R35-01 FIX] Uses `verify_strict`, not the `Verifier::verify` trait method.
+/// The cofactored `verify` accepts signatures whose `R` component or whose
+/// public key `A` lies in a small-order (torsion) subgroup. That permits
+/// signature malleability — a third party can derive a distinct byte string
+/// that still verifies — and non-binding signatures under weak keys. A
+/// `CodeAttestation` binds a node identity to a code identity, so its
+/// signature must be strongly non-malleable; `verify_strict` rejects
+/// small-order `R`/`A` and matches the encoding strictly.
 pub fn verify_attestation(
     attestation: &CodeAttestation,
     verifying_key: &VerifyingKey,
@@ -38,7 +47,7 @@ pub fn verify_attestation(
     let msg = attestation.sign_message();
     let sig = ed25519_dalek::Signature::from_bytes(&attestation.signature);
     verifying_key
-        .verify(&msg, &sig)
+        .verify_strict(&msg, &sig)
         .map_err(|_| ProofSystemError::SignatureVerificationFailed)
 }
 

@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 use crate::crypto::chain::HashChain;
 use crate::error::{ProofSystemError, Result};
@@ -60,13 +60,20 @@ pub fn verify_chain_tip(commitment: &Commitment, checkpoints: &[Hash]) -> bool {
 }
 
 /// Verify a SignedCommitment's Ed25519 signature.
+///
+/// [R35-01 FIX] Uses `verify_strict`, not the cofactored `Verifier::verify`.
+/// `verify` accepts signatures with a small-order `R` or public key `A`,
+/// which permits signature malleability and non-binding signatures. The
+/// `public_key` here is carried inside the attacker-supplied
+/// `SignedCommitment`, so accepting a small-order key would let a forged
+/// commitment pass; `verify_strict` rejects small-order `R`/`A`.
 pub fn verify_signed_commitment(sc: &SignedCommitment) -> Result<()> {
     let message = sc.commitment.to_bytes();
     let verifying_key = VerifyingKey::from_bytes(&sc.public_key)
         .map_err(|_| ProofSystemError::SignatureVerificationFailed)?;
     let signature = ed25519_dalek::Signature::from_bytes(&sc.signature);
     verifying_key
-        .verify(&message, &signature)
+        .verify_strict(&message, &signature)
         .map_err(|_| ProofSystemError::SignatureVerificationFailed)
 }
 
